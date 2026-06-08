@@ -68,6 +68,32 @@ let resolve ~(ctx : (string * Yojson.Safe.t) list) (path : string list) :
           in
           descend j0 rest)
 
+(* Resolve a dotted path to the RAW JSON at that location (the same descent as
+   [resolve], but the terminal case returns the JSON itself rather than the
+   reduced scalar). Used by [Exists] so that a present object/array — which
+   [value_of_json] would flatten to [Null] — is still seen as present. Total:
+   any unresolved path yields [None]. *)
+let resolve_raw ~(ctx : (string * Yojson.Safe.t) list) (path : string list) :
+    Yojson.Safe.t option =
+  match path with
+  | [] -> None
+  | root :: rest -> (
+      match List.assoc_opt root ctx with
+      | None -> None
+      | Some j0 ->
+          let rec descend (j : Yojson.Safe.t) segs =
+            match segs with
+            | [] -> Some j
+            | key :: more -> (
+                match j with
+                | `Assoc fields -> (
+                    match List.assoc_opt key fields with
+                    | Some j' -> descend j' more
+                    | None -> None)
+                | _ -> None)
+          in
+          descend j0 rest)
+
 (* ---- evaluation to a value (total) ------------------------------------- *)
 
 (* Reduce an expression to a [value option]: [None] means "no defined value"
@@ -116,7 +142,10 @@ and eval ~(ctx : (string * Yojson.Safe.t) list) (e : t) : bool =
   | Lit (Bool b) -> b
   | Lit _ -> false
   | Path p -> ( match resolve ~ctx p with Some (Bool b) -> b | _ -> false)
-  | Exists p -> ( match resolve ~ctx p with Some Null | None -> false | Some _ -> true)
+  (* [Exists] uses RAW-JSON presence, not the reduced scalar: a present
+     object/array/scalar => true; an explicit JSON [null] or a missing path =>
+     false. (Comparison operators keep using the value-based [resolve].) *)
+  | Exists p -> ( match resolve_raw ~ctx p with None | Some `Null -> false | Some _ -> true)
   | Not e -> not (eval ~ctx e)
   | And es -> List.for_all (eval ~ctx) es
   | Or es -> List.exists (eval ~ctx) es

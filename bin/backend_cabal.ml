@@ -8,12 +8,12 @@
 
 open Cabal
 
-(* Remaining budget for [Budget] governors. Defaults to a large constant
-   (1_000_000 iterations) so a cabal run is effectively unbounded unless the
-   embedder sets the [CWR_BUDGET] environment variable. *)
+(* Initial budget for [Budget] governors. Defaults to a large constant
+   (1_000_000) so a cabal run is effectively unbounded unless the embedder sets
+   the [CWR_BUDGET] environment variable. *)
 let default_budget = 1_000_000
 
-let budget () =
+let initial_budget () =
   match Sys.getenv_opt "CWR_BUDGET" with
   | Some s -> ( match int_of_string_opt (String.trim s) with Some n -> n | None -> default_budget)
   | None -> default_budget
@@ -107,6 +107,20 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
      closed. CWR_BACKEND selects a backend by id (default: first available);
      CWR_MODEL pins the model (e.g. a small/cheap/fast one like "haiku"). *)
   Adapter_loader.register_all ~sw ~env ();
+  (* A genuine consumable budget, per-[make] (i.e. per run, shared across all
+     loops in that run = a total run budget). Each [Budget]-governor check
+     consumes one unit: [budget ()] decrements the counter and returns the
+     remaining. With [CWR_BUDGET=N] the counter starts at N, so the readings are
+     N-1, N-2, ..., 0; the [Budget] governor stops the loop once a reading is
+     <= 0, i.e. on the Nth check. The run therefore performs AT MOST N
+     budget-governed loop iterations total. Determinism is unaffected: the engine
+     records every [Budget_read] in the trace and replay re-feeds the recorded
+     values (replay never calls this). *)
+  let budget_counter = ref (initial_budget ()) in
+  let budget () =
+    decr budget_counter;
+    !budget_counter
+  in
   let select () =
     match Sys.getenv_opt "CWR_BACKEND" with
     | Some name when String.trim name <> "" -> Registry.get (String.trim name)

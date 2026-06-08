@@ -75,19 +75,32 @@ let run ?(max_loop_iters = default_max_loop_iters) ~backend ~token validated =
         let success, output = agent ~id ~prompt ~read_only in
         let st = emit st (Agent_ran { id; success; output }) in
         let st = bind_output st id output in
-        (* Schema check is fail-closed and only on a successful run. *)
-        match (success, output_schema) with
-        | true, Some schema -> (
-            match Schema.validate schema output with
-            | Ok () -> st
-            | Error field ->
-                let reason = Printf.sprintf "schema mismatch: %s" field in
-                {
-                  st with
-                  terminal = Some (Aborted reason);
-                }
-                |> fun st -> emit st (Blocked_at { id; reason }))
-        | _ -> st)
+        (* An UNSUCCESSFUL agent run fails closed: it aborts the walk (mirroring
+           the schema-mismatch arm). Continuing past a failed agent would bind the
+           backend's error output and let a later always-true gate + token commit
+           despite the failure. The schema check is fail-closed and only on a
+           successful run. *)
+        if not success then begin
+          let reason =
+            Printf.sprintf
+              "agent step %S did not produce a successful structured output" id
+          in
+          let st = { st with terminal = Some (Aborted reason) } in
+          emit st (Blocked_at { id; reason })
+        end
+        else
+          match output_schema with
+          | Some schema -> (
+              match Schema.validate schema output with
+              | Ok () -> st
+              | Error field ->
+                  let reason = Printf.sprintf "schema mismatch: %s" field in
+                  {
+                    st with
+                    terminal = Some (Aborted reason);
+                  }
+                  |> fun st -> emit st (Blocked_at { id; reason }))
+          | None -> st)
     | Gate { id; when_ } -> (
         let verdict = if eval st when_ then Pass else Fail in
         let st = emit st (Gate_evaluated { id; verdict }) in
@@ -213,18 +226,33 @@ let replay ?(max_loop_iters = default_max_loop_iters) ~trace validated =
         | Agent_ran { success; output; id = rid } when rid = id -> (
             let st = emit st (Agent_ran { id; success; output }) in
             let st = bind_output st id output in
-            match (success, output_schema) with
-            | true, Some schema -> (
-                match Schema.validate schema output with
-                | Ok () -> st
-                | Error field ->
-                    let reason = Printf.sprintf "schema mismatch: %s" field in
-                    (* the recorded run aborted here too; consume its Blocked_at *)
-                    let st =
-                      { st with terminal = Some (Aborted reason) }
-                    in
-                    emit st (Blocked_at { id; reason }))
-            | _ -> st)
+            if not success then begin
+              (* the recorded run aborted here (fail-closed); consume its
+                 Blocked_at and reproduce the Aborted outcome. *)
+              let reason =
+                Printf.sprintf
+                  "agent step %S did not produce a successful structured output"
+                  id
+              in
+              match next () with
+              | Blocked_at { id = bid; reason = _ } when bid = id ->
+                  let st = { st with terminal = Some (Aborted reason) } in
+                  emit st (Blocked_at { id; reason })
+              | _ -> raise (Replay_mismatch "agent block entry mismatch")
+            end
+            else
+              match output_schema with
+              | Some schema -> (
+                  match Schema.validate schema output with
+                  | Ok () -> st
+                  | Error field ->
+                      let reason = Printf.sprintf "schema mismatch: %s" field in
+                      (* the recorded run aborted here too; consume its Blocked_at *)
+                      let st =
+                        { st with terminal = Some (Aborted reason) }
+                      in
+                      emit st (Blocked_at { id; reason }))
+              | None -> st)
         | _ -> raise (Replay_mismatch "agent entry mismatch"))
     | Gate { id; when_ } -> (
         match next () with
@@ -344,4 +372,8 @@ let replay ?(max_loop_iters = default_max_loop_iters) ~trace validated =
   let outcome, _trace =
     finish (go { rev_trace = []; ctx = []; terminal = None } wf.steps)
   in
+  (* The walk must have consumed the WHOLE trace: a trace that is a valid prefix
+     followed by extra (garbage) entries must NOT replay successfully. *)
+  if !pending <> [] then
+    raise (Replay_mismatch "trailing trace entries after workflow completed");
   outcome

@@ -81,7 +81,11 @@ specific (typically small/cheap/fast) model:
 - **`CWR_BACKEND`** — the cabal backend id to use (e.g. `claude-code`). Unset ⇒ the
   first available backend in the registry.
 - **`CWR_MODEL`** — the model to pin (e.g. `haiku`). Unset ⇒ the backend's default.
-- **`CWR_BUDGET`** — caps the `Budget` governor (default 1,000,000).
+- **`CWR_BUDGET`** — a genuine **consumable** total-run budget for the `Budget` governor
+  (default 1,000,000). Each `Budget`-governor check consumes one unit; with `CWR_BUDGET=N`
+  the run performs **at most N** budget-governed loop iterations total (shared across all
+  loops in the run) before the governor stops the loop. (It is the engine ceiling, not the
+  budget, that is the unconditional termination guarantee.)
 
 ```sh
 CWR_BACKEND=claude-code CWR_MODEL=haiku \

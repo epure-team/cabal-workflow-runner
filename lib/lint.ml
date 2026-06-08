@@ -250,10 +250,15 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
       produced
   | Branch { when_; then_; else_ } ->
       check_expr_refs ~loc ~produced ~warned_missing acc when_;
-      (* Each branch sees [produced] so far. The engine never removes bindings
-         from the run context, so outputs produced in EITHER taken branch are
-         visible to later steps; we union both branches' produced sets (a
-         reference is dangling only if neither branch could produce it). *)
+      (* Each branch sees [produced] so far. At runtime exactly ONE arm is taken,
+         so after the branch an output is GUARANTEED available only if BOTH arms
+         produce it — the produced set is the INTERSECTION of the two arms'
+         produced sets (mirroring the floor's branch=intersection discipline).
+         A reference after the branch to an output produced in only one arm is
+         therefore correctly flagged as dangling. Within an arm, that arm's own
+         outputs remain available (intra-arm behaviour is unchanged). Field-level
+         merge: an [id] survives only if present in both arms; its fields are the
+         intersection when both declare [Some], else [None] if either is [None]. *)
       let p_then =
         refs_steps ~loc_prefix:(loc ^ ".then") ~produced ~warned_missing acc
           then_
@@ -262,10 +267,17 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
         refs_steps ~loc_prefix:(loc ^ ".else") ~produced ~warned_missing acc
           else_
       in
-      List.fold_left
-        (fun acc_p (id, fields) ->
-          if List.mem_assoc id acc_p then acc_p else (id, fields) :: acc_p)
-        p_then p_else
+      let merge_fields a b =
+        match (a, b) with
+        | Some fa, Some fb -> Some (List.filter (fun f -> List.mem f fb) fa)
+        | _ -> None
+      in
+      List.filter_map
+        (fun (id, fields_then) ->
+          match List.assoc_opt id p_else with
+          | Some fields_else -> Some (id, merge_fields fields_then fields_else)
+          | None -> None)
+        p_then
   | Loop { body; until; governors } ->
       (* The body runs BEFORE [until] / [fixpoint] are evaluated each iteration,
          and the engine keeps body outputs bound in the run context afterward.

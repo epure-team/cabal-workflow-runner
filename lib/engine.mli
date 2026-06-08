@@ -47,6 +47,13 @@ val run :
 
     The token is exclusively a runtime parameter; no step can carry it. *)
 
+exception Replay_mismatch of string
+(** Raised by {!val:replay} when the supplied [trace] does not match the
+    workflow: an out-of-order/ill-typed entry, a re-evaluated verdict that
+    diverges from the recorded one, a trace that is exhausted before the walk
+    completes, or {b trailing entries left over after the walk completed} (a
+    valid prefix followed by garbage does NOT replay successfully). *)
+
 val replay :
   ?max_loop_iters:int -> trace:Types.trace -> Validate.Validated.t -> Types.outcome
 (** [replay ?max_loop_iters ~trace validated] re-interprets [validated] re-feeding
@@ -55,7 +62,8 @@ val replay :
     each recorded verdict. It produces the same outcome as the original
     {!val:run}. Pass the same [max_loop_iters] used for the run (default
     [10_000]); the ceiling is a constant, so the recorded [Loop_stopped] is
-    reproduced. *)
+    reproduced. Raises {!exception:Replay_mismatch} if [trace] does not match
+    (including trailing extra entries after the walk completes). *)
 
 val token_digest : string -> string
 (** Hash of an approval token, as recorded in traces. The raw token is never

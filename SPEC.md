@@ -26,7 +26,7 @@ commit). A `workflow` is a name plus a `step list`:
 
 | Step | Meaning | Determinism |
 |------|---------|-------------|
-| `Agent { id; prompt; read_only; output_schema }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. If `output_schema` is present the JSON is validated **fail-closed**. | Effect isolated to the backend; structured result recorded. |
+| `Agent { id; prompt; read_only; output_schema }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. A **`success = false` run fails closed** → `Aborted` (the run cannot continue past a failed agent). On success, if `output_schema` is present the JSON is validated **fail-closed**. | Effect isolated to the backend; structured result recorded. |
 | `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). A `Pass` records the verdict and continues; a **`Fail` BLOCKS** the run (`Blocked`, naming the gate id). | Verdict recorded; a false gate is a terminal block. |
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
 | `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
@@ -157,12 +157,18 @@ The CLI builds a **cabal-backed** backend (`bin/backend_cabal.ml`): `run_agent` 
 `Cabal.Backend_types.make_task_spec` (with `expected_outputs` including
 `Structured_report`), parsing the structured report's `raw_json` (falling back to
 parsing `agent_text` as JSON); if no parseable JSON is produced it **fails closed**
-(`success = false`). `budget` returns a large constant (1_000_000) by default, or reads
-the `CWR_BUDGET` env var if set. cabal usage is confined to this boundary: the
+(`success = false`). `budget` is a genuine **consumable** counter created per run
+(`make`), initialised to 1_000_000 by default or from the `CWR_BUDGET` env var: each
+`Budget`-governor check **decrements and returns** the remaining, so with `CWR_BUDGET=N`
+the run performs **at most N** budget-governed loop iterations total (shared across all
+loops in that run) before the `Budget` governor stops the loop. (Determinism is
+unaffected — every `Budget_read` is recorded and replay re-feeds the recorded values.)
+cabal usage is confined to this boundary: the
 `cabal_workflow_runner` **library depends on yojson only**; only `bin/` links cabal.
 
 `Engine.run ?max_loop_iters ~backend ~token validated : outcome * trace` performs a
-deterministic walk: `Agent` → `run_agent`, bind `outputs.<id>`, validate `output_schema`
+deterministic walk: `Agent` → `run_agent`, bind `outputs.<id>`; a `success = false` run
+**aborts** the walk (fail-closed), and on success the `output_schema` is validated
 (fail-closed); `Gate` → pure `Expr.eval`; a `Pass` continues, a **`Fail` blocks** the
 run (`Blocked`, naming the gate); `Branch` → pure `Expr.eval` chooses the arm; `Loop` →
 iterate under the engine **ceiling** (`?max_loop_iters`, default `10_000`; see §1.3),

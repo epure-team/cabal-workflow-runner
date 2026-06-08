@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.8
+
+A **corrective release** addressing five findings from an external review. Two engine
+safety fixes (fail-closed on a failed agent; replay rejects trailing trace garbage), two
+analysis fixes (`Exists` over a present object; branch-dependent dangling-ref detection),
+and one CLI honesty fix (a real consumable budget). CLI `--version` → `0.8.0`.
+
+### Fixed
+
+- **F1 (High) — a failed agent step now FAILS CLOSED.** Previously `Engine.run`'s `Agent`
+  branch fell through `| _ -> st` on `success = false`, binding the backend's `{"error":…}`
+  output and CONTINUING; a later always-true gate + token could then `Commit` despite the
+  failure. A `success = false` agent run now **aborts** the walk (`Aborted`, emitting
+  `Blocked_at`), mirroring the schema-mismatch arm. The symmetric change is made in
+  `Engine.replay` (it consumes the recorded `Blocked_at` and reproduces the `Aborted`), so
+  run and replay agree on the trace shape `[Agent_ran{success=false}; Blocked_at; …Aborted]`.
+- **F2 (Medium) — `Exists` treats a present object/array as present.** `value_of_json`
+  flattens `` `Assoc _ `` to `Null` (fine for comparisons), so `{"exists":"outputs.a.obj"}`
+  was false even when `obj` was a present object. `Expr` now resolves `Exists` over the
+  RAW JSON (new `resolve_raw`): a present object/array/scalar ⇒ true; an explicit JSON
+  `null` or a missing path ⇒ false. Comparison operators keep value-based `resolve`
+  (semantics unchanged); `Expr.eval` stays total.
+- **F3 (Medium) — lint catches branch-dependent dangling output refs.** `Lint`'s `Branch`
+  case previously UNIONED both arms' produced outputs, so a reference AFTER the branch to an
+  output produced in only ONE arm was not flagged. The guaranteed-available produced set
+  after a `Branch` is now the **INTERSECTION** of the two arms' sets (an output is guaranteed
+  only if BOTH arms produce it), mirroring the floor's branch=intersection discipline.
+  Field-level merge: an `id` survives only if in both arms; its fields are the field-set
+  intersection when both declare a schema, else `None`. Intra-arm behaviour is unchanged. The
+  examples remain lint-clean (0 diagnostics).
+- **F4 (Medium) — replay rejects trailing extra trace entries.** `Engine.replay` consumed
+  from the pending trace but never asserted it was empty when the walk finished, so a trace =
+  valid-prefix ++ garbage replayed "successfully". It now raises
+  `Replay_mismatch "trailing trace entries after workflow completed"` if any entries remain.
+  (`Replay_mismatch` is now exposed in `engine.mli`.)
+- **F5 (Low/Med) — `CWR_BUDGET` is a real consumable cap.** `bin/backend_cabal.ml`'s
+  `budget ()` returned the env value on EVERY call, so `CWR_BUDGET=10` read `10` forever and
+  the `Budget` governor never fired. `budget` is now a per-`make` (per-run, shared across all
+  loops = a total run budget) mutable counter initialised from `CWR_BUDGET` (default
+  1_000_000) that **decrements and returns** the remaining. Documented off-by-one: with
+  `CWR_BUDGET=N` the counter starts at N, readings are N−1…0, and the `Budget` governor stops
+  on the Nth check, so the run performs **at most N** budget-governed loop iterations total.
+  Determinism is unaffected (every `Budget_read` is recorded; replay re-feeds recorded
+  values and never calls `budget`).
+
+### Tests
+
+- **F1**: a workflow whose first agent stub returns `success = false` (then an always-true
+  gate + commit + token) ⇒ `Engine.run` yields `Aborted` (NOT `Committed`), no `Committed_step`
+  in the trace, and `Engine.replay ~trace` reproduces the same `Aborted`.
+- **F2**: `Exists ["outputs";"a";"obj"]` ⇒ true over a present object, false over an explicit
+  `null`, false over a missing path, true over a present scalar and a present array.
+- **F3**: a gate after a branch referencing `outputs.x.v` with `x` produced only in the `then`
+  arm ⇒ `dangling-output-ref` Warning; a reference to an output produced in BOTH arms ⇒ no
+  warning.
+- **F4**: a real recorded trace with one extra dummy entry appended ⇒ `Replay_mismatch`; the
+  unmodified trace still replays fine.
+- **F5**: the engine-level decrementing-budget test pins the exact iteration count (the CLI
+  constant→decrement change is verified by reading).
+
+### Docs
+
+- `SPEC.md` / `README.md`: the `Agent` step / engine §3 note the fail-closed-on-failed-agent
+  behaviour; the `CWR_BUDGET` description states the honest consumable-budget semantics and the
+  off-by-one. `Lint`'s branch comment now documents the intersection discipline.
+
+### Preserved invariants
+
+- Loop ceiling (termination guarantee); gate-Fail-blocks; runtime token digest-only; floor
+  reachability; determinism / byte-identical replay; `lib/` depends on **yojson only**;
+  `Expr.eval` totality; lint-clean ⇒ validate; schema↔parser parity / no-drift
+  (`scripts/parity_check.py` still 0 divergences).
+
 ## v0.7.1
 
 Final parity fix from a confirming external audit (94/95 cases agreed; this closes the last one).

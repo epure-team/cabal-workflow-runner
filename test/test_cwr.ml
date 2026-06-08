@@ -103,6 +103,35 @@ let test_total_dsl () =
     (Expr.eval ~ctx
        (Expr.Eq (Expr.Path [ "outputs"; "a"; "severity" ], Expr.Lit (Expr.String "high"))))
 
+(* ---- v0.8 F2: Exists treats a present object as present ---- *)
+
+let test_exists_present_object () =
+  (* a = {"obj": {...}} : a present object => Exists true *)
+  let ctx_obj =
+    [ ("outputs", `Assoc [ ("a", `Assoc [ ("obj", `Assoc [ ("k", `Int 1) ]) ]) ]) ]
+  in
+  Alcotest.(check bool) "exists present object => true" true
+    (Expr.eval ~ctx:ctx_obj (Expr.Exists [ "outputs"; "a"; "obj" ]));
+  (* a = {"obj": null} : explicit JSON null => Exists false *)
+  let ctx_null = [ ("outputs", `Assoc [ ("a", `Assoc [ ("obj", `Null) ]) ]) ] in
+  Alcotest.(check bool) "exists explicit null => false" false
+    (Expr.eval ~ctx:ctx_null (Expr.Exists [ "outputs"; "a"; "obj" ]));
+  (* missing path => false *)
+  Alcotest.(check bool) "exists missing path => false" false
+    (Expr.eval ~ctx:ctx_obj (Expr.Exists [ "outputs"; "a"; "nope" ]));
+  (* a present scalar => true *)
+  let ctx_scalar =
+    [ ("outputs", `Assoc [ ("a", `Assoc [ ("obj", `String "x") ]) ]) ]
+  in
+  Alcotest.(check bool) "exists present scalar => true" true
+    (Expr.eval ~ctx:ctx_scalar (Expr.Exists [ "outputs"; "a"; "obj" ]));
+  (* a present array => true *)
+  let ctx_arr =
+    [ ("outputs", `Assoc [ ("a", `Assoc [ ("obj", `List [ `Int 1 ]) ]) ]) ]
+  in
+  Alcotest.(check bool) "exists present array => true" true
+    (Expr.eval ~ctx:ctx_arr (Expr.Exists [ "outputs"; "a"; "obj" ]))
+
 (* ---- TEST 1 (spec): structured output drives a branch ---- *)
 
 let branch_wf =
@@ -173,6 +202,45 @@ let test_schema_fail_closed () =
   | o ->
       Alcotest.failf "expected Aborted on schema mismatch, got %s"
         (Types.string_of_outcome o)
+
+(* ---- v0.8 F1: a failed agent step FAILS CLOSED (aborts the walk) ---- *)
+
+(* A workflow whose FIRST agent stub returns success=false, then an always-true
+   gate + commit + token. The old engine fell through and continued, letting the
+   commit fire despite the failure. Now the failed agent aborts: Aborted, NOT
+   Committed, and no Committed_step in the trace. Replay reproduces the Aborted. *)
+let test_failed_agent_fails_closed () =
+  let wf =
+    {
+      name = "failed-agent";
+      steps =
+        [
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None };
+          Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
+          Commit { id = "submit" };
+        ];
+    }
+  in
+  (* a backend whose agent returns success=false with an error object *)
+  let agent ~id:_ ~prompt:_ ~read_only:_ =
+    (false, `Assoc [ ("error", `String "boom") ])
+  in
+  let backend = Backend.stub ~agent () in
+  let v = validate_ok ~floor:[ "g" ] wf in
+  let outcome, trace = Engine.run ~backend ~token:(Some "tok") v in
+  (match outcome with
+  | Aborted _ -> ()
+  | o ->
+      Alcotest.failf "expected Aborted on a failed agent, got %s"
+        (Types.string_of_outcome o));
+  let committed =
+    List.exists (function Committed_step _ -> true | _ -> false) trace
+  in
+  Alcotest.(check bool) "commit NOT reached" false committed;
+  (* run and replay agree on the trace shape: Agent_ran{success=false};
+     Blocked_at; terminal Aborted. *)
+  let replayed = Engine.replay ~trace v in
+  Alcotest.(check outcome_testable) "replay identical (Aborted)" outcome replayed
 
 (* ---- TEST 6 (spec): ungoverned loop rejected ---- *)
 
@@ -465,6 +533,27 @@ let test_replay_with_loop () =
   Alcotest.(check outcome_testable) "second run identical outcome" outcome outcome2;
   Alcotest.(check bool) "second run identical trace" true (trace = trace2)
 
+(* ---- v0.8 F4: replay rejects trailing extra trace entries ---- *)
+
+(* Take a real recorded trace; the unmodified trace replays fine, but the trace
+   with one extra dummy entry appended must raise Replay_mismatch. *)
+let test_replay_rejects_trailing_entries () =
+  let v = validate_ok ~floor:[ "g" ] gated_workflow in
+  let outcome, trace = Engine.run ~backend:(Backend.stub ()) ~token:(Some "tok") v in
+  (* unmodified trace replays fine *)
+  let replayed = Engine.replay ~trace v in
+  Alcotest.(check outcome_testable) "unmodified trace replays fine" outcome
+    replayed;
+  (* append one extra dummy entry => Replay_mismatch *)
+  let trace_plus = trace @ [ Loop_iter { index = 99 } ] in
+  let raised =
+    try
+      ignore (Engine.replay ~trace:trace_plus v);
+      false
+    with Engine.Replay_mismatch _ -> true
+  in
+  Alcotest.(check bool) "trailing entry => Replay_mismatch" true raised
+
 (* ---- KEEP: fail-closed validation ---- *)
 
 let test_validate_commit_no_gate () =
@@ -720,6 +809,76 @@ let test_lint_dangling_output_ref () =
   Alcotest.(check bool) "has dangling-output-ref" true
     (has_code "dangling-output-ref" ds);
   Alcotest.(check bool) "no errors for that alone" false (Lint.has_errors ds)
+
+(* ---- v0.8 F3: branch-dependent dangling output ref (intersection) ---- *)
+
+(* A gate AFTER a branch references outputs.x.v where x is produced ONLY in the
+   then arm. Under the old union behaviour this was silently NOT flagged; with
+   the intersection discipline it is a dangling-output-ref Warning. *)
+let test_lint_branch_one_arm_only_dangling () =
+  let wf =
+    {
+      name = "one-arm-ref";
+      steps =
+        [
+          Branch
+            {
+              when_ = Expr.Lit (Expr.Bool true);
+              then_ =
+                [
+                  Agent
+                    {
+                      id = "x";
+                      prompt = "p";
+                      read_only = true;
+                      output_schema = Some [ ("v", Schema.Int) ];
+                    };
+                ];
+              else_ =
+                [
+                  Agent
+                    { id = "y"; prompt = "p"; read_only = true; output_schema = None };
+                ];
+            };
+          (* references x.v, produced only in the then arm *)
+          Gate { id = "g"; when_ = Expr.Exists [ "outputs"; "x"; "v" ] };
+        ];
+    }
+  in
+  let ds = Lint.check ~floor_gates:[] wf in
+  Alcotest.(check bool) "one-arm-only ref => dangling-output-ref" true
+    (has_code "dangling-output-ref" ds)
+
+(* A reference AFTER the branch to an output produced in BOTH arms => no
+   dangling-output-ref warning. *)
+let test_lint_branch_both_arms_ok () =
+  let mk id =
+    Agent
+      {
+        id;
+        prompt = "p";
+        read_only = true;
+        output_schema = Some [ ("v", Schema.Int) ];
+      }
+  in
+  let wf =
+    {
+      name = "both-arms-ref";
+      steps =
+        [
+          Branch
+            {
+              when_ = Expr.Lit (Expr.Bool true);
+              then_ = [ mk "x" ];
+              else_ = [ mk "x" ];
+            };
+          Gate { id = "g"; when_ = Expr.Exists [ "outputs"; "x"; "v" ] };
+        ];
+    }
+  in
+  let ds = Lint.check ~floor_gates:[] wf in
+  Alcotest.(check bool) "both-arms ref => no dangling-output-ref" false
+    (has_code "dangling-output-ref" ds)
 
 (* ---- LINT 5: the CONTRACT (lint-clean <=> validate Ok) ---- *)
 
@@ -1401,6 +1560,8 @@ let () =
         [
           Alcotest.test_case "total: missing/mismatch => false, no raise" `Quick
             test_total_dsl;
+          Alcotest.test_case "F2: Exists treats present object/array as present"
+            `Quick test_exists_present_object;
         ] );
       ( "structured-output",
         [
@@ -1410,6 +1571,8 @@ let () =
             test_branch_low;
           Alcotest.test_case "missing schema field => Aborted (fail-closed)"
             `Quick test_schema_fail_closed;
+          Alcotest.test_case "F1: failed agent step fails closed (Aborted)"
+            `Quick test_failed_agent_fails_closed;
         ] );
       ( "governed-loops",
         [
@@ -1450,6 +1613,8 @@ let () =
         [
           Alcotest.test_case "governed loop + structured agents replays identically"
             `Quick test_replay_with_loop;
+          Alcotest.test_case "F4: replay rejects trailing extra trace entries"
+            `Quick test_replay_rejects_trailing_entries;
         ] );
       ( "happy-path",
         [
@@ -1475,6 +1640,12 @@ let () =
             test_lint_all_at_once;
           Alcotest.test_case "dangling-output-ref is a warning, not error"
             `Quick test_lint_dangling_output_ref;
+          Alcotest.test_case
+            "F3: ref to one-arm-only output after branch => dangling warning"
+            `Quick test_lint_branch_one_arm_only_dangling;
+          Alcotest.test_case
+            "F3: ref to both-arms output after branch => no warning" `Quick
+            test_lint_branch_both_arms_ok;
           Alcotest.test_case "contract: examples lint-clean AND validate Ok"
             `Quick test_lint_contract_examples;
           Alcotest.test_case "contract: known-bad has_errors AND validate Error"
