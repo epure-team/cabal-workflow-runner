@@ -178,6 +178,76 @@ match Validate.workflow ~floor_gates:["g-observed"; "g-independent"] wf with
     ...
 ```
 
+## 4a. Meta-agent: building workflows dynamically
+
+A meta-agent that *generates* its own workflows needs to know, **before** running
+anything, whether a candidate workflow is well-formed and safe — and, when it is not,
+**why**, in a form it can act on. The `Lint` library is that feedback channel. It is
+**pure, offline, and instant** (no agent, no backend, no I/O), so it is free to call in
+a tight generate → lint → fix loop.
+
+### The embedding pattern
+
+```ocaml
+open Cabal_workflow_runner
+
+let floor_gates = [ "g-observed"; "g-independent" ]
+
+let rec gen attempts =
+  let raw = run_generator_agent prompt in            (* the LLM emits a workflow JSON *)
+  match Lint.check_json ~floor_gates raw with
+  | [] ->                                             (* lint-clean: guaranteed to validate *)
+      (match Workflow_json.of_string raw with
+       | Ok wf -> Validate.workflow ~floor_gates wf   (* returns Ok by the contract below *)
+       | Error _ -> assert false)                     (* unreachable: check_json already parsed it *)
+  | ds when Lint.has_errors ds && attempts > 0 ->
+      (* feed the machine-readable diagnostics back into the next prompt *)
+      let feedback = Yojson.Safe.to_string (Lint.to_json ds) in
+      gen ~prompt:(prompt ^ "\nFix these diagnostics:\n" ^ feedback) (attempts - 1)
+  | ds ->
+      (* only warnings (or out of attempts): accept and validate *)
+      ...
+```
+
+`Lint.check_json` is **parse-tolerant and never raises**: malformed JSON yields a single
+`invalid-json` error (loc `"$"`), a shape error yields `invalid-shape`, and only a
+well-formed workflow reaches the semantic checks. So a generator's *raw* string output
+can be linted directly, with no exception handling around the call.
+
+### The contract: lint-clean ⇒ validate
+
+`Validate.workflow` is **defined in terms of `Lint.check`**: it computes the diagnostics
+and returns `Ok validated` iff `not (Lint.has_errors ds)`. The gate and the linter
+therefore share **one source of truth** and cannot drift. The guarantee the meta-agent
+relies on:
+
+> **A workflow with no error-severity diagnostics is guaranteed to `Validate.workflow`.**
+
+Warnings never fail the floor — they are legal, runnable shapes that a generator likely
+got wrong (a dangling output reference, a missing output schema, no commit at all,
+unreachable steps after a commit).
+
+### Stable diagnostic codes
+
+The `code` is a stable identifier an embedder can branch on (the `message` is for
+humans/agents; the `loc` is a JSON path to the offending node, e.g. `steps[3].body[0]`).
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `invalid-json` | error | `check_json` received non-JSON (loc `"$"`). |
+| `invalid-shape` | error | parsed JSON is not a valid workflow (unknown `kind`, missing/ill-typed field). |
+| `ungoverned-loop` | error | a `Loop` with an empty `governors` list. |
+| `unbounded-max-iters` | error | a `Max_iters n` with `n < 1`. |
+| `bad-fixpoint-window` | error | a `Fixpoint` with `window < 1`. |
+| `commit-missing-floor-gate` | error | a `Commit` reachable without all floor gates guaranteed on every path (one per offending commit, naming the missing gate(s)). |
+| `dangling-output-ref` | warning | an expression references `outputs.<id>.<field>` where no prior agent step produced `<id>` on the path, or its `output_schema` declares no such `<field>`. |
+| `missing-output-schema` | warning | a referenced agent step declares no `output_schema` (its output can't be validated). |
+| `no-commit` | warning | the workflow has no `Commit` step at all. |
+| `unreachable-after-commit` | warning | a step follows a `Commit` at the same level (a commit ends the run). |
+
+The error codes are **exactly** the floor + parse/shape failures `Validate.workflow`
+enforces — which is what makes the lint-clean ⇒ validate contract hold by construction.
+
 ## 5. Input format and planned follow-ups
 
 MVP input is **JSON** (`Workflow_json`, fail-closed on malformed input). Each step is

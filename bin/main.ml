@@ -46,6 +46,36 @@ let cmd_validate file floor_gates =
         file (String.concat "; " floor_gates);
       0
 
+(* ---- lint subcommand ---- *)
+
+let severity_str = function
+  | Lint.Error -> "error"
+  | Lint.Warning -> "warning"
+
+let print_lint_table (ds : Lint.diagnostic list) =
+  if ds = [] then print_endline "no diagnostics"
+  else
+    List.iter
+      (fun (d : Lint.diagnostic) ->
+        Printf.printf "  %-7s %-26s %-22s %s\n" (severity_str d.severity) d.code
+          d.loc d.message)
+      ds
+
+let cmd_lint file floor_gates json =
+  let raw =
+    try Ok (In_channel.with_open_bin file In_channel.input_all)
+    with Sys_error msg -> Error msg
+  in
+  match raw with
+  | Error msg ->
+      Printf.eprintf "cannot read file: %s\n" msg;
+      1
+  | Ok raw ->
+      let ds = Lint.check_json ~floor_gates raw in
+      if json then print_endline (Yojson.Safe.to_string (Lint.to_json ds))
+      else print_lint_table ds;
+      if Lint.has_errors ds then 1 else 0
+
 (* ---- run subcommand ---- *)
 
 let cmd_run file floor_gates approve =
@@ -98,6 +128,21 @@ let approve_arg =
           "Runtime human-approval token required to execute a Commit. Hashed \
            for the trace; never stored raw. Absent => commit is Blocked.")
 
+let json_arg =
+  Arg.(
+    value & flag
+    & info [ "json" ]
+        ~doc:"Print diagnostics as JSON ({\"diagnostics\":[..]}) instead of a table.")
+
+let lint_cmd =
+  let doc =
+    "Lint a workflow file (parse-tolerant). Prints all diagnostics; exits \
+     non-zero iff there is an error-severity diagnostic (warnings alone exit 0)."
+  in
+  Cmd.v
+    (Cmd.info "lint" ~doc)
+    Term.(const cmd_lint $ file_arg $ floor_arg $ json_arg)
+
 let validate_cmd =
   let doc = "Validate a workflow against the safety floor (fail-closed)." in
   Cmd.v
@@ -111,6 +156,6 @@ let run_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.2.0" ~doc in
-  let group = Cmd.group info [ validate_cmd; run_cmd ] in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.3.0" ~doc in
+  let group = Cmd.group info [ lint_cmd; validate_cmd; run_cmd ] in
   exit (Cmd.eval' group)

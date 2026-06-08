@@ -477,6 +477,235 @@ let test_happy_path () =
   | Committed { id; _ } -> Alcotest.(check string) "committed id" "submit" id
   | o -> Alcotest.failf "expected Committed, got %s" (Types.string_of_outcome o)
 
+(* ===================================================================== *)
+(* v0.3: Lint library — meta-agent usable                                *)
+(* ===================================================================== *)
+
+let has_code code ds =
+  List.exists (fun (d : Lint.diagnostic) -> d.code = code) ds
+
+let count_errors ds =
+  List.length (List.filter (fun (d : Lint.diagnostic) -> d.severity = Lint.Error) ds)
+
+(* ---- LINT 1: parse-tolerant, never raises (invalid JSON) ---- *)
+
+let test_lint_invalid_json () =
+  let ds =
+    try Lint.check_json "not json{"
+    with e -> Alcotest.failf "check_json raised: %s" (Printexc.to_string e)
+  in
+  Alcotest.(check int) "exactly one diagnostic" 1 (List.length ds);
+  Alcotest.(check bool) "is invalid-json" true (has_code "invalid-json" ds);
+  Alcotest.(check bool) "is an error" true (Lint.has_errors ds);
+  let d = List.hd ds in
+  Alcotest.(check string) "loc is $" "$" d.loc
+
+(* ---- LINT 2: shape error => invalid-shape, no raise ---- *)
+
+let test_lint_invalid_shape () =
+  let ds =
+    try Lint.check_json {|{ "name": "x", "steps": [ { "kind": "frobnicate" } ] }|}
+    with e -> Alcotest.failf "check_json raised: %s" (Printexc.to_string e)
+  in
+  Alcotest.(check bool) "is invalid-shape" true (has_code "invalid-shape" ds);
+  Alcotest.(check bool) "is an error" true (Lint.has_errors ds)
+
+(* ---- LINT 3: all-at-once (>= 2 errors in one call) ---- *)
+
+let test_lint_all_at_once () =
+  (* BOTH an ungoverned loop AND a commit missing its floor gate. *)
+  let wf =
+    {
+      name = "bad";
+      steps =
+        [
+          Loop
+            {
+              body =
+                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None } ];
+              until = None;
+              governors = [];
+            };
+          Commit { id = "submit" };
+        ];
+    }
+  in
+  let ds = Lint.check ~floor_gates:[ "g" ] wf in
+  Alcotest.(check bool) ">= 2 errors collected" true (count_errors ds >= 2);
+  Alcotest.(check bool) "has ungoverned-loop" true (has_code "ungoverned-loop" ds);
+  Alcotest.(check bool) "has commit-missing-floor-gate" true
+    (has_code "commit-missing-floor-gate" ds)
+
+(* ---- LINT 4: dangling-output-ref warning (and NOT an error) ---- *)
+
+let test_lint_dangling_output_ref () =
+  let wf =
+    {
+      name = "dangling";
+      steps =
+        [
+          Gate
+            {
+              id = "g";
+              when_ = Expr.Exists [ "outputs"; "nope"; "x" ];
+            };
+        ];
+    }
+  in
+  let ds = Lint.check ~floor_gates:[] wf in
+  Alcotest.(check bool) "has dangling-output-ref" true
+    (has_code "dangling-output-ref" ds);
+  Alcotest.(check bool) "no errors for that alone" false (Lint.has_errors ds)
+
+(* ---- LINT 5: the CONTRACT (lint-clean <=> validate Ok) ---- *)
+
+let test_lint_contract_examples () =
+  let load f = match Workflow_json.of_file f with
+    | Ok wf -> wf
+    | Error e -> Alcotest.failf "could not load %s: %s" f e
+  in
+  let check_clean f floor =
+    let wf = load f in
+    let ds = Lint.check ~floor_gates:floor wf in
+    Alcotest.(check bool)
+      (Printf.sprintf "%s has no error diagnostics" f)
+      false (Lint.has_errors ds);
+    match Validate.workflow ~floor_gates:floor wf with
+    | Ok _ -> ()
+    | Error e -> Alcotest.failf "%s: lint-clean but Validate.workflow Error: %s" f e
+  in
+  check_clean "../examples/bounty.workflow.json"
+    [ "g-validated"; "g-observed"; "g-independent" ];
+  check_clean "../examples/smoke.workflow.json" [ "g-observed" ]
+
+let test_lint_contract_badness () =
+  (* A known-bad workflow: commit with no required floor gate. *)
+  let wf = { name = "bad"; steps = [ Commit { id = "submit" } ] } in
+  let ds = Lint.check ~floor_gates:[ "g" ] wf in
+  Alcotest.(check bool) "has_errors true" true (Lint.has_errors ds);
+  match Validate.workflow ~floor_gates:[ "g" ] wf with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "known-bad workflow must NOT validate"
+
+(* ---- LINT 6: to_json / diagnostic_to_json shape ---- *)
+
+let test_lint_to_json_shape () =
+  let d : Lint.diagnostic =
+    { severity = Lint.Error; code = "ungoverned-loop";
+      message = "loop is ungoverned"; loc = "steps[0].governors" }
+  in
+  let j = Lint.diagnostic_to_json d in
+  let field k = match j with
+    | `Assoc fs -> List.assoc_opt k fs
+    | _ -> None
+  in
+  Alcotest.(check (option string)) "severity" (Some "error")
+    (match field "severity" with Some (`String s) -> Some s | _ -> None);
+  Alcotest.(check (option string)) "code" (Some "ungoverned-loop")
+    (match field "code" with Some (`String s) -> Some s | _ -> None);
+  Alcotest.(check (option string)) "loc" (Some "steps[0].governors")
+    (match field "loc" with Some (`String s) -> Some s | _ -> None);
+  (* warning serialises as "warning" *)
+  let w = Lint.diagnostic_to_json { d with severity = Lint.Warning } in
+  (match w with
+   | `Assoc fs -> (match List.assoc_opt "severity" fs with
+       | Some (`String "warning") -> ()
+       | _ -> Alcotest.fail "warning severity must serialise as \"warning\"")
+   | _ -> Alcotest.fail "diagnostic_to_json must be an object");
+  (* to_json wraps in {"diagnostics":[..]} *)
+  match Lint.to_json [ d ] with
+  | `Assoc [ ("diagnostics", `List [ _ ]) ] -> ()
+  | _ -> Alcotest.fail "to_json must be {\"diagnostics\":[..]}"
+
+(* ---- LINT 7: the headline generate->fix loop converges ---- *)
+
+(* A tiny pure fixer keyed on diagnostic CODES. This stands in for a meta-agent
+   patching its own generated workflow from the (stable) diagnostics. *)
+let rec insert_gate_before_commit gate steps =
+  List.concat_map
+    (function
+      | Commit _ as c -> [ Gate { id = gate; when_ = Expr.Lit (Expr.Bool true) }; c ]
+      | Branch { when_; then_; else_ } ->
+          [ Branch { when_;
+                     then_ = insert_gate_before_commit gate then_;
+                     else_ = insert_gate_before_commit gate else_ } ]
+      | s -> [ s ])
+    steps
+
+let rec govern_loops steps =
+  List.map
+    (function
+      | Loop { body; until; governors = [] } ->
+          Loop { body = govern_loops body; until; governors = [ Max_iters 3 ] }
+      | Loop { body; until; governors } ->
+          (* fix bad bounds too *)
+          let governors =
+            List.map
+              (function
+                | Max_iters n when n < 1 -> Max_iters 1
+                | Fixpoint { window; progress } when window < 1 ->
+                    Fixpoint { window = 1; progress }
+                | g -> g)
+              governors
+          in
+          Loop { body = govern_loops body; until; governors }
+      | Branch { when_; then_; else_ } ->
+          Branch { when_; then_ = govern_loops then_; else_ = govern_loops else_ }
+      | s -> s)
+    steps
+
+let fixer ~floor (ds : Lint.diagnostic list) (wf : workflow) : workflow =
+  List.fold_left
+    (fun wf (d : Lint.diagnostic) ->
+      match d.code with
+      | "ungoverned-loop" | "unbounded-max-iters" | "bad-fixpoint-window" ->
+          { wf with steps = govern_loops wf.steps }
+      | "commit-missing-floor-gate" ->
+          (* insert each missing floor gate before every commit *)
+          let steps =
+            List.fold_left
+              (fun steps g -> insert_gate_before_commit g steps)
+              wf.steps floor
+          in
+          { wf with steps }
+      | _ -> wf)
+    wf ds
+
+let test_lint_generate_fix_loop () =
+  let floor = [ "g" ] in
+  (* deliberately bad: ungoverned loop + commit with no floor gate *)
+  let bad =
+    {
+      name = "self-correcting";
+      steps =
+        [
+          Loop
+            {
+              body =
+                [ Agent { id = "w"; prompt = "p"; read_only = false; output_schema = None } ];
+              until = None;
+              governors = [];
+            };
+          Commit { id = "submit" };
+        ];
+    }
+  in
+  let rec converge n wf =
+    if n <= 0 then Alcotest.fail "generate->fix loop did not converge within bound"
+    else
+      let ds = Lint.check ~floor_gates:floor wf in
+      if not (Lint.has_errors ds) then wf
+      else converge (n - 1) (fixer ~floor ds wf)
+  in
+  let fixed = converge 5 bad in
+  (* lint-clean now... *)
+  Alcotest.(check bool) "converged to no errors" false
+    (Lint.has_errors (Lint.check ~floor_gates:floor fixed));
+  (* ...and the contract says it must validate. *)
+  match Validate.workflow ~floor_gates:floor fixed with
+  | Ok _ -> ()
+  | Error e -> Alcotest.failf "converged workflow failed to validate: %s" e
+
 let () =
   Alcotest.run "cabal_workflow_runner"
     [
@@ -537,5 +766,24 @@ let () =
         [
           Alcotest.test_case "gated + token + pass => Committed" `Quick
             test_happy_path;
+        ] );
+      ( "lint",
+        [
+          Alcotest.test_case "invalid JSON => invalid-json, no raise" `Quick
+            test_lint_invalid_json;
+          Alcotest.test_case "shape error => invalid-shape, no raise" `Quick
+            test_lint_invalid_shape;
+          Alcotest.test_case "all-at-once: >= 2 errors in one call" `Quick
+            test_lint_all_at_once;
+          Alcotest.test_case "dangling-output-ref is a warning, not error"
+            `Quick test_lint_dangling_output_ref;
+          Alcotest.test_case "contract: examples lint-clean AND validate Ok"
+            `Quick test_lint_contract_examples;
+          Alcotest.test_case "contract: known-bad has_errors AND validate Error"
+            `Quick test_lint_contract_badness;
+          Alcotest.test_case "to_json / diagnostic_to_json shape" `Quick
+            test_lint_to_json_shape;
+          Alcotest.test_case "generate->fix loop converges + validates" `Quick
+            test_lint_generate_fix_loop;
         ] );
     ]

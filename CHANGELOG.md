@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.3
+
+A **`Lint` library** designed to be embedded by a meta-agent that builds its own
+workflows dynamically. Library-first: `lib/lint.mli` is the deliverable; the CLI
+`lint` subcommand is a thin convenience.
+
+### Added
+
+- **`Lint` (`lib/lint.ml(i)`)** — a pure, offline, yojson-only linter.
+  - `check ?floor_gates wf` runs ALL floor + semantic checks over a typed
+    workflow and collects every diagnostic in one pass (never first-error-only).
+  - `check_json ?floor_gates raw` is the meta-agent entry point: it lints a
+    generator's RAW string output. **Parse-tolerant** — malformed JSON becomes a
+    single `invalid-json` error and a shape error becomes `invalid-shape`; it
+    **never raises**.
+  - `diagnostic`s carry a STABLE machine `code`, a human/agent `message`, and a
+    JSON-path `loc` (e.g. `steps[3].body[0]`). `diagnostic_to_json` / `to_json`
+    serialise them (`{"diagnostics":[..]}`) for feeding back into a generator
+    prompt. `has_errors` distinguishes floor failures from advisory warnings.
+  - **Error codes** (floor + parse/shape, make a workflow unrunnable):
+    `invalid-json`, `invalid-shape`, `ungoverned-loop`, `unbounded-max-iters`,
+    `bad-fixpoint-window`, `commit-missing-floor-gate`.
+  - **Warning codes** (legal + runnable, but a generator likely erred):
+    `dangling-output-ref`, `missing-output-schema`, `no-commit`,
+    `unreachable-after-commit`.
+- **CLI `lint <file> [--floor <g>]... [--json]`** — reads the file, calls
+  `Lint.check_json`, prints a human table by default or `Lint.to_json` with
+  `--json`. Exits non-zero **iff** there is an error-severity diagnostic
+  (warnings alone exit 0).
+- **Docs:** a "Meta-agent: building workflows dynamically" section in `SPEC.md`
+  and `README.md` (the generate → lint → fix embedding loop, the stable
+  diagnostic-code table, and the lint-clean ⇒ validate contract).
+
+### Changed
+
+- **`Validate.workflow` is now defined in terms of `Lint.check`.** It computes
+  diagnostics and returns `Ok validated` iff `not (has_errors ds)`, else `Error`
+  rendered from the error diagnostics. The gate and the linter therefore share
+  **ONE source of truth** and cannot drift: a workflow with no error-severity
+  diagnostics is **guaranteed** to validate. The signature
+  (`?floor_gates -> Types.workflow -> (Validated.t, string) result`) and all
+  existing behaviour are unchanged.
+
+### Preserved invariants
+
+- Abstract `Validate.Validated.t`; `Engine.run`/`replay` require it.
+- `Commit` needs a runtime token (hashed for the trace, never stored raw).
+- Floor gates guaranteed on every path to a commit.
+- `lib/` depends on **yojson only** — cabal stays confined to `bin/`.
+
 ## v0.2.1
 
 First **live end-to-end run** against a real agent (validated on Claude Haiku).

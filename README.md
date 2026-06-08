@@ -38,6 +38,13 @@ dune test
 ## CLI
 
 ```sh
+# Lint a workflow (parse-tolerant: malformed JSON / bad shape become diagnostics).
+# Human table by default; --json prints {"diagnostics":[..]}. Exits non-zero ONLY
+# on an error-severity diagnostic (warnings alone exit 0).
+cabal-workflow-runner lint examples/bounty.workflow.json \
+  --floor g-validated --floor g-observed --floor g-independent
+cabal-workflow-runner lint examples/smoke.workflow.json --floor g-observed --json
+
 # Fail-closed validation against an embedder-supplied safety floor:
 cabal-workflow-runner validate examples/bounty.workflow.json \
   --floor g-validated --floor g-observed --floor g-independent
@@ -77,6 +84,42 @@ let () =
       let outcome, trace = Engine.run ~backend ~token:(Some "approve") validated in
       assert (Engine.replay ~trace validated = outcome)  (* deterministic replay *)
 ```
+
+## Meta-agent: building workflows dynamically
+
+The `Lint` library (`lib/lint.ml(i)`, **pure, offline, yojson-only**) is the feedback
+channel for a meta-agent that *generates* its own workflows. It is free to call in a
+tight generate → lint → fix loop (no agent, no backend, no I/O):
+
+```ocaml
+open Cabal_workflow_runner
+
+let rec gen ~prompt attempts =
+  let raw = run_generator_agent prompt in              (* LLM emits a workflow JSON string *)
+  match Lint.check_json ~floor_gates raw with          (* parse-tolerant; never raises *)
+  | [] ->                                               (* lint-clean ⇒ guaranteed to validate *)
+      Result.bind (Workflow_json.of_string raw) (Validate.workflow ~floor_gates)
+  | ds when Lint.has_errors ds && attempts > 0 ->
+      let feedback = Yojson.Safe.to_string (Lint.to_json ds) in   (* machine-readable *)
+      gen ~prompt:(prompt ^ "\nFix:\n" ^ feedback) (attempts - 1) (* feed back into next prompt *)
+  | ds -> (* warnings only / out of attempts: accept *) accept raw ds
+```
+
+Two properties make this work:
+
+- **`check_json` is parse-tolerant and never raises** — malformed JSON → one
+  `invalid-json` error, a bad shape → `invalid-shape`. You lint the generator's *raw*
+  output with no exception handling.
+- **lint-clean ⇒ validate.** `Validate.workflow` is *defined in terms of `Lint.check`*,
+  so a workflow with **no error-severity diagnostics is guaranteed to validate** — the
+  gate and the linter share one source of truth and cannot drift.
+
+Diagnostics carry a **stable machine `code`** (e.g. `ungoverned-loop`,
+`commit-missing-floor-gate`, `dangling-output-ref`), an agent/human `message`, and a
+JSON-path `loc` (e.g. `steps[3].body[0]`). Errors are exactly the floor + parse/shape
+failures; warnings (`dangling-output-ref`, `missing-output-schema`, `no-commit`,
+`unreachable-after-commit`) are legal-but-likely-mistaken shapes that never fail the
+floor. See [`SPEC.md`](SPEC.md) §4a for the full code table and the contract.
 
 ## License
 
