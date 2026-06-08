@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.3"
+
+      - name: Pin the public cabal library and install deps
+        run: |
+          opam pin add -n cabal https://github.com/epure-team/cabal.git
+          opam install . --deps-only --with-test
+
+      - name: Build
+        run: opam exec -- dune build
+
+      - name: Test
+        run: opam exec -- dune runtest
+
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.3"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Pin the public cabal library and install deps
+        run: |
+          opam pin add -n cabal https://github.com/epure-team/cabal.git
+          opam install . --deps-only --with-test
+
+      - name: Install jsonschema
+        run: pip install jsonschema
+
+      - name: Build (produce _build/default/bin/main.exe)
+        run: opam exec -- dune build
+
+      - name: Schema <-> parser parity check
+        run: python3 scripts/parity_check.py

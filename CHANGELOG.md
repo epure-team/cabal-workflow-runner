@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.8.1
+
+Tooling / open-source-readiness changes only — **no runtime behaviour change**, so
+the CLI `--version` stays `0.8.0`.
+
+### Tooling
+
+- **CI (GitHub Actions).** `.github/workflows/ci.yml` reproduces the documented build
+  on `ubuntu-latest`: `ocaml/setup-ocaml@v3` (OCaml 5.3), pins the public cabal
+  (`opam pin add -n cabal …`), `opam install . --deps-only --with-test`, then
+  `dune build` + `dune runtest`. A second job runs the schema↔parser parity check
+  (`setup-python` → `pip install jsonschema` → `dune build` → `python3
+  scripts/parity_check.py`).
+- **Standalone test binary.** The four example/schema fixture loads in
+  `test/test_cwr.ml` previously used cwd-relative `../examples/…` / `../schema/…`
+  paths that only resolved under the `dune test` sandbox, so `dune exec
+  test/test_cwr.exe` from the repo root spuriously failed. A `project_path` helper now
+  resolves fixtures via `DUNE_SOURCEROOT` (set by dune for `dune exec`/`dune test`),
+  falling back to the legacy `../` form. Both `dune test` and `dune exec
+  test/test_cwr.exe` pass (45 tests).
+- **`CONTRIBUTING.md`** added: build/test recipe (cabal pin), the parity-check
+  workflow, the `lib/`-stays-yojson-only rule, the schema↔parser parity contract, and
+  the safety-floor invariants a change must preserve.
+- **`README.md`** gained a prominent "Status: early / experimental (v0.x)" note
+  surfacing the MVP boundaries (in-memory replay, JSON-only format, no `Spawn`, the
+  small-model live-dispatch validation) and a one-line AI-assistance disclosure.
+- Renamed a test fixture token from `super-secret-approval` to `test-approval-token`
+  (cosmetic; tests stay green).
+
 ## v0.8
 
 A **corrective release** addressing five findings from an external review. Two engine

@@ -1,5 +1,13 @@
 # cabal-workflow-runner
 
+> **Status: early / experimental (v0.x).** The core — deterministic engine,
+> fail-closed validator, governed loops, replay, and the schema↔parser contract —
+> is implemented and tested, but the MVP boundaries are real: replay is **in-memory
+> only** (no on-disk ledger or `replay <file>` CLI yet), the workflow format is
+> **JSON only** (YAML / Markdown front-ends are planned), there is **no `Spawn` /
+> sub-workflow step** yet, and the cabal-backed **live-dispatch path has been
+> validated on one small model**, not broadly. Interfaces may change.
+
 A **deterministic workflow engine on [cabal](https://github.com/epure-team/cabal)**
 (the Caml Agent Backend Abstraction Library). It interprets a declarative workflow —
 sequence, **governed loop**, branch, gate, and a terminal commit — running the
@@ -182,6 +190,14 @@ JSON-path `loc` (e.g. `steps[3].body[0]`). Errors are exactly the floor + parse/
 failures; warnings (`dangling-output-ref`, `missing-output-schema`, `no-commit`,
 `unreachable-after-commit`) are legal-but-likely-mistaken shapes that never fail the
 floor. See [`SPEC.md`](SPEC.md) §4a for the full code table and the contract.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build, test, run the
+schema↔parser parity check, and the invariants a change must preserve.
+
+This project was built and audited with AI assistance; the per-commit
+`Co-Authored-By` trailers disclose where.
 
 ## License
 

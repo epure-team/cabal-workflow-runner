@@ -3,6 +3,17 @@ open Types
 
 (* ---- helpers ---- *)
 
+(* Resolve a project-relative path (e.g. "examples/smoke.workflow.json") robustly,
+   so the test binary runs both under [dune test]'s sandbox AND standalone via
+   [dune exec test/test_cwr.exe] from the repo root. Dune sets DUNE_SOURCEROOT to
+   the project root for both [dune exec] and [dune test]; we join against it. The
+   fallback is the legacy cwd-relative "../<rel>" form that resolves inside the
+   [dune test] sandbox (cwd = test/). *)
+let project_path rel =
+  match Sys.getenv_opt "DUNE_SOURCEROOT" with
+  | Some root -> Filename.concat root rel
+  | None -> Filename.concat ".." rel
+
 let validate_ok ~floor wf =
   match Validate.workflow ~floor_gates:floor wf with
   | Ok v -> v
@@ -616,7 +627,7 @@ let test_commit_no_token_blocked () =
 
 let test_commit_token_digest_only () =
   let v = validate_ok ~floor:[ "g" ] gated_workflow in
-  let tok = "super-secret-approval" in
+  let tok = "test-approval-token" in
   let outcome, trace = Engine.run ~backend:(Backend.stub ()) ~token:(Some tok) v in
   (match outcome with
   | Committed { token_digest; _ } ->
@@ -688,7 +699,7 @@ let test_false_gate_blocks () =
    the bounty example lints with ZERO diagnostics (no warnings) and the smoke
    example reaches Committed. *)
 let test_bounty_lint_clean_zero_warnings () =
-  match Workflow_json.of_file "../examples/bounty.workflow.json" with
+  match Workflow_json.of_file (project_path "examples/bounty.workflow.json") with
   | Error e -> Alcotest.failf "could not load bounty example: %s" e
   | Ok wf ->
       let ds =
@@ -700,7 +711,7 @@ let test_bounty_lint_clean_zero_warnings () =
 (* The smoke example's floor gate g-observed evaluates TRUE (observed:true), so
    the run is not Blocked by the new gate semantics and reaches Committed. *)
 let test_smoke_still_committable () =
-  match Workflow_json.of_file "../examples/smoke.workflow.json" with
+  match Workflow_json.of_file (project_path "examples/smoke.workflow.json") with
   | Error e -> Alcotest.failf "could not load smoke example: %s" e
   | Ok wf -> (
       let v = validate_ok ~floor:[ "g-observed" ] wf in
@@ -897,9 +908,9 @@ let test_lint_contract_examples () =
     | Ok _ -> ()
     | Error e -> Alcotest.failf "%s: lint-clean but Validate.workflow Error: %s" f e
   in
-  check_clean "../examples/bounty.workflow.json"
+  check_clean (project_path "examples/bounty.workflow.json")
     [ "g-validated"; "g-observed"; "g-independent" ];
-  check_clean "../examples/smoke.workflow.json" [ "g-observed" ]
+  check_clean (project_path "examples/smoke.workflow.json") [ "g-observed" ]
 
 let test_lint_contract_badness () =
   (* A known-bad workflow: commit with no required floor gate. *)
@@ -1056,10 +1067,11 @@ let test_schema_well_formed () =
 
 (* NO DRIFT: the committed artifact byte-matches Workflow_schema.to_string ().
    This is the key test that keeps the file and the lib value in lock-step.
-   The test cwd is test/, so the artifact is at ../schema/workflow.schema.json
-   (declared as a dep in test/dune). *)
+   The artifact is resolved via [project_path] (DUNE_SOURCEROOT-rooted, falling
+   back to the cwd-relative ../ form inside the dune test sandbox) and is
+   declared as a dep in test/dune. *)
 let test_schema_no_drift () =
-  let path = "../schema/workflow.schema.json" in
+  let path = project_path "schema/workflow.schema.json" in
   let on_disk =
     try In_channel.with_open_bin path In_channel.input_all
     with Sys_error e -> Alcotest.failf "cannot read %s: %s" path e
