@@ -286,6 +286,36 @@ rebuilt context (asserting each recorded verdict), and produces the **same** out
 trace. Because the loop's bound is purely a function of these recorded inputs, **an
 unbounded-but-governed loop still replays byte-identically.**
 
+**On-disk ledger (persisted replay).** Replay is no longer in-memory-only. The
+pure, yojson-only `Ledger` module is the persistence boundary: `Ledger.to_ndjson
+: Types.trace -> string` serialises a trace to newline-delimited JSON (one tagged
+object per `trace_entry`, including the full `Run_executed` result —
+exit/stdout/stderr/truncated and each file's path/change/size/digest), and
+`Ledger.of_ndjson : string -> (Types.trace, string) result` is its **fail-closed**
+inverse (any malformed line ⇒ `Error`, never raises), with round-trip
+`of_ndjson (to_ndjson t) = Ok t` for every trace. The CLI writes the ledger with
+`run --ledger <path>` and re-runs it in a **later process** with
+`replay <wf> --ledger <path> [--floor …]`, which validates the workflow, decodes
+the ledger, and feeds the trace to the same `Engine.replay` (no backend; nothing
+is dispatched/executed). A workflow/ledger mismatch fails closed as
+`Replay_mismatch`. The ledger is **runtime output, not workflow input** — the
+schema is unchanged and there is no parity impact. Consumers such as
+`tools/bounty-pipeline` thereby gain persisted, deterministic replay.
+
+**What replay attests — and what it does NOT (read before trusting a ledger).**
+Replay re-evaluates the pure DSL over the rebuilt context and asserts each recorded
+verdict matches the recompute, so it guarantees the trace is **internally consistent
+with the workflow and the recorded agent/run outputs** — every *structural* tamper
+(corrupt/truncated/reordered/trailing line, a cross-workflow trace, or a verdict
+inconsistent with its inputs) fails closed. It does **NOT authenticate** those
+recorded outputs or the commit token: a ledger is an **unauthenticated,
+attacker-editable file**, so a *forged* ledger (one whose forged agent/run outputs
+make the gates genuinely pass, plus a forged `committed_step`) **can replay to
+`Committed`**. Replay proves "this trace is a valid execution of this workflow given
+these outputs," not "these outputs are real." For tamper-evidence, sign or MAC the
+ledger out of band. (Same spirit as the `file_change.digest` caveat: not a
+cryptographic integrity guarantee.)
+
 ## 4. Embedding
 
 An embedder supplies two things:
@@ -458,9 +488,12 @@ Done since the MVP:
 - **Workflow JSON Schema** (`Workflow_schema` + `schema/workflow.schema.json` + the
   `schema` CLI) — shipped (v0.4).
 
+- **On-disk ledger** plus a `replay` CLI subcommand — shipped (v0.10): `run
+  --ledger <file>` persists a run's trace as NDJSON and `replay <wf> --ledger
+  <file>` re-runs it byte-identically in a later process.
+
 Planned follow-ups (not yet shipped):
 
-- An **on-disk ledger** plus a `replay` CLI subcommand.
 - **YAML** / **Markdown front-matter** workflow front-end (a prose body plus a
   structured header; cabal already depends on a YAML library).
 - A `Spawn` / subworkflow step.

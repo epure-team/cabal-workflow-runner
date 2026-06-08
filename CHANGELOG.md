@@ -1,5 +1,64 @@
 # Changelog
 
+## v0.10
+
+An **on-disk ledger** + **`replay`-from-file**: a run's recorded trace can now be persisted
+to disk and replayed **byte-identically in a later process**. Replay is no longer
+in-memory-only. The persistence boundary is a pure, yojson-only module; `Engine.replay` is
+unchanged (it already took a `trace`). CLI `--version` → `0.10.0`.
+
+**Integrity caveat (be honest with auditors):** replay attests the trace is *internally
+consistent* with the workflow and the recorded agent/run outputs — every structural tamper
+(corrupt/truncated/reordered/trailing line, cross-workflow trace, or a verdict inconsistent
+with its inputs) fails closed — but it does **not authenticate** those outputs or the commit
+token. A ledger is an unauthenticated, attacker-editable file: a *forged* ledger can replay
+to `Committed`. For tamper-evidence, sign/MAC the ledger out of band. (Found by adversarial
+review; documented rather than over-claimed as "re-auditable".)
+
+### Added
+
+- **`lib/ledger.ml(i)` — pure, yojson-only persistence boundary.**
+  - `to_ndjson : Types.trace -> string` serialises a trace to newline-delimited JSON: one
+    tagged (`"kind"`) object per `trace_entry`, in order, each newline-terminated. Every
+    variant is covered — `Agent_ran`, `Gate_evaluated`, `Branch_taken`, `Loop_iter`,
+    `Budget_read`, `Fixpoint_progress`, `Loop_stopped`, `Run_executed` (incl. the FULL
+    `run_result`: exit/stdout/stderr/truncated and each file's path/change/size/digest),
+    `Committed_step`, `Blocked_at`.
+  - `of_ndjson : string -> (Types.trace, string) result` is the **fail-closed** inverse:
+    any malformed line (bad JSON, unknown/missing `kind`, missing/ill-typed field) ⇒
+    `Error`, **never raises**; blank lines (a trailing newline) are ignored. Round-trip:
+    `of_ndjson (to_ndjson t) = Ok t` for every trace.
+- **CLI.** `run` gains **`--ledger <path>`**: after a successful run the recorded trace is
+  written as NDJSON to `<path>`. New subcommand **`replay <workflow.json> --ledger <path>
+  [--floor <g>]…`**: loads + `Validate.workflow`s the workflow, reads the ledger,
+  `Ledger.of_ndjson`s it (clear error on corrupt), and `Engine.replay ~trace`s it — printing
+  the replayed outcome and exiting `0` on success, non-zero on a corrupt ledger, a validation
+  error, or a `Replay_mismatch` (incl. a workflow/ledger mismatch). Replay **never** dispatches
+  an agent or executes a command (no backend consulted), exactly like the in-memory replay.
+
+### Determinism / scope
+
+- **Persisted byte-identical replay.** Because the serialisation round-trips ALL trace
+  entries faithfully and `Engine.replay` re-feeds the recorded results (re-evaluating only the
+  total DSL and asserting each recorded verdict), `replay <wf> --ledger <file>` reproduces the
+  original outcome in a separate process. A workflow/ledger mismatch, a corrupt line, or a
+  trailing extra entry all **fail closed** (the existing trailing-entry guard now reached via
+  the file path) rather than silently "succeeding".
+- **`lib/` stays yojson-only.** The ledger is the on-disk encoding, not an effect;
+  reading/writing the file lives in `bin/`.
+- **No schema / parity impact.** The ledger is **runtime output, not workflow input** — the
+  workflow schema is unchanged and `scripts/parity_check.py` stays at **0 divergences**.
+
+### Tests
+
+- Round-trip over a trace exercising **every** entry variant (incl. a `Run_executed` with
+  file changes and `Loop`/`Budget`/`Fixpoint` entries): `of_ndjson (to_ndjson t) = Ok t`.
+- End-to-end **persist → replay-from-file**: a stub-backend run is written to a temp file,
+  read back via a fresh `of_ndjson`, and `Engine.replay`ed to the identical outcome — with
+  marker counters proving replay called neither `run_agent` nor `run_command`.
+- Corrupt/tampered ledger: a malformed (and an unknown-`kind`) line ⇒ `of_ndjson` `Error`; a
+  ledger with a trailing extra entry decodes but ⇒ `Engine.replay` `Replay_mismatch`.
+
 ## v0.9
 
 A new **`run` step**: an orchestrator-executed, **observable** shell command, designed so

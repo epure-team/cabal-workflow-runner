@@ -2169,6 +2169,188 @@ let test_schema_parser_behavioral_parity () =
         expect_accept accepted)
     behavioral_parity_cases
 
+(* ---- v0.10: on-disk ledger + replay-from-file ---- *)
+
+(* TEST L1 — round-trip: a trace exercising EVERY trace_entry variant (incl. a
+   Run_executed carrying file_changes, plus Loop/Budget/Fixpoint entries)
+   round-trips through to_ndjson/of_ndjson byte-for-byte at the value level:
+   [of_ndjson (to_ndjson t) = Ok t]. *)
+let test_ledger_roundtrip_all_variants () =
+  let trace : trace =
+    [
+      Agent_ran
+        {
+          id = "assess";
+          success = true;
+          output = `Assoc [ ("severity", `String "high"); ("n", `Int 3) ];
+        };
+      Agent_ran { id = "bad"; success = false; output = `Assoc [] };
+      Gate_evaluated { id = "g"; verdict = Pass };
+      Gate_evaluated { id = "g2"; verdict = Fail };
+      Branch_taken { verdict = Pass };
+      Branch_taken { verdict = Fail };
+      Loop_iter { index = 0 };
+      Budget_read { value = 7 };
+      Fixpoint_progress { progress = true };
+      Fixpoint_progress { progress = false };
+      Loop_iter { index = 1 };
+      Loop_stopped { iterations = 2; reason = "budget" };
+      Run_executed
+        {
+          id = "mk";
+          result =
+            {
+              exit = 0;
+              stdout = "hello\nworld";
+              stderr = "warn: x";
+              truncated = true;
+              files =
+                [
+                  { path = "out/x"; change = Created; size = 12; digest = "abc123" };
+                  { path = "out/y"; change = Modified; size = 5; digest = "def456" };
+                  { path = "out/z"; change = Deleted; size = 0; digest = "" };
+                ];
+            };
+        };
+      Committed_step { id = "submit"; token_digest = "deadbeef" };
+      Blocked_at { id = "b"; reason = "gate \"g\" evaluated false" };
+    ]
+  in
+  let serialised = Ledger.to_ndjson trace in
+  (* NDJSON: one newline-terminated line per entry, no blank lines. *)
+  Alcotest.(check int)
+    "one line per entry"
+    (List.length trace)
+    (List.length (List.filter (( <> ) "") (String.split_on_char '\n' serialised)));
+  match Ledger.of_ndjson serialised with
+  | Error e -> Alcotest.failf "round-trip failed to parse: %s" e
+  | Ok back ->
+      Alcotest.(check bool)
+        "of_ndjson (to_ndjson t) = Ok t (every variant)" true (back = trace)
+
+(* TEST L2 — end-to-end persist -> replay-from-file. Run a workflow with a stub
+   backend, persist its trace via to_ndjson to a temp file, read it back with
+   of_ndjson (a SEPARATE decode, simulating a later process), and Engine.replay
+   it: the replayed outcome equals the original run's outcome, and a marker stub
+   proves replay called NEITHER run_agent NOR run_command. *)
+let test_ledger_persist_then_replay_from_file () =
+  let agent_calls = ref 0 in
+  let cmd_calls = ref 0 in
+  let agent ~id ~prompt:_ ~read_only:_ =
+    incr agent_calls;
+    match id with
+    | "assess" -> (true, `Assoc [ ("severity", `String "high") ])
+    | _ -> (true, `Assoc [])
+  in
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+    incr cmd_calls;
+    {
+      exit = 0;
+      stdout = "made";
+      stderr = "";
+      truncated = false;
+      files = [ mk_file "out/x" Created ];
+    }
+  in
+  let backend = Backend.stub ~agent ~run_command () in
+  let wf =
+    {
+      name = "persist-replay";
+      steps =
+        [
+          Agent
+            { id = "assess"; prompt = "p"; read_only = true; output_schema = None };
+          Run
+            {
+              id = "mk";
+              cmd = [ "mkdir"; "out" ];
+              working_dir = "scratch";
+              timeout_ms = None;
+              observe = None;
+            };
+          Gate
+            {
+              id = "g";
+              when_ =
+                Expr.Eq
+                  (Expr.Path [ "outputs"; "mk"; "exit" ], Expr.Lit (Expr.Int 0));
+            };
+          Commit { id = "submit" };
+        ];
+    }
+  in
+  let v = validate_ok ~floor:[ "g" ] wf in
+  let outcome, trace =
+    Engine.run ~run_allowlist:[ "mkdir" ] ~backend ~token:(Some "tok") v
+  in
+  (match outcome with
+  | Committed _ -> ()
+  | o -> Alcotest.failf "expected Committed, got %s" (Types.string_of_outcome o));
+  Alcotest.(check int) "live run dispatched the agent once" 1 !agent_calls;
+  Alcotest.(check int) "live run executed the command once" 1 !cmd_calls;
+  (* Persist to a temp file, then read it back via a fresh decode. *)
+  let path = Filename.temp_file "cwr_ledger" ".ndjson" in
+  Fun.protect
+    ~finally:(fun () -> try Sys.remove path with _ -> ())
+    (fun () ->
+      Out_channel.with_open_bin path (fun oc ->
+          Out_channel.output_string oc (Ledger.to_ndjson trace));
+      let raw = In_channel.with_open_bin path In_channel.input_all in
+      match Ledger.of_ndjson raw with
+      | Error e -> Alcotest.failf "ledger read back as Error: %s" e
+      | Ok trace_from_file ->
+          Alcotest.(check bool)
+            "trace read from file equals original trace" true
+            (trace_from_file = trace);
+          let replayed = Engine.replay ~trace:trace_from_file v in
+          Alcotest.(check outcome_testable)
+            "replay-from-file outcome identical to run" outcome replayed;
+          (* replay touched NO backend effect *)
+          Alcotest.(check int)
+            "replay did NOT call run_agent (count unchanged)" 1 !agent_calls;
+          Alcotest.(check int)
+            "replay did NOT call run_command (count unchanged)" 1 !cmd_calls)
+
+(* TEST L3 — corrupt / tampered ledger. (a) A malformed line => of_ndjson Error
+   (fail-closed, never raises). (b) A valid ledger with a trailing extra entry
+   line decodes fine but Engine.replay raises Replay_mismatch — the existing
+   trailing-entry guard, now reached via the on-disk path. *)
+let test_ledger_corrupt_and_tampered () =
+  let v = validate_ok ~floor:[ "g" ] gated_workflow in
+  let outcome, trace =
+    Engine.run ~backend:(Backend.stub ()) ~token:(Some "tok") v
+  in
+  let good = Ledger.to_ndjson trace in
+  (* (a) malformed JSON line => Error, no raise *)
+  (match Ledger.of_ndjson (good ^ "{not json}\n") with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "malformed line should yield Error");
+  (* a well-formed JSON object with an unknown kind also fails closed *)
+  (match Ledger.of_ndjson (good ^ "{\"kind\":\"bogus\"}\n") with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "unknown kind should yield Error");
+  (* (b) tampered: append one extra (well-formed) entry line; it decodes, but
+     replay rejects the trailing entry with Replay_mismatch. *)
+  let tampered = good ^ Ledger.to_ndjson [ Loop_iter { index = 99 } ] in
+  (match Ledger.of_ndjson tampered with
+  | Error e -> Alcotest.failf "tampered ledger should still decode, got: %s" e
+  | Ok trace_plus ->
+      let raised =
+        try
+          ignore (Engine.replay ~trace:trace_plus v);
+          false
+        with Engine.Replay_mismatch _ -> true
+      in
+      Alcotest.(check bool)
+        "trailing entry via file => Replay_mismatch" true raised);
+  (* sanity: the untampered round-trip replays to the original outcome *)
+  match Ledger.of_ndjson good with
+  | Error e -> Alcotest.failf "untampered ledger decode failed: %s" e
+  | Ok t ->
+      Alcotest.(check outcome_testable)
+        "untampered ledger replays to original outcome" outcome
+        (Engine.replay ~trace:t v)
+
 let () =
   Alcotest.run "cabal_workflow_runner"
     [
@@ -2236,6 +2418,18 @@ let () =
             `Quick test_replay_with_loop;
           Alcotest.test_case "F4: replay rejects trailing extra trace entries"
             `Quick test_replay_rejects_trailing_entries;
+        ] );
+      ( "ledger",
+        [
+          Alcotest.test_case
+            "round-trip: every trace_entry variant survives to_ndjson/of_ndjson"
+            `Quick test_ledger_roundtrip_all_variants;
+          Alcotest.test_case
+            "persist -> replay-from-file: identical outcome, no backend effect"
+            `Quick test_ledger_persist_then_replay_from_file;
+          Alcotest.test_case
+            "corrupt line => Error; tampered (trailing) => Replay_mismatch"
+            `Quick test_ledger_corrupt_and_tampered;
         ] );
       ( "run-step",
         [

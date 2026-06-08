@@ -89,7 +89,7 @@ let cmd_schema () =
 
 (* ---- run subcommand ---- *)
 
-let cmd_run file floor_gates approve allow_run =
+let cmd_run file floor_gates approve allow_run ledger =
   match load_and_validate ~floor_gates file with
   | Error e ->
       Printf.eprintf "%s\n" e;
@@ -106,10 +106,60 @@ let cmd_run file floor_gates approve allow_run =
               Printf.printf "outcome: %s\ntrace:\n"
                 (Types.string_of_outcome outcome);
               print_trace trace;
+              (* Persist the run's trace as an on-disk ledger so it can be
+                 replayed byte-identically in a later process. Written after a
+                 successful walk only (a Blocked/Aborted run exits 2 below). *)
+              (match (ledger, outcome) with
+              | Some path, (Types.Committed _ | Types.Completed_no_commit) -> (
+                  (* Fail gracefully on an unwritable path (matches the read
+                     path), rather than an uncaught Sys_error after the run's
+                     effects already happened. *)
+                  try
+                    Out_channel.with_open_bin path (fun oc ->
+                        Out_channel.output_string oc (Ledger.to_ndjson trace));
+                    Printf.printf "ledger written: %s\n" path
+                  with Sys_error msg ->
+                    Printf.eprintf "could not write ledger: %s\n" msg)
+              | _ -> ());
               match outcome with
               | Types.Committed _ | Types.Completed_no_commit -> ()
               | Types.Blocked _ | Types.Aborted _ -> exit 2));
       0
+
+(* ---- replay subcommand ---- *)
+
+let cmd_replay file floor_gates ledger =
+  match load_and_validate ~floor_gates file with
+  | Error e ->
+      Printf.eprintf "%s\n" e;
+      1
+  | Ok validated -> (
+      let raw =
+        try Ok (In_channel.with_open_bin ledger In_channel.input_all)
+        with Sys_error msg -> Error msg
+      in
+      match raw with
+      | Error msg ->
+          Printf.eprintf "cannot read ledger: %s\n" msg;
+          1
+      | Ok raw -> (
+          match Ledger.of_ndjson raw with
+          | Error e ->
+              Printf.eprintf "corrupt ledger: %s\n" e;
+              1
+          | Ok trace -> (
+              (* Re-feed the recorded trace; NO backend is consulted and no
+                 command is ever dispatched/executed (same as in-memory replay).
+                 A workflow/ledger mismatch surfaces as Replay_mismatch. *)
+              match Engine.replay ~trace validated with
+              | outcome ->
+                  Printf.printf "replayed outcome: %s\ntrace:\n"
+                    (Types.string_of_outcome outcome);
+                  print_trace trace;
+                  0
+              | exception Engine.Replay_mismatch reason ->
+                  Printf.eprintf "replay mismatch: %s\n" reason;
+                  2)))
 
 (* ---- cmdliner wiring ---- *)
 
@@ -174,10 +224,44 @@ let allow_run_arg =
            working_dir bounds the cwd/snapshot but does NOT sandbox the command \
            from absolute paths in its args.")
 
+let ledger_arg =
+  Arg.(
+    value
+    & opt (some string) None
+    & info [ "ledger" ] ~docv:"PATH"
+        ~doc:
+          "After a successful run, write the recorded trace as an on-disk \
+           ledger (NDJSON) to PATH. The ledger can later be replayed \
+           byte-identically with the 'replay' subcommand, in a separate \
+           process. The ledger is runtime output, never workflow input.")
+
 let run_cmd =
   let doc = "Run a workflow deterministically, dispatching agents via cabal." in
   Cmd.v (Cmd.info "run" ~doc)
-    Term.(const cmd_run $ file_arg $ floor_arg $ approve_arg $ allow_run_arg)
+    Term.(
+      const cmd_run $ file_arg $ floor_arg $ approve_arg $ allow_run_arg
+      $ ledger_arg)
+
+let replay_ledger_arg =
+  Arg.(
+    required
+    & opt (some string) None
+    & info [ "ledger" ] ~docv:"PATH"
+        ~doc:
+          "Path to an on-disk ledger (NDJSON) previously written by 'run \
+           --ledger'. Required.")
+
+let replay_cmd =
+  let doc =
+    "Replay a workflow from an on-disk ledger byte-identically (in a later \
+     process). Loads + validates the workflow (same --floor gates), reads the \
+     ledger, and re-feeds the recorded trace to the engine. NO agent or command \
+     is ever dispatched/executed — recorded results are re-fed. Exits 0 on a \
+     faithful replay; non-zero on a corrupt ledger, a validation error, or a \
+     Replay_mismatch (incl. a workflow/ledger mismatch)."
+  in
+  Cmd.v (Cmd.info "replay" ~doc)
+    Term.(const cmd_replay $ file_arg $ floor_arg $ replay_ledger_arg)
 
 let schema_cmd =
   let doc =
@@ -189,6 +273,9 @@ let schema_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.9.0" ~doc in
-  let group = Cmd.group info [ lint_cmd; validate_cmd; run_cmd; schema_cmd ] in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.10.0" ~doc in
+  let group =
+    Cmd.group info
+      [ lint_cmd; validate_cmd; run_cmd; replay_cmd; schema_cmd ]
+  in
   exit (Cmd.eval' group)

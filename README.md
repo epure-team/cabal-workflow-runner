@@ -2,9 +2,10 @@
 
 > **Status: early / experimental (v0.x).** The core — deterministic engine,
 > fail-closed validator, governed loops, replay, and the schema↔parser contract —
-> is implemented and tested, but the MVP boundaries are real: replay is **in-memory
-> only** (no on-disk ledger or `replay <file>` CLI yet), the workflow format is
-> **JSON only** (YAML / Markdown front-ends are planned), there is **no `Spawn` /
+> is implemented and tested, but the MVP boundaries are real: replay is now
+> **persistable on disk** (`run --ledger <file>` writes the trace; `replay <wf>
+> --ledger <file>` re-runs it byte-identically in a later process), the workflow
+> format is **JSON only** (YAML / Markdown front-ends are planned), there is **no `Spawn` /
 > sub-workflow step** yet, and the cabal-backed **live-dispatch path has been
 > validated on one small model**, not broadly. Interfaces may change.
 
@@ -71,6 +72,16 @@ cabal-workflow-runner run examples/bounty.workflow.json \
 # With no --allow-run flag the allowlist is empty and NO run step ever executes
 # (fail-closed). A workflow file can NEVER grant itself the allowlist.
 cabal-workflow-runner run examples/run-demo.workflow.json --allow-run mkdir
+
+# Persist a run's trace as an on-disk ledger (NDJSON), then replay it
+# byte-identically in a LATER process. `replay` re-feeds the recorded results —
+# it never dispatches an agent or executes a command — and exits non-zero on a
+# corrupt ledger, a validation error, or a Replay_mismatch (incl. a
+# workflow/ledger mismatch).
+cabal-workflow-runner run examples/run-demo.workflow.json \
+  --allow-run mkdir --ledger run.ndjson
+cabal-workflow-runner replay examples/run-demo.workflow.json \
+  --floor g-ran-ok --ledger run.ndjson
 ```
 
 ```sh
@@ -189,8 +200,23 @@ let () =
     | Error reason -> Printf.eprintf "rejected: %s\n" reason
     | Ok validated ->
       let outcome, trace = Engine.run ~backend ~token:(Some "approve") validated in
-      assert (Engine.replay ~trace validated = outcome)  (* deterministic replay *)
+      assert (Engine.replay ~trace validated = outcome);  (* in-process replay *)
+      (* Persist the trace on disk and replay it byte-identically in a LATER
+         process (no backend consulted): *)
+      let path = "run.ndjson" in
+      Out_channel.with_open_bin path (fun oc ->
+        Out_channel.output_string oc (Ledger.to_ndjson trace));
+      (* ... later, possibly another process ... *)
+      (match Ledger.of_ndjson (In_channel.with_open_bin path In_channel.input_all) with
+       | Error e -> Printf.eprintf "corrupt ledger: %s\n" e
+       | Ok trace' -> assert (Engine.replay ~trace:trace' validated = outcome))
 ```
+
+On the CLI, `run … --ledger run.ndjson` writes the ledger and
+`replay wf.json --ledger run.ndjson --floor g-observed` re-runs it in a separate
+process, exiting non-zero on a corrupt ledger or a `Replay_mismatch`. Tooling
+such as `tools/bounty-pipeline` thus gains **persisted** replay: a run's trace
+survives the process and can be audited / re-verified later.
 
 ## Meta-agent: building workflows dynamically
 
