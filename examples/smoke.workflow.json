@@ -1,0 +1,42 @@
+{
+  "name": "smoke",
+  "_doc": "Dumb end-to-end smoke test: exercises structured output + schema validation, a gate expression, a governed loop (fixpoint + max_iters), a branch on structured output, and a token-gated commit. Each agent is asked to echo a fixed JSON so it runs cheaply on a small/fast model. Run: CWR_BACKEND=claude-code CWR_MODEL=haiku cabal-workflow-runner run examples/smoke.workflow.json --floor g-observed --approve <token>",
+  "steps": [
+    { "kind": "agent", "id": "classify",
+      "prompt": "Output ONLY this JSON object and nothing else (no prose, no markdown fences): {\"severity\":\"high\",\"observed\":true}",
+      "read_only": true,
+      "output_schema": { "severity": { "enum": ["low", "medium", "high", "critical"] }, "observed": "bool" } },
+
+    { "kind": "gate", "id": "g-observed",
+      "when": { "eq": [ { "path": "outputs.classify.observed" }, { "lit": true } ] } },
+
+    { "kind": "loop",
+      "until": { "eq": [ { "path": "outputs.tick.done" }, { "lit": true } ] },
+      "governors": [
+        { "kind": "fixpoint", "window": 2, "progress": { "path": "outputs.tick.progressed" } },
+        { "kind": "max_iters", "n": 4 }
+      ],
+      "body": [
+        { "kind": "agent", "id": "tick",
+          "prompt": "Output ONLY this JSON object and nothing else (no prose, no markdown fences): {\"done\":false,\"progressed\":false}",
+          "read_only": true,
+          "output_schema": { "done": "bool", "progressed": "bool" } }
+      ] },
+
+    { "kind": "branch",
+      "when": { "in": [ { "path": "outputs.classify.severity" }, { "lit": ["high", "critical"] } ] },
+      "then": [
+        { "kind": "agent", "id": "review",
+          "prompt": "Output ONLY this JSON object and nothing else (no prose, no markdown fences): {\"ok\":true}",
+          "read_only": true,
+          "output_schema": { "ok": "bool" } },
+        { "kind": "commit", "id": "submit" }
+      ],
+      "else": [
+        { "kind": "agent", "id": "note",
+          "prompt": "Output ONLY this JSON object and nothing else (no prose, no markdown fences): {\"noted\":true}",
+          "read_only": true,
+          "output_schema": { "noted": "bool" } }
+      ] }
+  ]
+}

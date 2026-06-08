@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.2.1
+
+First **live end-to-end run** against a real agent (validated on Claude Haiku).
+
+### Fixed / Added
+
+- **The cabal backend now populates the registry** via `Adapter_loader.register_all`
+  before any lookup. Previously the registry was empty at runtime, so `run` always
+  fell through to "no cabal backend available" and fail-closed — the live dispatch
+  path was never actually functional.
+- **Backend + model selection** via `CWR_BACKEND` (backend id, e.g. `claude-code`)
+  and `CWR_MODEL` (e.g. `haiku`), so a run can target a small/cheap/fast model.
+- **Robust structured-output extraction.** Small models often wrap JSON in prose or
+  a fenced code block; `structured_output` now tolerates that (direct parse → strip
+  fence → extract first `{`/`[` … last `}`/`]`) instead of failing closed on "JSON
+  plus noise". A live smoke run reproduced the brittleness (the first call failed
+  strict parse) and this fix resolves it.
+- **`examples/smoke.workflow.json`** — a dumb end-to-end workflow exercising the
+  whole tool (structured output + schema, a gate expression, a governed loop with
+  `fixpoint`, a branch on structured output, a token-gated commit). Verified live:
+  `Committed` with a hashed runtime token.
+
 ## v0.2
 
 Structured, data-driven workflows — without losing determinism or the safety floor.
