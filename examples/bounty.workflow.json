@@ -3,13 +3,22 @@
   "steps": [
     { "kind": "agent", "id": "recon",
       "prompt": "Survey the target and enumerate candidate findings.",
-      "read_only": true },
+      "read_only": true,
+      "output_schema": { "candidates": "int" } },
 
-    { "kind": "loop", "max_iters": 5, "until": "candidate-exhausted",
+    { "kind": "loop",
+      "until": { "eq": [ { "path": "outputs.deep-dive.exhausted" }, { "lit": true } ] },
+      "governors": [
+        { "kind": "max_iters", "n": 5 },
+        { "kind": "budget" },
+        { "kind": "fixpoint", "window": 2,
+          "progress": { "path": "outputs.deep-dive.progressed" } }
+      ],
       "body": [
         { "kind": "agent", "id": "deep-dive",
           "prompt": "Investigate the next candidate finding in depth.",
-          "read_only": true },
+          "read_only": true,
+          "output_schema": { "exhausted": "bool", "progressed": "bool" } },
         { "kind": "agent", "id": "draft-poc",
           "prompt": "Draft a proof-of-concept for the current candidate.",
           "read_only": false }
@@ -17,17 +26,26 @@
 
     { "kind": "agent", "id": "writeup",
       "prompt": "Write the report for the strongest finding.",
-      "read_only": false },
+      "read_only": false,
+      "output_schema": { "severity": { "enum": ["low", "medium", "high", "critical"] } } },
 
-    { "kind": "gate", "id": "g-validated" },
-    { "kind": "gate", "id": "g-observed" },
-    { "kind": "gate", "id": "g-independent" },
+    { "kind": "gate", "id": "g-validated",
+      "when": { "exists": "outputs.writeup.severity" } },
+    { "kind": "gate", "id": "g-observed",
+      "when": { "exists": "outputs.draft-poc" } },
+    { "kind": "gate", "id": "g-independent",
+      "when": { "eq": [ { "path": "outputs.final-review.verdict" }, { "lit": "approved" } ] } },
 
-    { "kind": "branch", "on": "g-independent",
+    { "kind": "branch",
+      "when": { "and": [
+        { "in": [ { "path": "outputs.writeup.severity" }, { "lit": ["high", "critical"] } ] },
+        { "eq": [ { "path": "outputs.final-review.verdict" }, { "lit": "approved" } ] }
+      ] },
       "then": [
         { "kind": "agent", "id": "final-review",
           "prompt": "Independent reviewer signs off on the finding.",
-          "read_only": true },
+          "read_only": true,
+          "output_schema": { "verdict": { "enum": ["approved", "rejected"] } } },
         { "kind": "commit", "id": "submit-bounty" }
       ],
       "else": [

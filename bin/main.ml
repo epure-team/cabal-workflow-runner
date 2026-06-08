@@ -12,14 +12,26 @@ let print_trace trace =
   List.iter
     (fun entry ->
       match entry with
-      | Types.Agent_ran { id; success; text } ->
-          Printf.printf "  agent  %-16s success=%b text=%S\n" id success text
+      | Types.Agent_ran { id; success; output } ->
+          Printf.printf "  agent    %-16s success=%b output=%s\n" id success
+            (Yojson.Safe.to_string output)
       | Types.Gate_evaluated { id; verdict } ->
-          Printf.printf "  gate   %-16s %s\n" id (Types.verdict_to_string verdict)
+          Printf.printf "  gate     %-16s %s\n" id
+            (Types.verdict_to_string verdict)
+      | Types.Branch_taken { verdict } ->
+          Printf.printf "  branch   -> %s\n" (Types.verdict_to_string verdict)
+      | Types.Loop_iter { index } -> Printf.printf "  loop     iter=%d\n" index
+      | Types.Budget_read { value } ->
+          Printf.printf "  budget   value=%d\n" value
+      | Types.Fixpoint_progress { progress } ->
+          Printf.printf "  fixpoint progress=%b\n" progress
+      | Types.Loop_stopped { iterations; reason } ->
+          Printf.printf "  loop     stopped after %d iter(s) (%s)\n" iterations
+            reason
       | Types.Committed_step { id; token_digest } ->
-          Printf.printf "  commit %-16s token_digest=%s\n" id token_digest
+          Printf.printf "  commit   %-16s token_digest=%s\n" id token_digest
       | Types.Blocked_at { id; reason } ->
-          Printf.printf "  block  %-16s %s\n" id reason)
+          Printf.printf "  block    %-16s %s\n" id reason)
     trace
 
 (* ---- validate subcommand ---- *)
@@ -99,6 +111,6 @@ let run_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.1.0" ~doc in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.2.0" ~doc in
   let group = Cmd.group info [ validate_cmd; run_cmd ] in
   exit (Cmd.eval' group)

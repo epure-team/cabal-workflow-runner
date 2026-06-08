@@ -13,19 +13,22 @@ module Validated : sig
   val workflow : t -> Types.workflow
   (** Recover the underlying workflow (read-only). *)
 
-  val floor_gates : t -> Types.gate_id list
+  val floor_gates : t -> string list
   (** The floor gates this workflow was validated against. *)
 end
 
 val workflow :
-  floor_gates:Types.gate_id list ->
+  floor_gates:string list ->
   Types.workflow ->
   (Validated.t, string) result
 (** [workflow ~floor_gates wf] validates [wf] fail-closed. Returns [Error
     reason] if any rule below is violated; otherwise [Ok validated].
 
     Rules (enforced for the whole workflow):
-    - every [Loop] has [max_iters >= 1] (bounded);
+    - every [Loop] declares >= 1 governor (an empty [governors] list is
+      [Error "loop is ungoverned"]); a [Max_iters n] requires [n >= 1] and a
+      [Fixpoint] requires [window >= 1]. A loop MAY be unbounded (no
+      [Max_iters]) as long as it declares some governor;
     - every [Commit] is guaranteed-preceded by ALL [floor_gates] on EVERY path.
       A gate counts as guaranteed-before a commit only if it appears before the
       commit on every path: inside a [Branch] it counts only if present in BOTH

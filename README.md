@@ -2,13 +2,19 @@
 
 A **deterministic workflow engine on [cabal](https://github.com/epure-team/cabal)**
 (the Caml Agent Backend Abstraction Library). It interprets a declarative workflow —
-sequence, bounded loop, branch, gate, and a terminal commit — running the
+sequence, **governed loop**, branch, gate, and a terminal commit — running the
 control-flow **deterministically in OCaml** and dispatching **agent steps via cabal**.
+
+Agents return **structured JSON** bound into a **run context**; gate / branch / loop
+decisions are a **total predicate DSL** over that context (always terminating, never
+raising). Loops may be **unbounded** but must declare ≥1 **governor** (`Max_iters`,
+`Budget`, or `Fixpoint`) — the termination guarantee.
 
 You get data-driven workflows **without** losing determinism, because the interpreter
 is deterministic, the **safety floor is enforced by the engine/validator as an
 invariant over any workflow** (not by the workflow author), and runs **replay** from a
-recorded trace. See [`SPEC.md`](SPEC.md) for the full design.
+recorded trace — the governor's inputs are recorded, so even an unbounded loop replays
+byte-identically. See [`SPEC.md`](SPEC.md) and [`CHANGELOG.md`](CHANGELOG.md).
 
 The project is **domain-neutral**. [`examples/bounty.workflow.json`](examples/bounty.workflow.json)
 is just one illustration — the bounty pipeline expressed as a single workflow file.
@@ -43,10 +49,12 @@ cabal-workflow-runner run examples/bounty.workflow.json \
   --approve "$APPROVAL_TOKEN"
 ```
 
-`validate` rejects (exit 1) any workflow with an unbounded loop or a commit that is
-not guaranteed-gated by the floor gates on every path. `run` dispatches agent steps to
-the first available cabal backend (failing closed if none) and prints the outcome plus
-the recorded trace.
+`validate` rejects (exit 1) any workflow with an **ungoverned** loop (empty `governors`,
+or a `Max_iters`/`Fixpoint` with an out-of-range bound) or a commit that is not
+guaranteed-gated by the floor gates on every path. `run` dispatches agent steps to the
+first available cabal backend (forcing structured output, failing closed if none or if
+the agent returns no parseable JSON) and prints the outcome plus the recorded trace.
+Set `CWR_BUDGET` to cap the `Budget` governor (default 1,000,000).
 
 ## Embedding the library
 
@@ -56,8 +64,8 @@ Supply a backend and the floor gates; everything else is enforced for you:
 open Cabal_workflow_runner
 
 let backend : Backend.t =
-  { run_agent = (fun ~id ~prompt:_ ~read_only:_ -> (true, id));
-    eval_gate = (fun _ -> Types.Pass) }
+  { run_agent = (fun ~id:_ ~prompt:_ ~read_only:_ -> (true, `Assoc [ ("severity", `String "high") ]));
+    budget = (fun () -> 1_000_000) }
 
 let () =
   match Workflow_json.of_file "wf.json" with

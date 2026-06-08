@@ -6,7 +6,7 @@
  (name cabal_workflow_runner)
  (synopsis "Deterministic workflow engine on cabal")
  (description
-  "A deterministic interpreter for declarative agentic workflows (sequence, bounded loop, branch, gate, agent, terminal commit). Structural control flow runs deterministically in OCaml; agent steps dispatch through cabal. A fail-closed validator enforces a safety floor as an engine invariant (commit requires a runtime human-approval token plus floor gates guaranteed on every path; loops are bounded), and recorded traces replay byte-identically.")
+  "A deterministic interpreter for declarative agentic workflows (sequence, governed loop, branch, gate, agent, terminal commit). Agents return structured JSON; gate/branch/loop decisions are a total predicate DSL over a run context. Structural control flow runs deterministically in OCaml; agent steps dispatch through cabal. A fail-closed validator enforces a safety floor as an engine invariant (commit requires a runtime human-approval token plus floor gates guaranteed on every path; loops may be unbounded but must declare a governor). Recorded traces replay byte-identically.")
  (depends
   (ocaml (>= 5.3.0))
   (dune (>= 3.13))

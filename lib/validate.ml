@@ -3,7 +3,7 @@ open Types
 module String_set = Set.Make (String)
 
 module Validated = struct
-  type t = { wf : workflow; floor : gate_id list }
+  type t = { wf : workflow; floor : string list }
 
   let workflow t = t.wf
   let floor_gates t = t.floor
@@ -33,7 +33,7 @@ let rec check_steps ~floor ~guaranteed steps =
 and check_step ~floor ~guaranteed step =
   match step with
   | Agent _ -> Ok guaranteed
-  | Gate { id } -> Ok (String_set.add id guaranteed)
+  | Gate { id; when_ = _ } -> Ok (String_set.add id guaranteed)
   | Commit { id } ->
       let missing =
         List.filter (fun g -> not (String_set.mem g guaranteed)) floor
@@ -46,7 +46,7 @@ and check_step ~floor ~guaranteed step =
               every preceding path"
              id
              (String.concat ", " (List.map (Printf.sprintf "%S") missing)))
-  | Branch { on = _; then_; else_ } -> (
+  | Branch { when_ = _; then_; else_ } -> (
       match
         (check_steps ~floor ~guaranteed then_, check_steps ~floor ~guaranteed else_)
       with
@@ -55,16 +55,35 @@ and check_step ~floor ~guaranteed step =
       | Ok g_then, Ok g_else ->
           (* Only gates guaranteed in BOTH branches remain guaranteed. *)
           Ok (String_set.inter g_then g_else))
-  | Loop { max_iters; until = _; body } ->
-      if max_iters < 1 then
-        Error
-          (Printf.sprintf "Loop is unbounded: max_iters=%d (must be >= 1)"
-             max_iters)
-      else
-        (* Check the body for violations, but do NOT propagate body gates as
-           guaranteed: a loop may execute zero iterations. *)
-        Result.map (fun _ -> guaranteed)
-          (check_steps ~floor ~guaranteed body)
+  | Loop { governors; until = _; body } -> (
+      (* A loop must declare >= 1 governor (the termination guarantee). It may
+         legitimately have NO Max_iters — unbounded but governed. What is
+         forbidden is an EMPTY governors list. Each governor is itself
+         well-formedness-checked. *)
+      match check_governors governors with
+      | Error _ as e -> e
+      | Ok () ->
+          (* Check the body for violations, but do NOT propagate body gates as
+             guaranteed: a loop may execute zero iterations. *)
+          Result.map (fun _ -> guaranteed)
+            (check_steps ~floor ~guaranteed body))
+
+and check_governors governors =
+  if governors = [] then Error "loop is ungoverned"
+  else
+    let bad =
+      List.find_map
+        (function
+          | Max_iters n when n < 1 ->
+              Some (Printf.sprintf "Max_iters governor must be >= 1 (got %d)" n)
+          | Fixpoint { window; _ } when window < 1 ->
+              Some
+                (Printf.sprintf "Fixpoint governor window must be >= 1 (got %d)"
+                   window)
+          | _ -> None)
+        governors
+    in
+    match bad with Some msg -> Error msg | None -> Ok ()
 
 let workflow ~floor_gates wf =
   match
