@@ -150,4 +150,7 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
         in
         structured_output response.Backend_types.result
   in
-  { Cabal_workflow_runner.Backend.run_agent; budget }
+  (* The Run-step effect: process execution + a before/after directory snapshot,
+     implemented in [Runner] (bin-side). The lib never spawns a process. *)
+  let run_command = Runner.make ~sw ~env ~base:working_dir in
+  { Cabal_workflow_runner.Backend.run_agent; budget; run_command }

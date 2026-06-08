@@ -30,6 +30,7 @@ commit). A `workflow` is a name plus a `step list`:
 | `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). A `Pass` records the verdict and continues; a **`Fail` BLOCKS** the run (`Blocked`, naming the gate id). | Verdict recorded; a false gate is a terminal block. |
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
 | `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
+| `Run { id; cmd; working_dir; timeout_ms; observe }` | Execute an observable shell command (no shell) via the **injected** `Backend.run_command` effect, recording the `run_result` and binding it under `outputs.<id>`. Executes **only** if the binary is in the operator's runtime **allowlist** (`[]` = fail-closed/off, `"*"` = all), else `Blocked`. | Command runs **exactly once** on the live run (recorded as `Run_executed`); **replay re-feeds the recorded result and never re-executes** (side-effect-free, byte-identical). |
 | `Commit { id }` | The **only** step that can file/submit. | Requires a runtime token (below). |
 
 Illegal states are made hard to express: there is **no** step constructor that can
@@ -88,6 +89,104 @@ loop may legitimately have **no `Max_iters`** (e.g. only `Budget` or `Fixpoint`)
 ceiling still bounds it. What is forbidden by the validator is an **empty** `governors`
 list (intent), but the termination guarantee itself is the ceiling, not the governors.
 
+### 1.4 The `run` step — observable, operator-allowlisted shell commands
+
+A `Run` step executes an **observable shell command** (added in v0.9):
+
+```json
+{ "kind": "run", "id": "mk", "cmd": ["mkdir", "-p", "out"],
+  "working_dir": "scratch", "timeout_ms": 30000, "observe": ["out"] }
+```
+
+- **`cmd`** — a non-empty argv array, executed **without a shell** (there is no implicit
+  `sh -c`; a workflow that wants a shell must spell `["sh","-c","…"]`).
+- **`working_dir`** — **required**, **relative**, **rejected at parse if absolute or
+  containing a `..` component** (mirroring the existing path-escape discipline). It is the
+  command's cwd, the effect scope, and the snapshot root.
+- **`timeout_ms`** — optional bounded wall-clock cap (same bounds as the integer governor
+  fields: `1 ≤ v ≤ max_int`).
+- **`observe`** — optional relative paths to snapshot; default = the whole `working_dir`.
+
+**Keeping cabal out of the library.** The engine must *run* a command without depending
+on a process library from `lib/`, so the run is an **injected effect**: `Backend.t` gains
+`run_command : id:string -> argv:string list -> working_dir:string -> timeout_ms:int
+option -> observe:string list option -> run_result`, where
+
+```ocaml
+type file_change_kind = Created | Modified | Deleted
+type file_change = { path : string; change : file_change_kind; size : int; digest : string }
+type run_result   = { exit : int; stdout : string; stderr : string;
+                      truncated : bool; files : file_change list }
+```
+
+The library defines these types and *calls* the injected function; only `bin/`
+(`bin/runner.ml`, wired in `bin/backend_cabal.ml`) implements it via cabal's
+`Backend_process.run_process` (no shell) plus a before/after directory snapshot
+(path → digest + size) diffed into a `file_change list`. `stdout`/`stderr` are
+**size-capped** (64 KiB) with the `truncated` flag. The library's stub backend supplies a
+deterministic `run_command` for tests. This mirrors how `run_agent` keeps cabal out of
+`lib/`: **`lib/` depends on yojson only.**
+
+`digest` is an **MD5 content digest** (OCaml stdlib `Digest`) used for
+**change-detection / observability** in the file diff — it is **NOT** a cryptographic
+integrity guarantee.
+
+The result is bound into the run context under `outputs.<id>` as JSON
+(`{ "exit", "stdout", "stderr", "truncated", "files":[{ "path","change","size","digest" }] }`),
+so the DSL can read `outputs.mk.exit`, `exists(outputs.mk.files)`, etc.
+
+**The allowlist is the trust control (operator-supplied at RUNTIME, never from the
+workflow file).** `Engine.run` gains `?run_allowlist:string list` (default `[]`). `cmd[0]`
+**must be a bare command name resolved via `PATH`**: a `cmd[0]` containing a path
+separator (`/`) — i.e. an absolute or relative path like `/usr/bin/mkdir`, `./x`, or
+`a/b` — is **`Blocked`** before the allowlist is consulted (`run command must be a bare
+name resolved via PATH, not a path: <cmd0>`), closing the bypass where a path-bearing
+`cmd[0]` would pass the basename match yet exec an arbitrary binary. Otherwise the step
+executes only if `Filename.basename (List.hd cmd)` (the bare name) is in the allowlist
+**or** the allowlist contains `"*"`; if not it is **`Blocked "run command \"<bin>\" not
+permitted (allowlist)"`** — fail-closed. With the default `[]`, **no `run` step ever
+executes**. The CLI flag `--allow-run BIN` (repeatable; `--allow-run '*'` allows all)
+populates it; it is **operator-only and runtime-only** — a workflow file cannot grant
+itself the right to run a command.
+
+**The run effect never crashes the engine.** The `bin` runner wraps the whole effect in
+`try … with`: a spawn failure (command not found ⇒ exit `127`), an output-capture
+buffer-limit overflow (⇒ exit `125`, `truncated=true`), a timeout (⇒ exit `124`), or any
+other error is turned into a **well-formed recorded `run_result`** (non-zero `exit`, a
+short `stderr` message, the diff computed so far), never an uncaught exception. This
+preserves "exactly one recorded result, replayable" even for an attacker-authored
+engine-kill attempt (e.g. `yes` flooding stdout). The contract is that the injected
+`run_command` **must not raise**; the `bin` runner honors it.
+
+**Determinism / replay.** A live run executes the command **exactly once**, captures the
+full `run_result`, **records it in the trace** as `Run_executed { id; result }`, and binds
+it into the context. **Replay consumes the recorded `Run_executed`, re-binds it, and NEVER
+re-executes** (it does not call `run_command`, and does not consult the allowlist, since
+nothing executes) — so a `run` of `rm` happens once and replay is byte-identical and
+side-effect-free, exactly mirroring the `Agent_ran` replay arm. The allowlist-`Blocked`
+case is recorded/replayed as `Blocked_at` + terminal `Blocked`, like the gate/commit
+`Fail` arms.
+
+**Honest scope — this is NOT a sandbox.** `working_dir` bounds the cwd and the snapshot
+scope but **does NOT** prevent the command from touching **absolute paths** named in its
+args. The **allowlist is the trust control** (operator opt-in; `[]` = off/fail-closed,
+`"*"` = all); full isolation (container/chroot) is **out of scope** for this MVP. Two
+caveats follow from this:
+
+- **Do NOT allowlist a wrapper binary.** Allowlisting `sh`, `bash`, `env`, `xargs`,
+  `find`, `python3`, `perl`, `node`, … effectively allows **arbitrary commands** (the
+  wrapper runs whatever it is told). Keep the allowlist to **leaf tools** (e.g. `mkdir`,
+  `touch`), never an interpreter/dispatcher.
+- **A symlinked `working_dir` is followed.** If `working_dir` resolves through a symlink,
+  the command runs with cwd = the **resolved target** (and the snapshot is taken there).
+  This reinforces that the allowlist — not the path — is the trust boundary.
+
+`Lint` emits an informational `run-step-executes-commands` warning for every `run` step,
+and a louder `run-step-destructive-command` warning for known-destructive binaries
+(`rm`, `rmdir`, `mv`, `dd`, `mkfs`, `shred`, `truncate`, the `:(){` fork-bomb idiom — a
+small, documented, **best-effort** set, **not** a security control). Both are warnings, so
+they never make `has_errors` true and never block validation.
+
 ## 2. The safety floor — enforced by the engine/validator, NOT the workflow
 
 This is the crux. The *mechanism* is hardcoded; the *specific gate ids* are a
@@ -145,8 +244,11 @@ DSL:
 
 ```ocaml
 type t = {
-  run_agent : id:string -> prompt:string -> read_only:bool -> bool * Yojson.Safe.t;
-  budget    : unit -> int;   (* a Budget governor stops the loop once this is <= 0 *)
+  run_agent   : id:string -> prompt:string -> read_only:bool -> bool * Yojson.Safe.t;
+  budget      : unit -> int;   (* a Budget governor stops the loop once this is <= 0 *)
+  run_command : id:string -> argv:string list -> working_dir:string ->
+                timeout_ms:int option -> observe:string list option -> run_result;
+    (* the Run-step effect; bin/ implements it (process + dir snapshot), lib stays yojson-only *)
 }
 ```
 
@@ -329,6 +431,8 @@ humans/agents; the `loc` is a JSON path to the offending node, e.g. `steps[3].bo
 | `missing-output-schema` | warning | a referenced agent step declares no `output_schema` (its output can't be validated). |
 | `no-commit` | warning | the workflow has no `Commit` step at all. |
 | `unreachable-after-commit` | warning | a step follows a `Commit` at the same level (a commit ends the run). |
+| `run-step-executes-commands` | warning | a `run` step executes a shell command (informational; it runs only if the operator's runtime allowlist permits its binary). |
+| `run-step-destructive-command` | warning | a `run` step invokes a known-destructive binary (`rm`/`dd`/… — best-effort advisory, **not** a security control; the runtime allowlist is the trust boundary). |
 
 The error codes are **exactly** the floor + parse/shape failures `Validate.workflow`
 enforces — which is what makes the lint-clean ⇒ validate contract hold by construction.
@@ -336,7 +440,7 @@ enforces — which is what makes the lint-clean ⇒ validate contract hold by co
 ## 5. Input format and planned follow-ups
 
 MVP input is **JSON** (`Workflow_json`, fail-closed on malformed input). Each step is
-an object with a `kind` discriminator (`agent` / `gate` / `branch` / `loop` /
+an object with a `kind` discriminator (`agent` / `gate` / `branch` / `loop` / `run` /
 `commit`). See `Workflow_json` docs for the schema.
 
 Expressions and governors are encoded as described in §1.2–§1.3; see the

@@ -255,6 +255,34 @@ let step_def : Yojson.Safe.t =
           ("body", step_list);
         ]
   in
+  let run =
+    closed_object_with
+      ~required:[ "kind"; "id"; "cmd"; "working_dir" ]
+      ~props:
+        [
+          ("kind", kind_const "run");
+          ("id", typ "string");
+          ( "cmd",
+            obj
+              [
+                ("type", s "array");
+                ("items", typ "string");
+                ("minItems", `Int 1);
+              ] );
+          (* working_dir: a RELATIVE path with no ".." component (mirrors the
+             parser's [req_relative_path]). The pattern rejects an absolute path
+             (leading "/") and any ".." path segment, while accepting names that
+             merely CONTAIN ".." (e.g. "a..b"). *)
+          ( "working_dir",
+            obj
+              [
+                ("type", s "string");
+                ("pattern", s "^(?!/)(?!(.*/)?\\.\\.(/|$)).+$");
+              ] );
+          ("timeout_ms", bounded_int);
+          ("observe", obj [ ("type", s "array"); ("items", typ "string") ]);
+        ]
+  in
   let commit =
     closed_object_with ~required:[ "kind"; "id" ]
       ~props:[ ("kind", kind_const "commit"); ("id", typ "string") ]
@@ -263,7 +291,7 @@ let step_def : Yojson.Safe.t =
     [
       ( "description",
         s "A workflow step, discriminated by the \"kind\" key." );
-      ("oneOf", arr [ agent; gate; branch; loop; commit ]);
+      ("oneOf", arr [ agent; gate; branch; loop; run; commit ]);
     ]
 
 (* ---- top level ---------------------------------------------------------- *)

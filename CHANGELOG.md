@@ -1,5 +1,119 @@
 # Changelog
 
+## v0.9
+
+A new **`run` step**: an orchestrator-executed, **observable** shell command, designed so
+a side-effecting step lives in a **replayable** engine without breaking determinism and
+without pulling process execution into the yojson-only library. CLI `--version` → `0.9.0`.
+
+### Added
+
+- **`Run { id; cmd; working_dir; timeout_ms; observe }` step.** `cmd` is a non-empty argv
+  executed **without a shell** (no implicit `sh -c`). `working_dir` is **required,
+  relative, and rejected at parse if absolute or containing a `..` component** (the
+  effect scope + snapshot root). `timeout_ms` is an optional bounded int; `observe` is an
+  optional list of relative paths to snapshot (default: the whole `working_dir`).
+- **Injected run effect — cabal stays out of `lib/`.** `Backend.t` gains
+  `run_command : id:… -> argv:string list -> working_dir:… -> timeout_ms:int option ->
+  observe:string list option -> run_result`, where
+  `run_result = { exit; stdout; stderr; truncated; files }` and
+  `file_change = { path; change : Created|Modified|Deleted; size; digest }`. The library
+  defines these types and calls the injected function; `bin/runner.ml` (wired in
+  `bin/backend_cabal.ml`) implements it via `Cabal.Backend_process.run_process` (no shell)
+  plus a before/after directory snapshot (path → digest + size) diffed into a
+  `file_change list`. `digest` is an **MD5 content digest** (`Digest`) for
+  change-detection / observability — NOT a cryptographic integrity guarantee.
+  `stdout`/`stderr` are **size-capped at 64 KiB** with a `truncated`
+  flag. The result is bound under `outputs.<id>` as JSON, so the DSL can read
+  `outputs.mk.exit`, `exists(outputs.mk.files)`, etc. **`lib/` still depends on yojson
+  only.**
+- **Operator allowlist (runtime-only, fail-closed).** `Engine.run` gains
+  `?run_allowlist:string list` (default `[]`). A `run` step executes only if
+  `Filename.basename (List.hd cmd)` is in the allowlist **or** the allowlist contains
+  `"*"`; otherwise the step is **`Blocked`** (`run command "<bin>" not permitted
+  (allowlist)`). With `[]`, **no `run` step ever executes** (off/fail-closed); `"*"`
+  allows all. CLI `--allow-run BIN` (repeatable) populates it. It is **operator-only and
+  runtime-only — a workflow file can never grant itself the allowlist.**
+- **Determinism / replay.** A live run executes the command **exactly once**, records the
+  full result as a new trace entry `Run_executed { id; result }`, and binds it.
+  **`Engine.replay` consumes the recorded `Run_executed`, re-binds it, and NEVER
+  re-executes** (no `run_command` call; the allowlist is not consulted on replay since
+  nothing runs) — so `rm` runs once and replay is byte-identical + side-effect-free,
+  mirroring the `Agent_ran` replay arm. The allowlist-`Blocked` case records/replays as
+  `Blocked_at` + terminal `Blocked`, like the gate/commit `Fail` arms. Trailing-trace-entry
+  rejection still holds for run-bearing traces.
+- **Validator / schema / parser.** `working_dir` absolute or `..` ⇒ reject; empty `cmd` ⇒
+  reject (parser-level). The JSON Schema gains a closed `run` step variant (`cmd` an array
+  `minItems:1` of strings, `working_dir` a required string carrying a **pattern** that
+  rejects absolute / `..`-segment paths to keep the schema↔parser iff, `timeout_ms` a
+  bounded int, `observe` an array of strings). `schema/workflow.schema.json` regenerated
+  (no-drift test green); the parser↔schema **kinds** test now includes `run`; the
+  behavioral parity test and `scripts/parity_check.py` gained `run` cases (parity still
+  **0 divergences**).
+- **Lint.** Every `run` step emits an informational `run-step-executes-commands` warning,
+  and a known-destructive binary (`rm`, `rmdir`, `mv`, `dd`, `mkfs`, `shred`, `truncate`,
+  the `:(){` fork-bomb idiom) emits a louder `run-step-destructive-command` warning. Both
+  are **warnings** (best-effort, **not** a security control — the allowlist is the trust
+  boundary), so `has_errors` stays false.
+- **Example.** `examples/run-demo.workflow.json` — a `run` of `mkdir -p` (observing the
+  created dir) followed by a `gate` on `eq(outputs.mk.exit, 0)`, ending
+  `Completed_no_commit`. Validates and lints clean-of-errors (the
+  `run-step-executes-commands` warning is expected).
+
+### Review fixes (pre-release, adversarial review of the `run` step)
+
+- **Correct, honestly-labeled digest.** Replaced the broken hand-rolled SHA-256 (failed
+  every known-answer vector — an operator-precedence bug) with OCaml stdlib `Digest`
+  (**MD5**): `Digest.to_hex (Digest.string content)`. The `file_change` field is renamed
+  `sha256` → **`digest`** (runtime output under `outputs.<id>.files[].digest`; no
+  schema/parity impact). Documented as an MD5 content digest for change-detection /
+  observability — **not** a cryptographic integrity guarantee. A known-answer test pins
+  `MD5("abc") = 900150983cd24fb0d6963f7d28e17f72`.
+- **Closed the allowlist bypass.** `cmd[0]` must be a **bare command name resolved via
+  `PATH`**: any `cmd[0]` containing a `/` (absolute/relative path) is **`Blocked`** before
+  the allowlist match (engine-level, fail-closed, recorded/replayable), so
+  `--allow-run mkdir` + `["/attacker/mkdir"]` no longer execs the attacker binary.
+- **The run effect can never crash the engine.** `bin/runner.ml` wraps the whole effect in
+  `try … with`: spawn failure ⇒ exit `127`, output-buffer overflow ⇒ exit `125` +
+  `truncated`, timeout ⇒ exit `124` — always a recorded `run_result`, never an uncaught
+  exception (preserving "exactly one recorded result, replayable").
+- **Honest doc warnings.** Allowlisting a wrapper (`sh`/`bash`/`env`/`xargs`/`find`/
+  interpreters) effectively allows arbitrary commands — keep the allowlist to leaf tools;
+  and a symlinked `working_dir` is followed (cwd = resolved target).
+
+### Honest scope (not overclaimed)
+
+`working_dir` bounds the cwd and the snapshot scope but **does NOT sandbox** the command
+from touching absolute paths named in its args. The **allowlist is the trust control**
+(operator opt-in; `[]` = off/fail-closed, `"*"` = all); full isolation (container/chroot)
+is **out of scope** for this MVP.
+
+### Tests
+
+- `run` mkdir-like (stub returns exit 0 + a `Created` file) ⇒ `outputs.mk.exit = 0`,
+  `files` has the created entry, and a following `gate eq(outputs.mk.exit, 0)` passes.
+- Allowlist enforcement: a non-allowlisted binary ⇒ `Blocked` with `run_command` **not**
+  called; the binary listed (by basename) ⇒ runs; `["*"]` ⇒ runs.
+- Replay never re-executes: a stub increments a counter per call; after a live run
+  (counter = 1), `Engine.replay` reproduces the identical outcome AND the counter does
+  **not** increment; trailing-entry rejection still holds.
+- File diff: a first run returns `Created` and a second returns `Deleted`; both observed in
+  their respective `outputs.<id>.files`.
+- `working_dir` with `..` / absolute and an empty `cmd` ⇒ parse `Error`.
+- The `run-demo` example validates + lints clean-of-errors; a destructive `rm` run emits
+  `run-step-destructive-command` while `has_errors` stays false.
+- Review-fix tests: MD5 digest known-answer; path-bearing `cmd[0]` (absolute/relative)
+  ⇒ `Blocked` with `run_command` **not** called while a bare allowlisted name runs; a
+  failed run effect is recorded (engine never crashes).
+- 45 → 55 tests; all prior invariants preserved.
+
+### Preserved invariants
+
+- Loop ceiling (termination guarantee); gate-Fail-blocks; runtime token digest-only; floor
+  reachability; determinism / byte-identical replay; `Expr.eval` totality; lint-clean ⇒
+  validate; schema↔parser parity / no-drift (`scripts/parity_check.py` 0 divergences);
+  **`lib/` depends on yojson only** — process execution lives in `bin/`.
+
 ## v0.8.1
 
 Tooling / open-source-readiness changes only — **no runtime behaviour change**, so

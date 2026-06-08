@@ -28,6 +28,11 @@ let print_trace trace =
       | Types.Loop_stopped { iterations; reason } ->
           Printf.printf "  loop     stopped after %d iter(s) (%s)\n" iterations
             reason
+      | Types.Run_executed { id; result } ->
+          Printf.printf
+            "  run      %-16s exit=%d truncated=%b files=%d\n" id
+            result.Types.exit result.Types.truncated
+            (List.length result.Types.files)
       | Types.Committed_step { id; token_digest } ->
           Printf.printf "  commit   %-16s token_digest=%s\n" id token_digest
       | Types.Blocked_at { id; reason } ->
@@ -84,7 +89,7 @@ let cmd_schema () =
 
 (* ---- run subcommand ---- *)
 
-let cmd_run file floor_gates approve =
+let cmd_run file floor_gates approve allow_run =
   match load_and_validate ~floor_gates file with
   | Error e ->
       Printf.eprintf "%s\n" e;
@@ -95,7 +100,8 @@ let cmd_run file floor_gates approve =
               let cwd = Sys.getcwd () in
               let backend = Backend_cabal.make ~sw ~env ~working_dir:cwd in
               let outcome, trace =
-                Engine.run ~backend ~token:approve validated
+                Engine.run ~run_allowlist:allow_run ~backend ~token:approve
+                  validated
               in
               Printf.printf "outcome: %s\ntrace:\n"
                 (Types.string_of_outcome outcome);
@@ -155,10 +161,23 @@ let validate_cmd =
     (Cmd.info "validate" ~doc)
     Term.(const cmd_validate $ file_arg $ floor_arg)
 
+let allow_run_arg =
+  Arg.(
+    value
+    & opt_all string []
+    & info [ "allow-run" ] ~docv:"BIN"
+        ~doc:
+          "Permit a run step whose command's basename is BIN to execute. \
+           Repeatable; use '*' to allow all. OPERATOR-only and RUNTIME-only: a \
+           workflow file cannot grant it. With no --allow-run flag, the \
+           allowlist is empty and NO run step ever executes (fail-closed). The \
+           working_dir bounds the cwd/snapshot but does NOT sandbox the command \
+           from absolute paths in its args.")
+
 let run_cmd =
   let doc = "Run a workflow deterministically, dispatching agents via cabal." in
   Cmd.v (Cmd.info "run" ~doc)
-    Term.(const cmd_run $ file_arg $ floor_arg $ approve_arg)
+    Term.(const cmd_run $ file_arg $ floor_arg $ approve_arg $ allow_run_arg)
 
 let schema_cmd =
   let doc =
@@ -170,6 +189,6 @@ let schema_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.8.0" ~doc in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.9.0" ~doc in
   let group = Cmd.group info [ lint_cmd; validate_cmd; run_cmd; schema_cmd ] in
   exit (Cmd.eval' group)

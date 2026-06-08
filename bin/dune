@@ -1,4 +1,4 @@
 (executable
  (name main)
  (public_name cabal-workflow-runner)
- (libraries cabal_workflow_runner cabal eio_main cmdliner yojson))
+ (libraries cabal_workflow_runner cabal eio_main cmdliner yojson unix))

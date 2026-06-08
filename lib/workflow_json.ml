@@ -47,11 +47,55 @@ let req_bounded_int key json =
   | Some _ -> err "field %S must be an integer" key
   | None -> err "missing required field %S" key
 
+(* An optional bounded integer (same bounds as [req_bounded_int] but [None] when
+   the key is absent). Used for [run.timeout_ms]. *)
+let opt_bounded_int key json =
+  match member_opt key json with
+  | None -> None
+  | Some _ -> Some (req_bounded_int key json)
+
 let req_list key json =
   match member_opt key json with
   | Some (`List l) -> l
   | Some _ -> err "field %S must be a list" key
   | None -> err "missing required field %S" key
+
+(* A required, non-empty list of strings (the schema's [minItems:1] array of
+   strings — e.g. a run step's [cmd]). *)
+let req_string_nonempty_list key json =
+  match member_opt key json with
+  | Some (`List []) -> err "field %S must be a non-empty list" key
+  | Some (`List l) ->
+      List.map
+        (function `String s -> s | _ -> err "field %S must be a list of strings" key)
+        l
+  | Some _ -> err "field %S must be a list" key
+  | None -> err "missing required field %S" key
+
+(* An optional list of strings (the schema's array of strings — e.g. a run
+   step's [observe]). [None] when absent. *)
+let opt_string_list key json =
+  match member_opt key json with
+  | None -> None
+  | Some (`List l) ->
+      Some
+        (List.map
+           (function
+             | `String s -> s | _ -> err "field %S must be a list of strings" key)
+           l)
+  | Some _ -> err "field %S must be a list" key
+
+(* Path-escape discipline (mirrors the run-step effect scope): a relative path
+   with no [..] component and not absolute. Rejected fail-closed otherwise. The
+   [what] names the offending field in the error. *)
+let req_relative_path key json =
+  let p = req_string key json in
+  if Filename.is_relative p = false then
+    err "field %S must be a relative path (got absolute %S)" key p
+  else if List.mem Filename.parent_dir_name (String.split_on_char '/' p) then
+    err "field %S must not contain a %S component (got %S)" key
+      Filename.parent_dir_name p
+  else p
 
 (* A required list that the schema declares with [minItems:1] (e.g. a loop's
    [governors]): an empty array is a parse-level shape error, matching the
@@ -231,6 +275,21 @@ let rec step_of_json json =
       reject_unknown_keys ~what:"loop step"
         ~known:[ "kind"; "body"; "until"; "governors" ] json;
       s
+  | "run" ->
+      let s =
+        Run
+          {
+            id = req_string "id" json;
+            cmd = req_string_nonempty_list "cmd" json;
+            working_dir = req_relative_path "working_dir" json;
+            timeout_ms = opt_bounded_int "timeout_ms" json;
+            observe = opt_string_list "observe" json;
+          }
+      in
+      reject_unknown_keys ~what:"run step"
+        ~known:[ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe" ]
+        json;
+      s
   | "commit" ->
       let s = Commit { id = req_string "id" json } in
       reject_unknown_keys ~what:"commit step" ~known:[ "kind"; "id" ] json;
@@ -332,6 +391,19 @@ let rec step_to_json = function
             ("governors", `List (List.map governor_to_json governors));
             ("body", `List (List.map step_to_json body));
           ])
+  | Run { id; cmd; working_dir; timeout_ms; observe } ->
+      `Assoc
+        ([
+           ("kind", `String "run");
+           ("id", `String id);
+           ("cmd", `List (List.map (fun s -> `String s) cmd));
+           ("working_dir", `String working_dir);
+         ]
+        @ (match timeout_ms with None -> [] | Some n -> [ ("timeout_ms", `Int n) ])
+        @
+        match observe with
+        | None -> []
+        | Some l -> [ ("observe", `List (List.map (fun s -> `String s) l)) ])
   | Commit { id } -> `Assoc [ ("kind", `String "commit"); ("id", `String id) ]
 
 let to_json { name; steps } =

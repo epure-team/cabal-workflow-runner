@@ -565,6 +565,563 @@ let test_replay_rejects_trailing_entries () =
   in
   Alcotest.(check bool) "trailing entry => Replay_mismatch" true raised
 
+(* ---- v0.9: the run step ---- *)
+
+(* A stub run_command returning a fixed run_result regardless of args. *)
+let run_backend result =
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ = result in
+  Backend.stub ~run_command ()
+
+let mk_file path change =
+  { path; change; size = 3; digest = "deadbeef" }
+
+(* TEST 1: a mkdir-like run (stub returns exit 0 + a Created file) binds
+   outputs.mk.exit=0, the files list has the created entry, and a following gate
+   eq(outputs.mk.exit,0) passes. *)
+let test_run_step_outputs_and_gate () =
+  let result =
+    {
+      exit = 0;
+      stdout = "ok";
+      stderr = "";
+      truncated = false;
+      files = [ mk_file "out/x" Created ];
+    }
+  in
+  let backend = run_backend result in
+  let wf =
+    {
+      name = "run-demo";
+      steps =
+        [
+          Run
+            {
+              id = "mk";
+              cmd = [ "mkdir"; "-p"; "out" ];
+              working_dir = "scratch";
+              timeout_ms = Some 30000;
+              observe = Some [ "out" ];
+            };
+          Gate
+            {
+              id = "g";
+              when_ =
+                Expr.Eq
+                  (Expr.Path [ "outputs"; "mk"; "exit" ], Expr.Lit (Expr.Int 0));
+            };
+        ];
+    }
+  in
+  let v = validate_ok ~floor:[ "g" ] wf in
+  let outcome, trace =
+    Engine.run ~run_allowlist:[ "mkdir" ] ~backend ~token:None v
+  in
+  Alcotest.(check outcome_testable)
+    "completed (gate passed, no commit)" Completed_no_commit outcome;
+  (* the recorded run_result is in the trace *)
+  let recorded =
+    List.find_map
+      (function Run_executed { id = "mk"; result } -> Some result | _ -> None)
+      trace
+  in
+  (match recorded with
+  | Some r ->
+      Alcotest.(check int) "recorded exit 0" 0 r.exit;
+      Alcotest.(check int) "one created file" 1 (List.length r.files);
+      Alcotest.(check string) "created path" "out/x" (List.hd r.files).path
+  | None -> Alcotest.fail "expected a Run_executed entry for mk");
+  (* the gate after it must have passed (Pass verdict recorded) *)
+  let gate_passed =
+    List.exists
+      (function Gate_evaluated { id = "g"; verdict = Pass } -> true | _ -> false)
+      trace
+  in
+  Alcotest.(check bool) "gate eq(outputs.mk.exit,0) passed" true gate_passed
+
+(* TEST 2: allowlist enforcement. *)
+let test_run_step_allowlist () =
+  let result =
+    { exit = 0; stdout = ""; stderr = ""; truncated = false; files = [] }
+  in
+  let wf =
+    {
+      name = "allow";
+      steps =
+        [
+          Run
+            {
+              id = "r";
+              cmd = [ "rm"; "-rf"; "x" ];
+              working_dir = "scratch";
+              timeout_ms = None;
+              observe = None;
+            };
+        ];
+    }
+  in
+  let v = validate_ok ~floor:[] wf in
+  (* not in allowlist => Blocked, no execution *)
+  let ran = ref 0 in
+  let backend_count =
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+      incr ran;
+      result
+    in
+    Backend.stub ~run_command ()
+  in
+  let outcome, trace =
+    Engine.run ~run_allowlist:[] ~backend:backend_count ~token:None v
+  in
+  Alcotest.(check int) "blocked => run_command NOT called" 0 !ran;
+  (match outcome with
+  | Blocked reason ->
+      Alcotest.(check bool) "blocked names the allowlist" true
+        (let needle = "allowlist" in
+         let rec has i =
+           i + String.length needle <= String.length reason
+           && (String.sub reason i (String.length needle) = needle || has (i + 1))
+         in
+         has 0)
+  | o -> Alcotest.failf "expected Blocked, got %s" (Types.string_of_outcome o));
+  let has_block =
+    List.exists (function Blocked_at { id = "r"; _ } -> true | _ -> false) trace
+  in
+  Alcotest.(check bool) "Blocked_at emitted" true has_block;
+  (* bare name in the allowlist => runs *)
+  let ran2 = ref 0 in
+  let backend2 =
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+      incr ran2;
+      result
+    in
+    Backend.stub ~run_command ()
+  in
+  let outcome2, _ =
+    Engine.run ~run_allowlist:[ "rm" ] ~backend:backend2 ~token:None v
+  in
+  Alcotest.(check int) "allowed (bare rm) => run_command called once" 1 !ran2;
+  Alcotest.(check outcome_testable) "allowed => completes" Completed_no_commit
+    outcome2;
+  (* "*" => runs *)
+  let ran3 = ref 0 in
+  let backend3 =
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+      incr ran3;
+      result
+    in
+    Backend.stub ~run_command ()
+  in
+  let outcome3, _ =
+    Engine.run ~run_allowlist:[ "*" ] ~backend:backend3 ~token:None v
+  in
+  Alcotest.(check int) "'*' => run_command called once" 1 !ran3;
+  Alcotest.(check outcome_testable) "'*' => completes" Completed_no_commit
+    outcome3
+
+(* TEST 3: replay never re-executes. The stub increments a counter on each
+   run_command call; after a live run (counter=1), Engine.replay reproduces the
+   SAME outcome with NO further increment (replay re-feeds the recorded result).
+   Trailing-entry rejection still holds. *)
+let test_run_step_replay_no_reexec () =
+  let counter = ref 0 in
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+    incr counter;
+    {
+      exit = 0;
+      stdout = Printf.sprintf "call#%d" !counter;
+      stderr = "";
+      truncated = false;
+      files = [ mk_file "out/y" Created ];
+    }
+  in
+  let backend = Backend.stub ~run_command () in
+  let wf =
+    {
+      name = "replay-run";
+      steps =
+        [
+          Run
+            {
+              id = "mk";
+              cmd = [ "mkdir"; "out" ];
+              working_dir = "scratch";
+              timeout_ms = None;
+              observe = None;
+            };
+          Gate
+            {
+              id = "g";
+              when_ =
+                Expr.Eq
+                  (Expr.Path [ "outputs"; "mk"; "exit" ], Expr.Lit (Expr.Int 0));
+            };
+        ];
+    }
+  in
+  let v = validate_ok ~floor:[ "g" ] wf in
+  let outcome, trace =
+    Engine.run ~run_allowlist:[ "mkdir" ] ~backend ~token:None v
+  in
+  Alcotest.(check int) "live run executed the command exactly once" 1 !counter;
+  (* replay re-feeds the recorded result, NEVER calling run_command again *)
+  let replayed = Engine.replay ~trace v in
+  Alcotest.(check int) "replay did NOT re-execute (counter unchanged)" 1 !counter;
+  Alcotest.(check outcome_testable) "replay outcome identical" outcome replayed;
+  (* trailing-entry rejection still holds for a run-bearing trace *)
+  let trace_plus = trace @ [ Loop_iter { index = 99 } ] in
+  let raised =
+    try
+      ignore (Engine.replay ~trace:trace_plus v);
+      false
+    with Engine.Replay_mismatch _ -> true
+  in
+  Alcotest.(check bool) "trailing entry => Replay_mismatch" true raised
+
+(* TEST 4: file diff — first run returns a Created entry, a second run returns a
+   Deleted entry; both observed in their respective outputs.<id>.files. *)
+let test_run_step_file_diff () =
+  let calls = ref 0 in
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+    incr calls;
+    if !calls = 1 then
+      {
+        exit = 0;
+        stdout = "";
+        stderr = "";
+        truncated = false;
+        files = [ mk_file "f" Created ];
+      }
+    else
+      {
+        exit = 0;
+        stdout = "";
+        stderr = "";
+        truncated = false;
+        files = [ { path = "f"; change = Deleted; size = 0; digest = "" } ];
+      }
+  in
+  let backend = Backend.stub ~run_command () in
+  let mkrun id =
+    Run
+      {
+        id;
+        cmd = [ "touch"; "f" ];
+        working_dir = "scratch";
+        timeout_ms = None;
+        observe = None;
+      }
+  in
+  let wf =
+    { name = "diff"; steps = [ mkrun "create"; mkrun "remove" ] }
+  in
+  let v = validate_ok ~floor:[] wf in
+  let _outcome, trace =
+    Engine.run ~run_allowlist:[ "touch" ] ~backend ~token:None v
+  in
+  let files_of id =
+    List.find_map
+      (function
+        | Run_executed { id = rid; result } when rid = id -> Some result.files
+        | _ -> None)
+      trace
+  in
+  (match files_of "create" with
+  | Some [ fc ] ->
+      Alcotest.(check bool) "first run observed Created" true (fc.change = Created)
+  | _ -> Alcotest.fail "expected one Created in create.files");
+  match files_of "remove" with
+  | Some [ fc ] ->
+      Alcotest.(check bool) "second run observed Deleted" true (fc.change = Deleted)
+  | _ -> Alcotest.fail "expected one Deleted in remove.files"
+
+(* TEST 5: working_dir with ".." or absolute => parse/validate Error. *)
+let test_run_step_bad_working_dir () =
+  let parent =
+    {|{ "name": "x", "steps": [
+         { "kind": "run", "id": "r", "cmd": ["echo","hi"], "working_dir": "../escape" } ] }|}
+  in
+  let absolute =
+    {|{ "name": "x", "steps": [
+         { "kind": "run", "id": "r", "cmd": ["echo","hi"], "working_dir": "/abs" } ] }|}
+  in
+  let empty_cmd =
+    {|{ "name": "x", "steps": [
+         { "kind": "run", "id": "r", "cmd": [], "working_dir": "ok" } ] }|}
+  in
+  List.iter
+    (fun (label, json) ->
+      match Workflow_json.of_string json with
+      | Error _ -> ()
+      | Ok _ -> Alcotest.failf "expected parse Error for %s" label)
+    [ ("..", parent); ("absolute", absolute); ("empty cmd", empty_cmd) ];
+  (* a relative no-".." working_dir + non-empty cmd parses fine *)
+  let ok =
+    {|{ "name": "x", "steps": [
+         { "kind": "run", "id": "r", "cmd": ["echo","hi"], "working_dir": "ok/sub" } ] }|}
+  in
+  match Workflow_json.of_string ok with
+  | Ok _ -> ()
+  | Error e -> Alcotest.failf "valid run step should parse, got Error: %s" e
+
+(* The run-demo example validates and lints clean-of-errors (the
+   run-step-executes-commands warning is expected/allowed). *)
+let test_run_demo_example () =
+  let path = project_path "examples/run-demo.workflow.json" in
+  match Workflow_json.of_file path with
+  | Error e -> Alcotest.failf "run-demo parse Error: %s" e
+  | Ok wf ->
+      let ds = Lint.check ~floor_gates:[] wf in
+      Alcotest.(check bool) "run-demo has no error diagnostics" false
+        (Lint.has_errors ds);
+      let has_run_warning =
+        List.exists
+          (fun (d : Lint.diagnostic) -> d.code = "run-step-executes-commands")
+          ds
+      in
+      Alcotest.(check bool) "run-demo emits run-step-executes-commands warning"
+        true has_run_warning;
+      (match Validate.workflow ~floor_gates:[] wf with
+      | Ok _ -> ()
+      | Error e -> Alcotest.failf "run-demo should validate, got Error: %s" e)
+
+(* Lint emits a louder destructive-command warning for rm (still a warning,
+   has_errors stays false). *)
+let test_run_step_destructive_warning () =
+  let wf =
+    {
+      name = "destructive";
+      steps =
+        [
+          Run
+            {
+              id = "wipe";
+              cmd = [ "rm"; "-rf"; "out" ];
+              working_dir = "scratch";
+              timeout_ms = None;
+              observe = None;
+            };
+        ];
+    }
+  in
+  let ds = Lint.check ~floor_gates:[] wf in
+  Alcotest.(check bool) "destructive run is a warning, not error" false
+    (Lint.has_errors ds);
+  let has_destructive =
+    List.exists
+      (fun (d : Lint.diagnostic) -> d.code = "run-step-destructive-command")
+      ds
+  in
+  Alcotest.(check bool) "emits run-step-destructive-command" true has_destructive
+
+(* v0.9 review Fix 1: the per-file digest is MD5 ([Digest]), honestly labeled.
+   Known-answer: [Digest.to_hex (Digest.string "abc")] is the well-known MD5 of
+   "abc" = "900150983cd24fb0d6963f7d28e17f72". The runner computes a file change's
+   [digest] field the same way, so a created-file diff binds that value. This
+   pins the digest construction so a future regression (e.g. a wrong hash) is
+   caught. *)
+let test_run_step_digest_known_answer () =
+  Alcotest.(check string) "MD5(\"abc\") known-answer"
+    "900150983cd24fb0d6963f7d28e17f72"
+    (Digest.to_hex (Digest.string "abc"));
+  (* A run_result carrying a Created file whose digest is MD5("abc") survives the
+     engine round-trip into outputs.<id>.files[].digest unchanged. *)
+  let result =
+    {
+      exit = 0;
+      stdout = "";
+      stderr = "";
+      truncated = false;
+      files =
+        [
+          {
+            path = "out/x";
+            change = Created;
+            size = 3;
+            digest = Digest.to_hex (Digest.string "abc");
+          };
+        ];
+    }
+  in
+  let backend = run_backend result in
+  let wf =
+    {
+      name = "digest";
+      steps =
+        [
+          Run
+            {
+              id = "mk";
+              cmd = [ "touch"; "out/x" ];
+              working_dir = "scratch";
+              timeout_ms = None;
+              observe = None;
+            };
+        ];
+    }
+  in
+  let v = validate_ok ~floor:[] wf in
+  let _, trace = Engine.run ~run_allowlist:[ "touch" ] ~backend ~token:None v in
+  let recorded =
+    List.find_map
+      (function Run_executed { id = "mk"; result } -> Some result | _ -> None)
+      trace
+  in
+  match recorded with
+  | Some r ->
+      Alcotest.(check string) "files[0].digest == MD5(\"abc\")"
+        "900150983cd24fb0d6963f7d28e17f72" (List.hd r.files).digest
+  | None -> Alcotest.fail "expected a Run_executed entry for mk"
+
+(* v0.9 review Fix 2: a path-bearing cmd[0] (absolute OR relative) is rejected by
+   the engine BEFORE the allowlist match — it must be a bare name resolved via
+   PATH. So ["/usr/bin/mkdir"] with --allow-run mkdir is Blocked (the bypass is
+   closed) and run_command is NOT called; ["./mkdir"] is Blocked too; bare
+   ["mkdir"] allowlisted runs. *)
+let test_run_step_rejects_path_argv0 () =
+  let result =
+    { exit = 0; stdout = ""; stderr = ""; truncated = false; files = [] }
+  in
+  let mk_wf cmd0 =
+    {
+      name = "pathy";
+      steps =
+        [
+          Run
+            {
+              id = "r";
+              cmd = [ cmd0; "out" ];
+              working_dir = "scratch";
+              timeout_ms = None;
+              observe = None;
+            };
+        ];
+    }
+  in
+  (* a backend counting executions; with allowlist ["mkdir"] *)
+  let run_blocked cmd0 =
+    let ran = ref 0 in
+    let backend =
+      let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+        incr ran;
+        result
+      in
+      Backend.stub ~run_command ()
+    in
+    let v = validate_ok ~floor:[] (mk_wf cmd0) in
+    let outcome, trace =
+      Engine.run ~run_allowlist:[ "mkdir" ] ~backend ~token:None v
+    in
+    (outcome, trace, !ran)
+  in
+  (* absolute path => Blocked (path rejected), run_command NOT called *)
+  let outcome_abs, trace_abs, ran_abs = run_blocked "/usr/bin/mkdir" in
+  Alcotest.(check int) "absolute path => run_command NOT called" 0 ran_abs;
+  (match outcome_abs with
+  | Blocked reason ->
+      let contains hay needle =
+        let nl = String.length needle and hl = String.length hay in
+        let rec aux i = i + nl <= hl && (String.sub hay i nl = needle || aux (i + 1)) in
+        nl = 0 || aux 0
+      in
+      Alcotest.(check bool) "block reason mentions PATH/bare name" true
+        (contains reason "bare name" || contains reason "PATH")
+  | o -> Alcotest.failf "expected Blocked for absolute path, got %s"
+           (Types.string_of_outcome o));
+  Alcotest.(check bool) "Blocked_at emitted (absolute)" true
+    (List.exists (function Blocked_at { id = "r"; _ } -> true | _ -> false)
+       trace_abs);
+  (* relative ./ path => Blocked, not run *)
+  let outcome_rel, _, ran_rel = run_blocked "./mkdir" in
+  Alcotest.(check int) "relative ./ path => run_command NOT called" 0 ran_rel;
+  (match outcome_rel with
+  | Blocked _ -> ()
+  | o -> Alcotest.failf "expected Blocked for ./mkdir, got %s"
+           (Types.string_of_outcome o));
+  (* nested a/b path => Blocked, not run *)
+  let _, _, ran_nested = run_blocked "a/b" in
+  Alcotest.(check int) "a/b path => run_command NOT called" 0 ran_nested;
+  (* bare name + allowlist => runs *)
+  let ran_ok = ref 0 in
+  let backend_ok =
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+      incr ran_ok;
+      result
+    in
+    Backend.stub ~run_command ()
+  in
+  let v_ok = validate_ok ~floor:[] (mk_wf "mkdir") in
+  let outcome_ok, _ =
+    Engine.run ~run_allowlist:[ "mkdir" ] ~backend:backend_ok ~token:None v_ok
+  in
+  Alcotest.(check int) "bare mkdir allowlisted => run_command called once" 1
+    !ran_ok;
+  Alcotest.(check outcome_testable) "bare allowlisted => completes"
+    Completed_no_commit outcome_ok
+
+(* v0.9 review Fix 3 (engine-level surface): the engine calls the injected
+   run_command exactly once and records its result; the bin runner wraps the real
+   effect in try/with so a spawn/buffer-limit exception becomes a RECORDED
+   non-zero result rather than a crash. Here we assert the lib contract: a
+   run_command returning a synthetic non-zero result (mirroring the bin runner's
+   on-exception path, e.g. exit 127 ENOENT) is recorded as a normal Run_executed,
+   so the run is replayable and the engine never aborts. (The bin runner's
+   try/with itself is exercised by the CLI repro in the review notes.) *)
+let test_run_step_effect_failure_recorded () =
+  (* a run_command that simulates the bin runner's spawn-failure return: a
+     well-formed non-zero result, NOT a raised exception. *)
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+    {
+      exit = 127;
+      stdout = "";
+      stderr = "run: command could not be executed: ENOENT";
+      truncated = false;
+      files = [];
+    }
+  in
+  let backend = Backend.stub ~run_command () in
+  let wf =
+    {
+      name = "enoent";
+      steps =
+        [
+          Run
+            {
+              id = "boom";
+              cmd = [ "definitely-not-a-real-binary-xyz" ];
+              working_dir = "scratch";
+              timeout_ms = None;
+              observe = None;
+            };
+          Gate
+            {
+              id = "g";
+              when_ =
+                Expr.Eq
+                  (Expr.Path [ "outputs"; "boom"; "exit" ], Expr.Lit (Expr.Int 127));
+            };
+        ];
+    }
+  in
+  let v = validate_ok ~floor:[ "g" ] wf in
+  let outcome, trace =
+    Engine.run ~run_allowlist:[ "definitely-not-a-real-binary-xyz" ] ~backend
+      ~token:None v
+  in
+  (* the failure was RECORDED (exit 127), the gate read it, the run completed *)
+  let recorded =
+    List.find_map
+      (function Run_executed { id = "boom"; result } -> Some result | _ -> None)
+      trace
+  in
+  (match recorded with
+  | Some r -> Alcotest.(check int) "recorded synthetic exit 127" 127 r.exit
+  | None -> Alcotest.fail "expected a recorded Run_executed for boom");
+  Alcotest.(check outcome_testable) "engine completed (no crash/abort)"
+    Completed_no_commit outcome;
+  (* and it replays byte-identically *)
+  let replayed = Engine.replay ~trace v in
+  Alcotest.(check outcome_testable) "replay identical" outcome replayed
+
 (* ---- KEEP: fail-closed validation ---- *)
 
 let test_validate_commit_no_gate () =
@@ -647,6 +1204,7 @@ let test_commit_token_digest_only () =
            | Budget_read { value } -> string_of_int value
            | Fixpoint_progress { progress } -> string_of_bool progress
            | Loop_stopped { reason; _ } -> reason
+           | Run_executed { id; _ } -> id
            | Blocked_at { reason; _ } -> reason)
          trace)
   in
@@ -1086,7 +1644,7 @@ let test_schema_no_drift () =
    unknown kind. *)
 let test_schema_kinds_agree () =
   (* Hard-coded expected set the parser (Workflow_json.step_of_json) accepts. *)
-  let expected = [ "agent"; "branch"; "commit"; "gate"; "loop" ] in
+  let expected = [ "agent"; "branch"; "commit"; "gate"; "loop"; "run" ] in
   (* Extract the kind consts enumerated under $defs/step/oneOf in the schema. *)
   let top = match Workflow_schema.schema with `Assoc l -> l | _ -> [] in
   let step_def =
@@ -1250,6 +1808,10 @@ let test_parser_rejects_unknown_keys () =
         {|{ "name": "x", "steps": [
              { "kind": "loop",
                "governors": [ { "kind": "budget" } ], "body": [], "junk": 1 } ] }|} );
+      ( "run step",
+        {|{ "name": "x", "steps": [
+             { "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "s",
+               "junk": 1 } ] }|} );
       ( "commit step",
         {|{ "name": "x", "steps": [
              { "kind": "commit", "id": "c", "junk": 1 } ] }|} );
@@ -1303,6 +1865,7 @@ let parser_known_keys =
     ("gate", [ "kind"; "id"; "when" ]);
     ("branch", [ "kind"; "when"; "then"; "else" ]);
     ("loop", [ "kind"; "until"; "governors"; "body" ]);
+    ("run", [ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe" ]);
     ("commit", [ "kind"; "id" ]);
     ("max_iters", [ "kind"; "n" ]);
     ("budget", [ "kind" ]);
@@ -1541,6 +2104,52 @@ let behavioral_parity_cases : (string * string * bool) list =
     (* nested expr operand object likewise strictly single-key *)
     ( "expr nested not{lit,_x}",
       wf (gate {|{ "not": { "lit": true, "_x": 1 } }|}), false );
+    (* ---- run step ---- *)
+    ( "run: ok",
+      wf
+        {|{ "kind": "run", "id": "r", "cmd": ["mkdir","-p","out"],
+            "working_dir": "scratch", "timeout_ms": 30000, "observe": ["out"] }|},
+      true );
+    ( "run: minimal (cmd + working_dir only)",
+      wf {|{ "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "s" }|},
+      true );
+    ( "run: unknown key",
+      wf
+        {|{ "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "s",
+            "junk": 1 }|},
+      false );
+    ( "run: _note key",
+      wf
+        {|{ "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "s",
+            "_note": "n" }|},
+      true );
+    ( "run: empty cmd",
+      wf {|{ "kind": "run", "id": "r", "cmd": [], "working_dir": "s" }|}, false );
+    ( "run: cmd not strings",
+      wf {|{ "kind": "run", "id": "r", "cmd": [1,2], "working_dir": "s" }|},
+      false );
+    ( "run: working_dir absolute",
+      wf {|{ "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "/abs" }|},
+      false );
+    ( "run: working_dir with ..",
+      wf
+        {|{ "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "../up" }|},
+      false );
+    ( "run: working_dir nested .. segment",
+      wf
+        {|{ "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "a/../b" }|},
+      false );
+    ( "run: working_dir contains-but-not-segment ..",
+      wf
+        {|{ "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "a..b" }|},
+      true );
+    ( "run: missing working_dir",
+      wf {|{ "kind": "run", "id": "r", "cmd": ["echo"] }|}, false );
+    ( "run: timeout_ms=0 (below bound)",
+      wf
+        {|{ "kind": "run", "id": "r", "cmd": ["echo"], "working_dir": "s",
+            "timeout_ms": 0 }|},
+      false );
     (* ---- a couple of type confusions ---- *)
     ( "steps wrong type (string)",
       {|{ "name": "x", "steps": "nope" }|}, false );
@@ -1627,6 +2236,32 @@ let () =
             `Quick test_replay_with_loop;
           Alcotest.test_case "F4: replay rejects trailing extra trace entries"
             `Quick test_replay_rejects_trailing_entries;
+        ] );
+      ( "run-step",
+        [
+          Alcotest.test_case "mkdir-like run: exit + files bound, gate passes"
+            `Quick test_run_step_outputs_and_gate;
+          Alcotest.test_case
+            "allowlist: [] blocks, [bin] runs, [*] runs (basename match)" `Quick
+            test_run_step_allowlist;
+          Alcotest.test_case "replay never re-executes the command" `Quick
+            test_run_step_replay_no_reexec;
+          Alcotest.test_case "file diff: Created then Deleted both observed"
+            `Quick test_run_step_file_diff;
+          Alcotest.test_case ".. / absolute working_dir + empty cmd => Error"
+            `Quick test_run_step_bad_working_dir;
+          Alcotest.test_case "run-demo example validates + lints clean-of-errors"
+            `Quick test_run_demo_example;
+          Alcotest.test_case "destructive binary => warning (not error)" `Quick
+            test_run_step_destructive_warning;
+          Alcotest.test_case "Fix1: file digest is MD5 (known-answer)" `Quick
+            test_run_step_digest_known_answer;
+          Alcotest.test_case
+            "Fix2: path-bearing cmd[0] (abs/rel) rejected; bare runs" `Quick
+            test_run_step_rejects_path_argv0;
+          Alcotest.test_case
+            "Fix3: a failed run effect is recorded (no engine crash)" `Quick
+            test_run_step_effect_failure_recorded;
         ] );
       ( "happy-path",
         [

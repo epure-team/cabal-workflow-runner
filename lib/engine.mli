@@ -15,6 +15,7 @@
 
 val run :
   ?max_loop_iters:int ->
+  ?run_allowlist:string list ->
   backend:Backend.t ->
   token:string option ->
   Validate.Validated.t ->
@@ -42,8 +43,23 @@ val run :
       binds ["loop.iter"], runs [body], then stops if [until] holds OR any governor
       fires ([Max_iters], [Budget] via [backend.budget], or [Fixpoint]). The
       ceiling is the termination guarantee; governors are early-stop heuristics.
+    - [Run] -> execute an observable shell command via the INJECTED
+      [backend.run_command] effect, recording the full {!Types.run_result} as a
+      [Run_executed] trace entry and binding it into ["outputs.<id>"]. The
+      command executes only if the basename of its head is in [run_allowlist] OR
+      [run_allowlist] contains ["*"]; otherwise the step is [Blocked]
+      (fail-closed). The command runs exactly ONCE (on the live run); replay
+      re-feeds the recorded result and NEVER re-executes.
     - [Commit] -> requires a well-formed [token]; absent/ill-formed yields
       [Blocked]. The token is never stored: only its digest is recorded.
+
+    [run_allowlist] (default [[]]) is the OPERATOR-supplied, RUNTIME-only trust
+    control for [Run] steps: an empty list means no [Run] step ever executes
+    (fail-closed/off), ["*"] permits all binaries, and any other list permits a
+    [Run] step iff [Filename.basename (List.hd cmd)] is a member. A workflow file
+    can NEVER grant itself the allowlist — it is not a workflow field. The
+    [working_dir] bounds the cwd / snapshot scope but does NOT sandbox the
+    command from absolute paths in its args; full isolation is out of scope.
 
     The token is exclusively a runtime parameter; no step can carry it. *)
 

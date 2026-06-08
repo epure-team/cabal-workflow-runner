@@ -59,6 +59,13 @@ type step =
       until : Expr.t option;
       governors : governor list;
     }
+  | Run of {
+      id : string;
+      cmd : string list;
+      working_dir : string;
+      timeout_ms : int option;
+      observe : string list option;
+    }
   | Commit of { id : string }
 
 and governor =
@@ -78,6 +85,58 @@ type outcome =
   | Blocked of string
   | Aborted of string
 
+(* A single observed filesystem change produced by a [Run] step. *)
+type file_change_kind =
+  | Created
+  | Modified
+  | Deleted
+
+type file_change = {
+  path : string;  (** relative to the run step's [working_dir]. *)
+  change : file_change_kind;
+  size : int;  (** post-change size in bytes (0 for [Deleted]). *)
+  digest : string;
+      (** post-change MD5 content digest ("" for [Deleted]). For
+          change-detection / observability only — NOT a cryptographic integrity
+          guarantee. *)
+}
+
+(* The structured result of executing a [Run] step's command. Stdout/stderr are
+   size-capped by the runner; [truncated] flags that a cap was hit. *)
+type run_result = {
+  exit : int;
+  stdout : string;
+  stderr : string;
+  truncated : bool;
+  files : file_change list;
+}
+
+let string_of_file_change_kind = function
+  | Created -> "created"
+  | Modified -> "modified"
+  | Deleted -> "deleted"
+
+(* Bind a [run_result] into the run context as JSON under [outputs.<id>] so the
+   DSL can read [outputs.<id>.exit], [exists(outputs.<id>.files)], etc. *)
+let json_of_file_change (fc : file_change) : Yojson.Safe.t =
+  `Assoc
+    [
+      ("path", `String fc.path);
+      ("change", `String (string_of_file_change_kind fc.change));
+      ("size", `Int fc.size);
+      ("digest", `String fc.digest);
+    ]
+
+let json_of_run_result (r : run_result) : Yojson.Safe.t =
+  `Assoc
+    [
+      ("exit", `Int r.exit);
+      ("stdout", `String r.stdout);
+      ("stderr", `String r.stderr);
+      ("truncated", `Bool r.truncated);
+      ("files", `List (List.map json_of_file_change r.files));
+    ]
+
 (* Everything a stop / branch decision READS is recorded, in order, so replay is
    byte-identical and the (data-driven, possibly unbounded) loop bound is purely
    a function of recorded inputs. *)
@@ -89,6 +148,9 @@ type trace_entry =
   | Budget_read of { value : int }  (** a [backend.budget ()] reading. *)
   | Fixpoint_progress of { progress : bool }  (** a Fixpoint progress verdict. *)
   | Loop_stopped of { iterations : int; reason : string }
+  | Run_executed of { id : string; result : run_result }
+      (** A [Run] step's command executed once; the full result is recorded so
+          replay re-binds it WITHOUT re-executing the command. *)
   | Committed_step of { id : string; token_digest : string }
   | Blocked_at of { id : string; reason : string }
 

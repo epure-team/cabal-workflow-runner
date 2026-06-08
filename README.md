@@ -65,6 +65,12 @@ cabal-workflow-runner validate examples/bounty.workflow.json \
 cabal-workflow-runner run examples/bounty.workflow.json \
   --floor g-validated --floor g-observed --floor g-independent \
   --approve "$APPROVAL_TOKEN"
+
+# A `run` step executes a shell command, but ONLY if its binary is in the
+# operator-supplied, RUNTIME-only allowlist (--allow-run, repeatable; '*' = all).
+# With no --allow-run flag the allowlist is empty and NO run step ever executes
+# (fail-closed). A workflow file can NEVER grant itself the allowlist.
+cabal-workflow-runner run examples/run-demo.workflow.json --allow-run mkdir
 ```
 
 ```sh
@@ -106,6 +112,61 @@ workflow (structured output + schema, a gate, a governed loop, a branch, a token
 commit) whose agents just echo fixed JSON so it runs cheaply; it was verified **live**
 all the way to `Committed`.
 
+### The `run` step (observable shell command)
+
+A `run` step executes an observable shell command and binds its result into the run
+context:
+
+```json
+{ "kind": "run", "id": "mk", "cmd": ["mkdir", "-p", "out"],
+  "working_dir": "scratch", "timeout_ms": 30000, "observe": ["out"] }
+```
+
+- **`cmd`** — a non-empty argv array, executed **without a shell** (no implicit
+  `sh -c`; a workflow wanting a shell must spell `["sh","-c","…"]`).
+- **`working_dir`** — **required**, **relative**, **rejected at parse if absolute or
+  containing `..`**. It is the command's cwd, the effect scope, and the snapshot root.
+- **`timeout_ms`** — optional bounded wall-clock cap.
+- **`observe`** — optional relative paths to snapshot; default = the whole `working_dir`.
+
+The result is bound under `outputs.<id>` as
+`{ "exit", "stdout", "stderr", "truncated", "files":[{ "path","change","size","digest" }] }`,
+so the DSL can read `outputs.mk.exit`, `exists(outputs.mk.files)`, etc. `stdout`/`stderr`
+are size-capped (64 KiB) with a `truncated` flag. `digest` is an **MD5 content digest**
+(`Digest`) for **change-detection / observability** — **NOT** a cryptographic integrity
+guarantee.
+
+**The allowlist is the trust control — it is operator-supplied at RUNTIME and never read
+from the workflow file.** `cmd[0]` **must be a bare command name resolved via `PATH`**: a
+`cmd[0]` containing a `/` (an absolute or relative path) is **`Blocked`** before the
+allowlist is checked (closing the bypass where a path-bearing `cmd[0]` passes the basename
+match yet runs an attacker-chosen binary). Otherwise a `run` step executes only if
+`Filename.basename` of its command head is in `Engine.run`'s `?run_allowlist` (CLI
+`--allow-run BIN`, repeatable), **or** the allowlist contains `"*"` (allow all). Otherwise
+the step is **`Blocked`** (fail-closed); with the default empty allowlist, **no `run` step
+ever executes**. A workflow file cannot grant itself the allowlist.
+
+> ⚠️ **Allowlist leaf tools, not wrappers.** Allowlisting a wrapper binary (`sh`, `bash`,
+> `env`, `xargs`, `find`, `python3`, `perl`, `node`, …) effectively allows **arbitrary
+> commands**. Keep the allowlist to leaf tools. Also note a **symlinked `working_dir` is
+> followed** — the command runs with cwd = the resolved target. This is **not a sandbox**;
+> the allowlist is the trust control.
+
+The run effect **never crashes the engine**: a spawn failure (exit `127`), an
+output-buffer overflow (exit `125`, `truncated=true`), or a timeout (exit `124`) is turned
+into a recorded `run_result`, so the run is always recorded and replayable.
+
+`working_dir` bounds the cwd and the snapshot scope but **does NOT sandbox** the command
+from touching absolute paths in its args; full isolation (container/chroot) is **out of
+scope** — the allowlist is the trust boundary. The command runs **exactly once**, on the
+live run: its full result is recorded in the trace (`Run_executed`), and **replay
+re-feeds the recorded result and NEVER re-executes** (so `rm` runs once and replay is
+byte-identical + side-effect-free). `Lint` emits an informational
+`run-step-executes-commands` warning for every `run` step (and a louder
+`run-step-destructive-command` for known-destructive binaries like `rm`/`dd`); both are
+warnings, best-effort, not a security control. See
+[`examples/run-demo.workflow.json`](examples/run-demo.workflow.json).
+
 ## Embedding the library
 
 Supply a backend and the floor gates; everything else is enforced for you:
@@ -115,7 +176,10 @@ open Cabal_workflow_runner
 
 let backend : Backend.t =
   { run_agent = (fun ~id:_ ~prompt:_ ~read_only:_ -> (true, `Assoc [ ("severity", `String "high") ]));
-    budget = (fun () -> 1_000_000) }
+    budget = (fun () -> 1_000_000);
+    (* the run-step effect; in bin/ this snapshots the dir + spawns a process. *)
+    run_command = (fun ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ->
+      { Types.exit = 0; stdout = ""; stderr = ""; truncated = false; files = [] }) }
 
 let () =
   match Workflow_json.of_file "wf.json" with

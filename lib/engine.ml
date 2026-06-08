@@ -57,7 +57,29 @@ let bind_loop_iter st index = bind st "loop" (`Assoc [ ("iter", `Int index) ])
    value. The ceiling is a constant, so replay reproduces byte-identically. *)
 let default_max_loop_iters = 10_000
 
-let run ?(max_loop_iters = default_max_loop_iters) ~backend ~token validated =
+(* A [Run] step executes only if the basename of its command's head is in the
+   operator-supplied allowlist, OR the allowlist contains ["*"] (allow all). The
+   default allowlist is [[]], so with no operator opt-in NO run step ever
+   executes (fail-closed). The allowlist is a RUNTIME parameter, never read from
+   the workflow file: a workflow cannot grant itself the right to run a command. *)
+let run_permitted ~run_allowlist cmd =
+  match cmd with
+  | [] -> false (* validator rejects this; defensive. *)
+  | head :: _ ->
+      List.mem "*" run_allowlist
+      || List.mem (Filename.basename head) run_allowlist
+
+(* [cmd.(0)] must be a BARE command name resolved via PATH. A head containing a
+   path separator ('/') — i.e. an absolute path ["/abs/x"], an explicit relative
+   path ["./x"], or any ["a/b"] — is rejected: it bypasses the allowlist's
+   [Filename.basename] match while executing an arbitrary binary. The bin runner
+   execs bare names via PATH. *)
+let path_bearing_head = function
+  | head :: _ -> String.contains head '/'
+  | [] -> false
+
+let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
+    ~backend ~token validated =
   let wf = Validate.Validated.workflow validated in
   let agent ~id ~prompt ~read_only =
     backend.Backend.run_agent ~id ~prompt ~read_only
@@ -118,6 +140,47 @@ let run ?(max_loop_iters = default_max_loop_iters) ~backend ~token validated =
         let chosen = match verdict with Pass -> then_ | Fail -> else_ in
         go st chosen
     | Loop { body; until; governors } -> run_loop st body until governors
+    | Run { id; cmd; working_dir; timeout_ms; observe } ->
+        (* Fail-closed allowlist gate. The allowlist is operator-supplied at
+           runtime; if the binary is not permitted, the step is Blocked WITHOUT
+           executing — mirroring the gate/commit Fail arms (emit Blocked_at,
+           terminal Blocked). Nothing is recorded as executed, so replay never
+           sees a Run_executed for it.
+
+           First, cmd[0] MUST be a BARE command name resolved via PATH: any path
+           separator ('/') in it — i.e. an absolute or relative path — is
+           rejected (closes the allowlist bypass where a path-bearing cmd[0]
+           passes the basename match but execs an attacker-chosen binary). *)
+        if path_bearing_head cmd then begin
+          let head = match cmd with hd :: _ -> hd | [] -> "<empty>" in
+          let reason =
+            Printf.sprintf
+              "run command must be a bare name resolved via PATH, not a path: %s"
+              head
+          in
+          let st = emit st (Blocked_at { id; reason }) in
+          { st with terminal = Some (Blocked reason) }
+        end
+        else if not (run_permitted ~run_allowlist cmd) then begin
+          let bin =
+            match cmd with hd :: _ -> Filename.basename hd | [] -> "<empty>"
+          in
+          let reason =
+            Printf.sprintf "run command %S not permitted (allowlist)" bin
+          in
+          let st = emit st (Blocked_at { id; reason }) in
+          { st with terminal = Some (Blocked reason) }
+        end
+        else begin
+          (* Execute the injected effect exactly ONCE, record the full result,
+             and bind it into ctx. Replay re-feeds this without re-executing. *)
+          let result =
+            backend.Backend.run_command ~id ~argv:cmd ~working_dir ~timeout_ms
+              ~observe
+          in
+          let st = emit st (Run_executed { id; result }) in
+          bind_output st id (json_of_run_result result)
+        end
     | Commit { id } ->
         if token_is_wellformed token then begin
           let digest = token_digest (Option.get token) in
@@ -283,6 +346,18 @@ let replay ?(max_loop_iters = default_max_loop_iters) ~trace validated =
         | _ -> raise (Replay_mismatch "branch entry mismatch"))
     | Loop { body; until; governors } ->
         replay_loop st body until governors
+    | Run { id; cmd = _; working_dir = _; timeout_ms = _; observe = _ } -> (
+        (* NEVER re-execute: re-feed the recorded result (or reproduce the
+           recorded allowlist-Blocked). The allowlist is NOT consulted on replay
+           (nothing executes), mirroring the Agent_ran replay arm. *)
+        match next () with
+        | Run_executed { id = rid; result } when rid = id ->
+            let st = emit st (Run_executed { id; result }) in
+            bind_output st id (json_of_run_result result)
+        | Blocked_at { id = rid; reason } when rid = id ->
+            let st = emit st (Blocked_at { id; reason }) in
+            { st with terminal = Some (Blocked reason) }
+        | _ -> raise (Replay_mismatch "run entry mismatch"))
     | Commit { id } -> (
         match next () with
         | Committed_step { id = rid; token_digest } when rid = id ->

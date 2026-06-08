@@ -1,0 +1,14 @@
+{
+  "name": "run-demo",
+  "_doc": "Demonstrates the v0.9 run step: it executes an observable shell command (mkdir -p out) under a relative working_dir (scratch), snapshots the created directory, gates on the command's recorded exit code, and ends Completed_no_commit (no commit needed). The run step executes ONLY if the operator passes --allow-run mkdir at runtime (e.g. cabal-workflow-runner run examples/run-demo.workflow.json --allow-run mkdir); with no allowlist the run step is Blocked (fail-closed). working_dir bounds the cwd/snapshot scope but does NOT sandbox the command from absolute paths in its args — the allowlist is the trust control. Linting reports the expected informational warning run-step-executes-commands (no errors).",
+  "steps": [
+    { "kind": "run", "id": "mk",
+      "cmd": ["mkdir", "-p", "out"],
+      "working_dir": "scratch",
+      "timeout_ms": 30000,
+      "observe": ["out"] },
+
+    { "kind": "gate", "id": "g-ran-ok",
+      "when": { "eq": [ { "path": "outputs.mk.exit" }, { "lit": 0 } ] } }
+  ]
+}

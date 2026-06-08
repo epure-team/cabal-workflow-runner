@@ -61,6 +61,23 @@ type step =
               [10_000]) — every loop stops at the ceiling regardless of
               governors / [until] / budget / agent progress. *)
     }
+  | Run of {
+      id : string;
+      cmd : string list;
+          (** non-empty argv; executed WITHOUT a shell (no implicit [sh -c]). *)
+      working_dir : string;
+          (** REQUIRED, relative, no [..]; the effect scope + snapshot root. *)
+      timeout_ms : int option;  (** optional bounded wall-clock cap. *)
+      observe : string list option;
+          (** relative paths to snapshot; default = the whole [working_dir]. *)
+    }
+      (** Run an observable shell command via an INJECTED effect
+          ([Backend.run_command]); records the full {!run_result} into the trace
+          and binds it into the run context under ["outputs.<id>"]. Executes only
+          if the binary is in {!val:Engine.run}'s runtime [run_allowlist]
+          (operator-supplied), else the step is [Blocked] (fail-closed). The
+          [working_dir] bounds the cwd/snapshot but does NOT sandbox the command
+          from absolute paths in its args; the allowlist is the trust control. *)
   | Commit of { id : string }
       (** The ONLY step that can file/submit. Requires a runtime token. *)
 
@@ -89,6 +106,41 @@ type outcome =
           [Gate] whose predicate evaluated [false]. *)
   | Aborted of string  (** Structural / schema error encountered at runtime. *)
 
+(** A single observed filesystem change produced by a {!Run} step. *)
+type file_change_kind =
+  | Created
+  | Modified
+  | Deleted
+
+type file_change = {
+  path : string;  (** relative to the run step's [working_dir]. *)
+  change : file_change_kind;
+  size : int;  (** post-change size in bytes (0 for [Deleted]). *)
+  digest : string;
+      (** post-change MD5 content digest ([""] for [Deleted]) — for
+          change-detection / observability only, NOT a cryptographic integrity
+          guarantee. *)
+}
+
+(** The structured result of executing a {!Run} step's command. Stdout/stderr
+    are size-capped by the runner; [truncated] flags that a cap was hit. *)
+type run_result = {
+  exit : int;
+  stdout : string;
+  stderr : string;
+  truncated : bool;
+  files : file_change list;
+}
+
+val string_of_file_change_kind : file_change_kind -> string
+
+val json_of_file_change : file_change -> Yojson.Safe.t
+(** [{"path","change","size","digest"}]. *)
+
+val json_of_run_result : run_result -> Yojson.Safe.t
+(** [{"exit","stdout","stderr","truncated","files":[..]}] — the form bound into
+    the run context under ["outputs.<id>"]. *)
+
 (** A recorded effect, in execution order. Replay re-feeds these without a
     backend. {b Everything a stop/branch decision reads is recorded} — each
     agent output, each budget reading, each Fixpoint progress verdict, each
@@ -103,6 +155,10 @@ type trace_entry =
   | Budget_read of { value : int }
   | Fixpoint_progress of { progress : bool }
   | Loop_stopped of { iterations : int; reason : string }
+  | Run_executed of { id : string; result : run_result }
+      (** A {!Run} step's command executed once; the full result is recorded so
+          {!Engine.replay} re-binds it WITHOUT re-executing (the command runs
+          exactly once, on the live run, never on replay). *)
   | Committed_step of { id : string; token_digest : string }
   | Blocked_at of { id : string; reason : string }
 

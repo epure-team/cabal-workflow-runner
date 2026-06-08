@@ -69,6 +69,31 @@
         },
         {
           "type": "object",
+          "required": [ "kind", "id", "cmd", "working_dir" ],
+          "properties": {
+            "kind": { "const": "run" },
+            "id": { "type": "string" },
+            "cmd": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "working_dir": {
+              "type": "string",
+              "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$)).+$"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4611686018427387903
+            },
+            "observe": { "type": "array", "items": { "type": "string" } }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "required": [ "kind", "id" ],
           "properties": {
             "kind": { "const": "commit" },

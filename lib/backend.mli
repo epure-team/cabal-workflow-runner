@@ -16,14 +16,35 @@ type t = {
       (** Remaining budget. A [Budget] governor stops the loop once this is
           [<= 0]. Embedder-supplied; a decrementing stub lets tests force loop
           termination without any [Max_iters] cap. *)
+  run_command :
+    id:string ->
+    argv:string list ->
+    working_dir:string ->
+    timeout_ms:int option ->
+    observe:string list option ->
+    Types.run_result;
+      (** Execute a {!Types.Run} step's command and return its observed
+          {!Types.run_result}. This is the INJECTED effect that keeps process
+          execution out of the lib: the lib defines the types and calls this
+          function; only [bin/] implements it via cabal/[Unix] + a before/after
+          directory snapshot. The engine calls it at most ONCE per run step (on a
+          live run, and only after the allowlist check passes); {!Engine.replay}
+          NEVER calls it (it re-feeds the recorded result). *)
 }
 
 val stub :
   ?agent:(id:string -> prompt:string -> read_only:bool -> bool * Yojson.Safe.t) ->
   ?budget:(unit -> int) ->
+  ?run_command:
+    (id:string ->
+     argv:string list ->
+     working_dir:string ->
+     timeout_ms:int option ->
+     observe:string list option ->
+     Types.run_result) ->
   unit ->
   t
 (** A deterministic stub backend used by tests and as a default. By default all
-    agents succeed returning [`Assoc []] and [budget] returns [max_int]
-    (effectively unbounded). Override [agent] or [budget] for specific
-    scenarios. *)
+    agents succeed returning [`Assoc []], [budget] returns [max_int]
+    (effectively unbounded), and [run_command] is a no-op success (exit 0, empty
+    output, no files). Override any of them for specific scenarios. *)

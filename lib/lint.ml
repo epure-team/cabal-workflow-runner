@@ -75,6 +75,7 @@ let rec floor_steps ~floor ~loc_prefix ~guaranteed acc steps =
 and floor_step ~floor ~loc ~guaranteed acc step =
   match step with
   | Agent _ -> guaranteed
+  | Run _ -> guaranteed
   | Gate { id; when_ = _ } -> String_set.add id guaranteed
   | Commit { id } ->
       let missing =
@@ -245,6 +246,12 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
   | Agent { id; output_schema; _ } ->
       let fields = Option.map schema_fields output_schema in
       (id, fields) :: List.remove_assoc id produced
+  | Run { id; _ } ->
+      (* A Run step binds outputs.<id> with a FIXED shape (see
+         [Types.json_of_run_result]); register those field names so references
+         like outputs.<id>.exit are not flagged dangling. *)
+      let fields = Some [ "exit"; "stdout"; "stderr"; "truncated"; "files" ] in
+      (id, fields) :: List.remove_assoc id produced
   | Gate { when_; _ } ->
       check_expr_refs ~loc ~produced ~warned_missing acc when_;
       produced
@@ -348,6 +355,68 @@ let rec unreachable_steps ~loc_prefix acc steps =
   in
   ()
 
+(* ---- run-step diagnostics (Warnings) ------------------------------------ *)
+
+(* Known destructive binaries. Matched by [Filename.basename] of the command
+   head, or — for the shell fork-bomb idiom — as a prefix of the head string.
+   This is BEST-EFFORT advisory only (a louder warning so a generator/operator
+   notices), NOT a security control: the allowlist (operator opt-in at runtime)
+   is the trust boundary. The list is deliberately small and documented. *)
+let destructive_bins = [ "rm"; "rmdir"; "mv"; "dd"; "mkfs"; "shred"; "truncate" ]
+
+let is_destructive cmd =
+  match cmd with
+  | [] -> false
+  | head :: _ ->
+      let base = Filename.basename head in
+      List.mem base destructive_bins
+      (* the classic ":(){ :|:& };:" fork bomb starts with ":(){" *)
+      || (String.length head >= 4 && String.sub head 0 4 = ":(){")
+
+(* Emit, for every Run step: an informational warning that it executes commands
+   ([run-step-executes-commands]), and additionally a louder warning when the
+   command head is a known-destructive binary ([run-step-destructive-command]).
+   Both are WARNINGS — they never set [has_errors]. *)
+let rec run_steps ~loc_prefix acc steps =
+  List.iteri
+    (fun i step ->
+      let loc = loc_index loc_prefix i in
+      match step with
+      | Run { id; cmd; _ } ->
+          acc :=
+            {
+              severity = Warning;
+              code = "run-step-executes-commands";
+              message =
+                Printf.sprintf
+                  "run step %S executes a shell command (%s); it runs only if \
+                   the operator's runtime allowlist permits its binary"
+                  id
+                  (String.concat " " cmd);
+              loc;
+            }
+            :: !acc;
+          if is_destructive cmd then
+            acc :=
+              {
+                severity = Warning;
+                code = "run-step-destructive-command";
+                message =
+                  Printf.sprintf
+                    "run step %S invokes a potentially DESTRUCTIVE command \
+                     (%s); best-effort advisory, not a security control — the \
+                     runtime allowlist is the trust boundary"
+                    id (List.nth cmd 0);
+                loc;
+              }
+              :: !acc
+      | Branch { then_; else_; _ } ->
+          run_steps ~loc_prefix:(loc ^ ".then") acc then_;
+          run_steps ~loc_prefix:(loc ^ ".else") acc else_
+      | Loop { body; _ } -> run_steps ~loc_prefix:(loc ^ ".body") acc body
+      | _ -> ())
+    steps
+
 (* ---- top-level check ---------------------------------------------------- *)
 
 let check ?(floor_gates = []) (wf : Types.workflow) : diagnostic list =
@@ -362,6 +431,8 @@ let check ?(floor_gates = []) (wf : Types.workflow) : diagnostic list =
     (refs_steps ~loc_prefix:"steps" ~produced:[] ~warned_missing acc wf.steps);
   (* Warnings: unreachable-after-commit. *)
   unreachable_steps ~loc_prefix:"steps" acc wf.steps;
+  (* Warnings: run steps execute commands (+ destructive-command notice). *)
+  run_steps ~loc_prefix:"steps" acc wf.steps;
   (* Warning: no commit at all. *)
   if not (any_commit wf.steps) then
     acc :=
