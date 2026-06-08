@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.7.1
+
+Final parity fix from a confirming external audit (94/95 cases agreed; this closes the last one).
+
+- **Integer-valued floats.** JSON Schema's `"type":"integer"` matches any number with zero
+  fractional part, so `{"n": 5.0}` is schema-valid — but the parser's `req_bounded_int` accepted
+  only `` `Int ``, rejecting `` `Float ``. The schema cannot cleanly forbid `5.0`, so the parser now
+  accepts an integer-valued float in `[1, max_int]` (and rejects a fractional one), restoring the
+  "parser accepts iff structurally schema-valid" iff. Safe direction either way (the bug was
+  over-rejection, never under-acceptance).
+- **`scripts/parity_check.py`** — a reproducible, real-validator-driven parity check (jsonschema
+  Draft 2020-12 vs the parser over a 30-case battery; exits non-zero on any divergence). Addresses
+  the prior weakness that the in-suite behavioral test's expected verdicts were hand-authored.
+- Added integer-valued-float cases to `test_schema_parser_behavioral_parity`.
+
 ## v0.7
 
 A **corrective release** addressing a third re-audit finding: the published JSON

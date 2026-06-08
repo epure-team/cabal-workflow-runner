@@ -239,7 +239,14 @@ Three layers guard a generated workflow, each tighter than the last:
      `maximum: 4611686018427387903` (OCaml `max_int` on 64-bit). A value `< 1` is rejected at
      parse and by the schema; a large-but-valid literal such as `1073741824` is accepted by
      both; a literal `> max_int` is yielded by yojson as `` `Intlit `` (which the parser
-     rejects) and exceeds the schema `maximum`, so it is invalid on both sides.
+     rejects) and exceeds the schema `maximum`, so it is invalid on both sides. Because JSON
+     Schema's `"type":"integer"` matches any number with zero fractional part, an
+     integer-valued float (`5.0`) is schema-valid; the parser therefore accepts an
+     integer-valued float in range and rejects a fractional one (`5.5`), preserving the iff.
+   - The schema↔parser iff is checked two ways: the in-suite behavioral test
+     (`test_schema_parser_behavioral_parity`) and `scripts/parity_check.py`, which drives the
+     committed schema with a real JSON-Schema validator (jsonschema, Draft 2020-12) against the
+     parser over a battery and exits non-zero on any divergence (dev/CI; not part of `dune test`).
    - **A loop's `governors` array is `minItems:1`** in the schema and a non-empty list at
      parse, so an empty `governors` array is a parse-level *shape* error (the richer
      `ungoverned-loop` *semantic* diagnostic still lives in `Lint`/`Validate`).

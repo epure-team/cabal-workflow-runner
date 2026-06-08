@@ -33,6 +33,15 @@ let req_bounded_int key json =
   match member_opt key json with
   | Some (`Int n) ->
       if n < 1 then err "field %S must be >= 1 (got %d)" key n else n
+  | Some (`Float f) ->
+      (* JSON Schema's ["type":"integer"] matches any number with zero
+         fractional part, so [5.0] is schema-valid. Accept an integer-valued
+         float in range (parity with the schema); reject a fractional one. *)
+      if not (Float.is_integer f) then
+        err "field %S must be an integer (got %g)" key f
+      else if f < 1.0 || f > Float.of_int max_int then
+        err "field %S is out of range (1 <= n <= %d)" key max_int
+      else int_of_float f
   | Some (`Intlit _) ->
       err "field %S is out of the supported integer range (max %d)" key max_int
   | Some _ -> err "field %S must be an integer" key

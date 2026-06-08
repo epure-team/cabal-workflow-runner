@@ -1343,11 +1343,18 @@ let behavioral_parity_cases : (string * string * bool) list =
     ( "max_iters n=>max_int (Intlit)",
       wf (loop (mi "100000000000000000000") ""), false );
     ("max_iters n wrong type (string)", wf (loop (mi {|"3"|}) ""), false);
+    (* JSON Schema's "type":"integer" matches integer-valued floats, so 5.0 is
+       schema-valid and the parser must accept it; a fractional float is invalid. *)
+    ("max_iters n=5.0 (integer-valued float)", wf (loop (mi "5.0") ""), true);
+    ("max_iters n=5.5 (fractional float)", wf (loop (mi "5.5") ""), false);
+    ("max_iters n=0.0 (integer-valued float < 1)", wf (loop (mi "0.0") ""), false);
     (* ---- fixpoint.window bounds: same battery ---- *)
     ("fixpoint window=-5", wf (loop (fp "-5") ""), false);
     ("fixpoint window=0", wf (loop (fp "0") ""), false);
     ("fixpoint window=1", wf (loop (fp "1") ""), true);
     ("fixpoint window=2", wf (loop (fp "2") ""), true);
+    ("fixpoint window=2.0 (integer-valued float)", wf (loop (fp "2.0") ""), true);
+    ("fixpoint window=2.5 (fractional float)", wf (loop (fp "2.5") ""), false);
     ("fixpoint window=1073741824", wf (loop (fp "1073741824") ""), true);
     ( "fixpoint window=>max_int (Intlit)",
       wf (loop (fp "100000000000000000000") ""), false );
