@@ -1,0 +1,3 @@
+(library
+ (name cabal_workflow_runner)
+ (libraries yojson))

@@ -1,0 +1,39 @@
+{
+  "name": "bounty-pipeline",
+  "steps": [
+    { "kind": "agent", "id": "recon",
+      "prompt": "Survey the target and enumerate candidate findings.",
+      "read_only": true },
+
+    { "kind": "loop", "max_iters": 5, "until": "candidate-exhausted",
+      "body": [
+        { "kind": "agent", "id": "deep-dive",
+          "prompt": "Investigate the next candidate finding in depth.",
+          "read_only": true },
+        { "kind": "agent", "id": "draft-poc",
+          "prompt": "Draft a proof-of-concept for the current candidate.",
+          "read_only": false }
+      ] },
+
+    { "kind": "agent", "id": "writeup",
+      "prompt": "Write the report for the strongest finding.",
+      "read_only": false },
+
+    { "kind": "gate", "id": "g-validated" },
+    { "kind": "gate", "id": "g-observed" },
+    { "kind": "gate", "id": "g-independent" },
+
+    { "kind": "branch", "on": "g-independent",
+      "then": [
+        { "kind": "agent", "id": "final-review",
+          "prompt": "Independent reviewer signs off on the finding.",
+          "read_only": true },
+        { "kind": "commit", "id": "submit-bounty" }
+      ],
+      "else": [
+        { "kind": "agent", "id": "abort-note",
+          "prompt": "Record why the finding did not clear independent review.",
+          "read_only": true }
+      ] }
+  ]
+}
