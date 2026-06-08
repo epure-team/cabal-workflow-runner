@@ -68,7 +68,7 @@ CASES = [
     ("branch +junk", wf([{"kind": "branch", "when": {"lit": True},
                           "then": [A("t")], "else": [A("e")], "junk": 1}])),
     ("unknown kind", wf([{"kind": "frobnicate"}])),
-    ("governor +junk", wf([{**mi(3)}]) | {} if False else wf([loop([{"kind": "max_iters", "n": 3, "junk": 1}])])),
+    ("governor +junk", wf([loop([{"kind": "max_iters", "n": 3, "junk": 1}])])),
     ("governor unknown kind", wf([loop([{"kind": "throttle"}])])),
     ("empty governors", wf([loop([])])),
     # int bounds
