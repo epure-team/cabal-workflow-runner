@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.7
+
+A **corrective release** addressing a third re-audit finding: the published JSON
+Schema and the parser **still disagreed on 7 of 54 enumerated inputs**, verified
+against the Draft 2020-12 validator. The divergences were value-bound mismatches
+and an expr `_`-escape mismatch. This release closes them definitively and states
+the governing principle that makes the agreement testable.
+
+**Governing principle (now stated in SPEC and made true):** `Workflow_json.of_string`
+accepts a workflow **iff** that workflow is structurally valid per
+`schema/workflow.schema.json`. Every *structural* constraint the schema expresses is
+enforced by the parser, and vice-versa. Semantic *floor* checks (gate reachability,
+ungoverned-loop, etc.) remain `Lint`/`Validate`'s job and are deliberately not encoded
+in the schema.
+
+### Fixed
+
+- **`max_iters.n` and `fixpoint.window` bounds now agree on both sides.** The parser
+  enforces `1 ≤ v ≤ max_int` **at parse** (new `req_bounded_int`): a value `< 1` is
+  rejected with a clear message (`field "n" must be >= 1 (got 0)`); a literal `> max_int`
+  is yielded by yojson as `` `Intlit `` and rejected. Previously the parser **accepted**
+  `n = -5` / `n = 0` that the schema rejected. The schema's `bounded_int` `maximum` was
+  raised from `1073741823` (2³⁰−1) to `4611686018427387903` (OCaml `max_int` on 64-bit),
+  so a large-but-valid literal like `1073741824` is now **schema-valid AND parser-accepted**
+  (previously schema-rejected); a literal beyond `max_int` remains invalid on both sides.
+- **Empty `governors` is now a parse-level shape error.** The schema declares the loop
+  `governors` array `minItems:1`; the parser now requires a non-empty list (new
+  `req_nonempty_list`), so it no longer **accepts** an empty `governors` array the schema
+  rejects. (The richer `ungoverned-loop` *semantic* diagnostic still lives in
+  `Lint`/`Validate`.)
+- **Expr operator objects are now *strictly* closed on the schema side too.** Expr objects
+  are single-operator: the parser requires exactly one key and rejects any extra key,
+  including a leading-underscore one (`{"lit":true,"_x":1}` → rejected). The schema's expr
+  branches previously carried the `^_` `patternProperty` (inherited from the shared
+  closed-object builder) and therefore **accepted** `{"lit":true,"_x":1}`. Expr branches now
+  use a distinct strictly-closed builder (`additionalProperties:false`, **no** `^_`), so the
+  schema rejects it too. Workflow / step / governor objects keep the `^_` escape hatch (the
+  parser allows `_` there).
+- The committed `schema/workflow.schema.json` is regenerated from the lib value (the
+  no-drift test enforces byte-equality; the `schema` CLI output byte-equals the file).
+
+### Tests
+
+- **New behavioral parity test** (`test_schema_parser_behavioral_parity`) enumerates a
+  battery of candidate workflow JSON strings (mirroring the audit's 54-case methodology) —
+  unknown vs `_`-prefixed keys per object kind, `max_iters.n` / `fixpoint.window` ∈
+  {−5, 0, 1, 2, 1073741824, `>max_int`}, empty vs single `governors`, expr objects with
+  0/1/2 keys and an `_`-key, and type confusions — and asserts, per case, that the **parser**
+  accepts iff the case is structurally schema-valid (the expected verdict is hard-coded to
+  mirror the schema). This drives the parser over the battery, which the prior
+  structural-only parity test never did; it fails on pre-fix code (catching the 7
+  divergences) and passes after. The structural parity test was adapted: expr branches are
+  now asserted strictly closed (no `^_`).
+
+### Docs
+
+- `SPEC.md` / `README.md` state the governing principle, correct the over-claim that expr
+  objects took `_` metadata, document the `max_int` bound and the `minItems:1` governors
+  rule, and note `output_schema` is the one intentionally-open map.
+
 ## v0.6
 
 A **corrective release** addressing a re-audit finding: the published JSON

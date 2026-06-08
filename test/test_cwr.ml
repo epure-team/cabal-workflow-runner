@@ -1220,14 +1220,167 @@ let test_schema_parser_parity () =
             (prop_names v)
       | None -> Alcotest.fail "governor variant missing a kind const")
     (one_of (def "governor"));
-  (* Every expr branch is also closed (no kind const to key on). *)
+  (* Every expr branch is STRICTLY closed: additionalProperties:false AND NO
+     [^_] patternProperty. Expr operator objects are single-operator-key; the
+     parser rejects any extra key including an underscore one, so unlike
+     workflow/step/governor objects they must NOT carry the [^_] escape hatch. *)
+  let is_strictly_closed v =
+    match v with
+    | `Assoc l ->
+        List.assoc_opt "additionalProperties" l = Some (`Bool false)
+        && not (List.mem_assoc "patternProperties" l)
+    | _ -> false
+  in
   List.iteri
     (fun i b ->
       Alcotest.(check bool)
-        (Printf.sprintf "expr branch %d closed (additionalProperties:false + ^_)"
-           i)
-        true (is_closed b))
+        (Printf.sprintf
+           "expr branch %d strictly closed (additionalProperties:false, NO ^_)" i)
+        true (is_strictly_closed b))
     (one_of (def "expr"))
+
+(* ---- BEHAVIORAL schema<->parser parity (drive the PARSER over a battery) --- *)
+
+(* The governing principle: [Workflow_json.of_string] parse-accepts a workflow
+   IFF that workflow is structurally valid per schema/workflow.schema.json. The
+   structural parity test above checks the schema's SHAPE; this one drives the
+   actual PARSER over a battery of candidate JSON strings (mirroring the audit's
+   54-case methodology) and asserts, per case, that the parser's accept/reject
+   verdict matches the hard-coded structurally-schema-valid verdict. No JSON
+   Schema validator is used: the [expect] column encodes what the schema says,
+   so the test fails if the parser ever drifts from the schema on these inputs. *)
+
+(* [expect = true] means "structurally schema-valid, so the parser MUST accept";
+   [expect = false] means "structurally schema-invalid, so the parser MUST
+   reject". A handful of governors-empty/loop bodies are otherwise well-formed at
+   the STRUCTURAL level (semantic floor checks are Validate's job, not the
+   parser's / schema's), so they are expected-accept here. *)
+let behavioral_parity_cases : (string * string * bool) list =
+  let wf steps = Printf.sprintf {|{ "name": "x", "steps": [ %s ] }|} steps in
+  let loop govs body =
+    Printf.sprintf
+      {|{ "kind": "loop", "governors": [ %s ], "body": [ %s ] }|} govs body
+  in
+  let gate when_ =
+    Printf.sprintf {|{ "kind": "gate", "id": "g", "when": %s }|} when_
+  in
+  let mi n = Printf.sprintf {|{ "kind": "max_iters", "n": %s }|} n in
+  let fp w =
+    Printf.sprintf
+      {|{ "kind": "fixpoint", "window": %s, "progress": { "lit": true } }|} w
+  in
+  [
+    (* ---- top-level workflow: unknown vs underscore key ---- *)
+    ("workflow: unknown key", {|{ "name": "x", "junk": 1, "steps": [] }|}, false);
+    ("workflow: _doc key", {|{ "name": "x", "_doc": "note", "steps": [] }|}, true);
+    (* ---- agent step ---- *)
+    ( "agent: ok",
+      wf {|{ "kind": "agent", "id": "a", "prompt": "p" }|}, true );
+    ( "agent: unknown key",
+      wf {|{ "kind": "agent", "id": "a", "prompt": "p", "junk": 1 }|}, false );
+    ( "agent: _note key",
+      wf {|{ "kind": "agent", "id": "a", "prompt": "p", "_note": "n" }|}, true );
+    ( "agent: id wrong type (int)",
+      wf {|{ "kind": "agent", "id": 1, "prompt": "p" }|}, false );
+    ( "agent: read_only wrong type (string)",
+      wf {|{ "kind": "agent", "id": "a", "prompt": "p", "read_only": "yes" }|},
+      false );
+    (* output_schema is the one intentionally-open map: arbitrary field keys ok *)
+    ( "agent: output_schema open map",
+      wf
+        {|{ "kind": "agent", "id": "a", "prompt": "p",
+            "output_schema": { "anyField": "int", "another": { "enum": ["x"] } } }|},
+      true );
+    (* ---- gate step ---- *)
+    ("gate: ok", wf (gate {|{ "lit": true }|}), true);
+    ( "gate: unknown key",
+      wf {|{ "kind": "gate", "id": "g", "when": { "lit": true }, "junk": 1 }|},
+      false );
+    ( "gate: _note key",
+      wf {|{ "kind": "gate", "id": "g", "when": { "lit": true }, "_note": "n" }|},
+      true );
+    (* ---- branch step ---- *)
+    ( "branch: ok",
+      wf
+        {|{ "kind": "branch", "when": { "lit": true }, "then": [], "else": [] }|},
+      true );
+    ( "branch: unknown key",
+      wf
+        {|{ "kind": "branch", "when": { "lit": true }, "then": [], "else": [],
+            "junk": 1 }|},
+      false );
+    (* ---- commit step ---- *)
+    ("commit: ok", wf {|{ "kind": "commit", "id": "c" }|}, true);
+    ( "commit: unknown key",
+      wf {|{ "kind": "commit", "id": "c", "junk": 1 }|}, false );
+    (* ---- unknown step kind ---- *)
+    ("step: unknown kind", wf {|{ "kind": "frobnicate" }|}, false);
+    (* ---- loop step + governors ---- *)
+    ( "loop: unknown key",
+      wf {|{ "kind": "loop", "governors": [ { "kind": "budget" } ],
+              "body": [], "junk": 1 }|},
+      false );
+    ( "loop: _note key",
+      wf {|{ "kind": "loop", "governors": [ { "kind": "budget" } ],
+              "body": [], "_note": "n" }|},
+      true );
+    (* empty governors: minItems:1 => structurally invalid => parser must reject *)
+    ("loop: empty governors", wf (loop "" ""), false);
+    ("loop: single governor (budget)", wf (loop {|{ "kind": "budget" }|} ""), true);
+    (* governor: unknown / underscore keys *)
+    ( "budget governor: unknown key",
+      wf (loop {|{ "kind": "budget", "junk": 1 }|} ""), false );
+    ( "budget governor: _why key",
+      wf (loop {|{ "kind": "budget", "_why": "cheap" }|} ""), true );
+    ("governor: unknown kind", wf (loop {|{ "kind": "throttle" }|} ""), false);
+    (* ---- max_iters.n bounds: reject <1 and >max_int; accept 1..max_int ---- *)
+    ("max_iters n=-5", wf (loop (mi "-5") ""), false);
+    ("max_iters n=0", wf (loop (mi "0") ""), false);
+    ("max_iters n=1", wf (loop (mi "1") ""), true);
+    ("max_iters n=2", wf (loop (mi "2") ""), true);
+    ("max_iters n=1073741824", wf (loop (mi "1073741824") ""), true);
+    ("max_iters n=max_int", wf (loop (mi "4611686018427387903") ""), true);
+    ( "max_iters n=>max_int (Intlit)",
+      wf (loop (mi "100000000000000000000") ""), false );
+    ("max_iters n wrong type (string)", wf (loop (mi {|"3"|}) ""), false);
+    (* ---- fixpoint.window bounds: same battery ---- *)
+    ("fixpoint window=-5", wf (loop (fp "-5") ""), false);
+    ("fixpoint window=0", wf (loop (fp "0") ""), false);
+    ("fixpoint window=1", wf (loop (fp "1") ""), true);
+    ("fixpoint window=2", wf (loop (fp "2") ""), true);
+    ("fixpoint window=1073741824", wf (loop (fp "1073741824") ""), true);
+    ( "fixpoint window=>max_int (Intlit)",
+      wf (loop (fp "100000000000000000000") ""), false );
+    (* ---- expr operator objects: 0 / 1 / 2 keys; underscore key REJECTED ---- *)
+    ("expr 0-key {}", wf (gate "{}"), false);
+    ("expr 1-key {lit}", wf (gate {|{ "lit": true }|}), true);
+    ("expr 2-key {lit,eq}", wf (gate {|{ "lit": true, "eq": [] }|}), false);
+    (* the headline divergence: underscore key inside an expr operator object *)
+    ("expr {lit,_x} (underscore inside expr)",
+      wf (gate {|{ "lit": true, "_x": 1 }|}), false);
+    ("expr {path,_doc} (underscore inside expr)",
+      wf (gate {|{ "path": "outputs.a.x", "_doc": "note" }|}), false);
+    (* nested expr operand object likewise strictly single-key *)
+    ( "expr nested not{lit,_x}",
+      wf (gate {|{ "not": { "lit": true, "_x": 1 } }|}), false );
+    (* ---- a couple of type confusions ---- *)
+    ( "steps wrong type (string)",
+      {|{ "name": "x", "steps": "nope" }|}, false );
+    ("name wrong type (int)", {|{ "name": 1, "steps": [] }|}, false);
+  ]
+
+let test_schema_parser_behavioral_parity () =
+  List.iter
+    (fun (label, json, expect_accept) ->
+      let accepted =
+        match Workflow_json.of_string json with Ok _ -> true | Error _ -> false
+      in
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "parser accept==schema-valid for %S (expect %s)" label
+           (if expect_accept then "ACCEPT" else "REJECT"))
+        expect_accept accepted)
+    behavioral_parity_cases
 
 let () =
   Alcotest.run "cabal_workflow_runner"
@@ -1340,6 +1493,9 @@ let () =
           Alcotest.test_case
             "schema/parser parity: closed defs + properties == known keys"
             `Quick test_schema_parser_parity;
+          Alcotest.test_case
+            "behavioral parity: parser accepts iff structurally schema-valid"
+            `Quick test_schema_parser_behavioral_parity;
         ] );
       ( "parser-strictness",
         [

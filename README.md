@@ -123,11 +123,17 @@ Three layers guard a generated workflow, each tighter than the last:
 1. **Schema (shape at generation).** `Workflow_schema` (`lib/workflow_schema.ml(i)`,
    **pure, yojson-only**) publishes the canonical **JSON Schema (draft 2020-12)** of the
    workflow format — derived from `Workflow_json` (the actual parser), so it describes
-   *exactly* what the parser accepts. The parser and the published schema **agree**:
-   every workflow / step / governor / expr object is **closed** — unknown keys are
-   rejected by **both** — except keys prefixed with `_` (ignored metadata, e.g. `_doc`),
-   and integers are bounded. A schema-valid workflow parses, and a parser-accepted
-   workflow is schema-valid. Prompt your generator with
+   *exactly* what the parser accepts. **Governing principle:** `Workflow_json.of_string`
+   accepts a workflow **iff** that workflow is structurally valid per the schema; every
+   structural constraint is enforced by both, and a behavioral parity test drives the
+   parser over a battery of inputs to prove it. Workflow / step / governor objects are
+   **closed** with a `_`-metadata escape hatch (unknown keys rejected by both, but `_doc`
+   / `_note` accepted by both). **Expr operator objects are *strictly* closed — a single
+   operator key, no `_` metadata** — so `{"lit":true,"_x":1}` is rejected by both. The
+   bounded integers `max_iters.n` / `fixpoint.window` are `1 ≤ v ≤ max_int` (so
+   `1073741824` is valid; a literal beyond `max_int` is rejected by both); a loop's
+   `governors` array must be non-empty. `output_schema` is the one intentionally-open
+   field→type map. Prompt your generator with
    `cabal-workflow-runner schema` (or the committed
    [`schema/workflow.schema.json`](schema/workflow.schema.json), or
    `Workflow_schema.to_string ()`) so it emits **conformant workflows by construction**

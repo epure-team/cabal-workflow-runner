@@ -23,9 +23,18 @@ let opt_bool key default json =
   | Some _ -> err "field %S must be a boolean" key
   | None -> default
 
-let req_int key json =
+(* A bounded integer field, used for [max_iters.n] and [fixpoint.window]. The
+   schema declares [1 <= v <= max_int]; we enforce the SAME bounds at parse so
+   the parser accepts a workflow iff it is structurally schema-valid:
+   - a literal [> max_int] (e.g. 100000000000000000000) is yielded by yojson as
+     [`Intlit] (not [`Int]); we reject it explicitly with a clear message.
+   - a value [< 1] is rejected here (the schema's [minimum:1]). *)
+let req_bounded_int key json =
   match member_opt key json with
-  | Some (`Int n) -> n
+  | Some (`Int n) ->
+      if n < 1 then err "field %S must be >= 1 (got %d)" key n else n
+  | Some (`Intlit _) ->
+      err "field %S is out of the supported integer range (max %d)" key max_int
   | Some _ -> err "field %S must be an integer" key
   | None -> err "missing required field %S" key
 
@@ -34,6 +43,15 @@ let req_list key json =
   | Some (`List l) -> l
   | Some _ -> err "field %S must be a list" key
   | None -> err "missing required field %S" key
+
+(* A required list that the schema declares with [minItems:1] (e.g. a loop's
+   [governors]): an empty array is a parse-level shape error, matching the
+   schema. ([Lint]/[Validate] keep their richer [ungoverned-loop] diagnostic;
+   this just ensures the parser does not ACCEPT what the schema rejects.) *)
+let req_nonempty_list key json =
+  match req_list key json with
+  | [] -> err "field %S must be a non-empty list" key
+  | l -> l
 
 (* Closed-object discipline (mirrors [expr_of_json], which already rejects an
    object with more than one operator key). After reading the known keys of an
@@ -141,7 +159,7 @@ let governor_of_json (j : Yojson.Safe.t) : governor =
   let kind = req_string "kind" j in
   match kind with
   | "max_iters" ->
-      let g = Max_iters (req_int "n" j) in
+      let g = Max_iters (req_bounded_int "n" j) in
       reject_unknown_keys ~what:"max_iters governor" ~known:[ "kind"; "n" ] j;
       g
   | "budget" ->
@@ -149,7 +167,8 @@ let governor_of_json (j : Yojson.Safe.t) : governor =
       Budget
   | "fixpoint" ->
       let g =
-        Fixpoint { window = req_int "window" j; progress = req_expr "progress" j }
+        Fixpoint
+          { window = req_bounded_int "window" j; progress = req_expr "progress" j }
       in
       reject_unknown_keys ~what:"fixpoint governor"
         ~known:[ "kind"; "window"; "progress" ] j;
@@ -196,7 +215,8 @@ let rec step_of_json json =
           {
             body = List.map step_of_json (req_list "body" json);
             until = opt_expr "until" json;
-            governors = List.map governor_of_json (req_list "governors" json);
+            governors =
+              List.map governor_of_json (req_nonempty_list "governors" json);
           }
       in
       reject_unknown_keys ~what:"loop step"

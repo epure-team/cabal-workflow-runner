@@ -3,12 +3,17 @@
    Hand-derived from [Workflow_json] (the actual parser) so it accepts EXACTLY
    what the parser accepts:
 
-   - Every workflow / step / governor / expr object is CLOSED: the parser
-     rejects any key that is neither a known key for that object nor a leading-
-     underscore metadata key (the documented [_doc] / [_note] escape hatch). We
-     model that with [additionalProperties:false] PLUS [patternProperties:
-     {"^_": {}}] on every such object. ([output_schema] is intentionally an open
-     field->type map and is the one exception.)
+   - Every workflow / step / governor object is CLOSED with a metadata escape
+     hatch: the parser rejects any key that is neither a known key for that
+     object nor a leading-underscore metadata key (the documented [_doc] /
+     [_note] convention). We model that with [additionalProperties:false] PLUS
+     [patternProperties: {"^_": {}}] on each such object.
+   - Expr operator objects are STRICTLY closed: the parser requires EXACTLY one
+     operator key and rejects any other key — including a leading-underscore one.
+     So expr objects do NOT take [_] metadata; we model them with
+     [additionalProperties:false] and NO [^_] patternProperty.
+   - ([output_schema] is intentionally an open field->type map and is the one
+     exception to closedness.)
    - The parser dispatches steps on a [kind] discriminator and rejects any other
      kind; governors likewise. We model both as [oneOf] keyed on [kind].
    - The expr encoding is the single-operator-object form produced/consumed by
@@ -25,16 +30,19 @@ let ref_ name : Yojson.Safe.t = obj [ ("$ref", s ("#/$defs/" ^ name)) ]
 (* { "type": "string" } etc. *)
 let typ t = obj [ ("type", s t) ]
 
-(* A bounded integer: [minimum:1] and a [maximum] inside OCaml's safe int range
-   so a literal yojson parses as [`Int] (not [`Intlit]). 2^30-1 is comfortably an
-   OCaml [int]; the parser rejects out-of-range integers (they become [`Intlit]),
-   so the schema must reject them too. *)
+(* A bounded integer: [minimum:1] and [maximum: max_int] (OCaml [max_int] on a
+   64-bit platform, 2^62-1). This matches the parser exactly: the parser accepts
+   any [`Int] in [1, max_int] (see [Workflow_json.req_bounded_int]) and rejects
+   both [< 1] and any literal [> max_int] (yojson yields the latter as [`Intlit],
+   which the parser rejects). A large-but-valid literal like [1073741824] is thus
+   schema-valid AND parser-accepted; a literal beyond [max_int] is invalid on
+   both sides. *)
 let bounded_int : Yojson.Safe.t =
   obj
     [
       ("type", s "integer");
       ("minimum", `Int 1);
-      ("maximum", `Int 1073741823);
+      ("maximum", `Int max_int);
     ]
 
 (* An object schema that requires [required] keys, gives [props] for the named
@@ -64,6 +72,21 @@ let closed_object_with ~required ~props : Yojson.Safe.t =
       ("additionalProperties", `Bool false);
     ]
 
+(* A STRICTLY closed object schema with NO [^_] metadata escape hatch: it is
+   exactly the declared keys and nothing else. Used for expr operator objects,
+   which the parser requires to be a single-operator object — it rejects ANY
+   extra key, including a leading-underscore one (see [Workflow_json.expr_of_json],
+   whose [`Assoc [ (key, v) ]] pattern matches exactly one key). So expr objects
+   do NOT take [_doc]/[_note] metadata, and the schema must agree. *)
+let strictly_closed_object_with ~required ~props : Yojson.Safe.t =
+  obj
+    [
+      ("type", s "object");
+      ("required", arr (List.map s required));
+      ("properties", obj props);
+      ("additionalProperties", `Bool false);
+    ]
+
 (* ---- expr ($defs/expr) -------------------------------------------------- *)
 
 (* Helpers describing the operand shapes the parser enforces:
@@ -74,7 +97,7 @@ let closed_object_with ~required ~props : Yojson.Safe.t =
    - not -> a single expr. *)
 let expr_def : Yojson.Safe.t =
   let single key value_schema =
-    closed_object_with ~required:[ key ] ~props:[ (key, value_schema) ]
+    strictly_closed_object_with ~required:[ key ] ~props:[ (key, value_schema) ]
   in
   let pair key =
     single key

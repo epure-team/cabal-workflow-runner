@@ -86,21 +86,18 @@
           "type": "object",
           "required": [ "path" ],
           "properties": { "path": { "type": "string" } },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "exists" ],
           "properties": { "exists": { "type": "string" } },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "lit" ],
           "properties": { "lit": {} },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -114,7 +111,6 @@
               "maxItems": 2
             }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -128,7 +124,6 @@
               "maxItems": 2
             }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -142,7 +137,6 @@
               "maxItems": 2
             }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -156,7 +150,6 @@
               "maxItems": 2
             }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -170,7 +163,6 @@
               "maxItems": 2
             }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -184,7 +176,6 @@
               "maxItems": 2
             }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -198,7 +189,6 @@
               "maxItems": 2
             }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -207,7 +197,6 @@
           "properties": {
             "and": { "type": "array", "items": { "$ref": "#/$defs/expr" } }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -216,14 +205,12 @@
           "properties": {
             "or": { "type": "array", "items": { "$ref": "#/$defs/expr" } }
           },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "not" ],
           "properties": { "not": { "$ref": "#/$defs/expr" } },
-          "patternProperties": { "^_": {} },
           "additionalProperties": false
         }
       ]
@@ -236,7 +223,11 @@
           "required": [ "kind", "n" ],
           "properties": {
             "kind": { "const": "max_iters" },
-            "n": { "type": "integer", "minimum": 1, "maximum": 1073741823 }
+            "n": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4611686018427387903
+            }
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false
@@ -256,7 +247,7 @@
             "window": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1073741823
+              "maximum": 4611686018427387903
             },
             "progress": { "$ref": "#/$defs/expr" }
           },

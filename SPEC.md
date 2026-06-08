@@ -213,18 +213,40 @@ Three layers guard a generated workflow, each tighter than the last:
    string`). It is **derived from `Workflow_json`** — the actual parser — and a test
    asserts the committed [`schema/workflow.schema.json`](schema/workflow.schema.json)
    byte-matches `Workflow_schema.to_string ()` and that the step `kind`s it enumerates
-   are exactly the ones the parser accepts, so it cannot drift from what runs. **The
-   parser and the published schema agree: every workflow / step / governor / expr object
-   is closed — unknown keys are rejected by BOTH — except keys prefixed with `_` (ignored
-   metadata, e.g. `_doc`); integers are bounded. A schema-valid workflow parses, and a
-   parser-accepted workflow is schema-valid.** Concretely, the schema marks each such
-   object `additionalProperties:false` with a `patternProperties: {"^_": {}}` escape
-   hatch, exactly mirroring the parser, which rejects any key that is neither a known key
-   for that object nor `_`-prefixed (so `{"path":"x","junk":2}` is rejected by both, while
-   `_doc`/`_note` are accepted by both); and the integer governor fields (`max_iters.n`,
-   `fixpoint.window`) carry `minimum:1` and a `maximum` (`1073741823` = 2³⁰−1) inside
-   OCaml's safe `int` range, so a literal too large for the parser to read as an `int` is
-   also schema-invalid. (`output_schema` is intentionally an open field→type map.) Prompt a
+   are exactly the ones the parser accepts, so it cannot drift from what runs.
+
+   **Governing principle.** `Workflow_json.of_string` accepts a workflow **iff** that
+   workflow is **structurally valid per `schema/workflow.schema.json`**. Every *structural*
+   constraint the schema expresses is enforced by the parser, and vice-versa. (Semantic
+   *floor* checks — gate reachability, commit-must-be-gated, ungoverned-loop, dangling
+   refs — remain `Lint`/`Validate`'s job and are deliberately **not** encoded in the
+   schema.) A behavioral parity test drives the parser over a battery of candidate JSON
+   strings and asserts, per case, that the parser's accept/reject verdict matches the
+   schema's structural verdict.
+
+   Concretely:
+   - **Workflow / step / governor objects are closed with a metadata escape hatch:** the
+     schema marks each `additionalProperties:false` **plus** `patternProperties: {"^_": {}}`,
+     mirroring the parser, which rejects any key that is neither a known key for that object
+     nor `_`-prefixed. So `{"kind":"agent",…,"junk":1}` is rejected by both, while `_doc` /
+     `_note` are accepted by both.
+   - **Expr operator objects are *strictly* closed — they take NO `_` metadata.** An expr is a
+     single-operator object: the parser requires exactly one key and rejects any extra key,
+     *including* a leading-underscore one. The schema models each expr branch with
+     `additionalProperties:false` and **no** `^_` pattern. So `{"lit":true,"_x":1}` is rejected
+     by both; an empty `{}` (zero keys) and a two-key object are likewise rejected by both.
+   - **Bounded integers** (`max_iters.n`, `fixpoint.window`) carry `minimum:1` and
+     `maximum: 4611686018427387903` (OCaml `max_int` on 64-bit). A value `< 1` is rejected at
+     parse and by the schema; a large-but-valid literal such as `1073741824` is accepted by
+     both; a literal `> max_int` is yielded by yojson as `` `Intlit `` (which the parser
+     rejects) and exceeds the schema `maximum`, so it is invalid on both sides.
+   - **A loop's `governors` array is `minItems:1`** in the schema and a non-empty list at
+     parse, so an empty `governors` array is a parse-level *shape* error (the richer
+     `ungoverned-loop` *semantic* diagnostic still lives in `Lint`/`Validate`).
+   - `output_schema` is intentionally the **one open** field→type map (`additionalProperties`
+     is a type tag), so arbitrary field names are allowed there.
+
+   Prompt a
    generator with `cabal-workflow-runner schema` (or `Workflow_schema.to_string ()`) so
    it emits **conformant workflows by construction** — correct `kind`s, the expr /
    governor encodings, required fields.
