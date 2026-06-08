@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.6
+
+A **corrective release** addressing a re-audit finding: the published JSON
+Schema and the parser **disagreed on unknown keys**. v0.5 made the schema reject
+extra keys on `step`/`governor`/`agent` objects (`additionalProperties:false`),
+but the **parser still silently accepted them** — so the schema rejected
+workflows the runner happily executed, voiding the "schema == what runs"
+contract.
+
+### Fixed
+
+- **The parser now rejects unknown keys (closed objects), with a `_`-prefixed
+  metadata escape hatch.** `Workflow_json` now rejects, fail-closed, any key that
+  is neither a known key for the object nor prefixed with an underscore `_`, on
+  the **top-level workflow object**, each **step** (`agent`/`gate`/`branch`/
+  `loop`/`commit`), and each **governor** (`max_iters`/`budget`/`fixpoint`). The
+  error names the key and the object (e.g. `unknown key "junk" in agent step`).
+  Keys beginning with `_` (e.g. `_doc`, `_note`) are ignored metadata and
+  allowed — the documented escape hatch the examples use. This mirrors the
+  discipline `expr_of_json` already enforced ("expression object must have
+  exactly one operator key"). `output_schema` is unchanged: it is intentionally
+  an open field→type map.
+- **The schema regained agreement with the parser.** Every closed object
+  (workflow, the 5 steps, the 3 governors, the 13 expr branches) now carries
+  `patternProperties: {"^_": {}}` alongside `additionalProperties:false`, so the
+  schema accepts exactly the `_`-prefixed metadata the parser accepts and rejects
+  exactly the unknown keys the parser rejects. The committed
+  `schema/workflow.schema.json` is regenerated (the no-drift test enforces
+  equality; the `schema` CLI output byte-equals the committed file).
+
+### Docs
+
+- **Schema↔parser conformance wording corrected** in `SPEC.md` / `README.md` to
+  the now-accurate statement: the parser and the published schema agree — every
+  workflow / step / governor / expr object is closed (unknown keys rejected by
+  BOTH) except keys prefixed with `_` (ignored metadata); integers are bounded; a
+  schema-valid workflow parses, and a parser-accepted workflow is schema-valid.
+  The prior sentence that conflated the expr case with step/governor and claimed
+  the schema "does not accept what the parser rejects" while the parser was still
+  lenient has been replaced. `Workflow_json.mli` documents the closed-object rule
+  and the `_` escape hatch.
+
+### Other
+
+- CLI `--version` → `0.6.0`.
+- **New tests (behavioral parity guards the v0.5 suite lacked):**
+  - *Parser strictness, per object type*: a table asserting the parser
+    `of_string ⇒ Error` on an unknown non-underscore key for EACH of the
+    top-level workflow object, `agent`/`gate`/`branch`/`loop`/`commit` steps, and
+    `max_iters`/`budget`/`fixpoint` governors.
+  - *Underscore metadata accepted*: a workflow with a top-level `_doc` and a step
+    `_note` (and a governor `_why`) parses OK.
+  - *Schema/parser parity (structural cross-check, no JSON-Schema-validator
+    dependency)*: each closed object def in the schema carries both
+    `additionalProperties:false` and a `^_` patternProperty, AND the set of
+    declared `properties` names for each step/governor/workflow object EQUALS the
+    parser's hard-coded known-key set.
+  - The examples (`bounty.workflow.json`, `smoke.workflow.json` — the latter has
+    a top-level `_doc`) still parse, validate, and lint clean. All v0.5 tests
+    remain green (39 tests total).
+
+### Preserved invariants
+
+- Runtime token on every `Commit` (hashed for the trace, never stored raw).
+- Floor gates guaranteed-evaluated and must PASS on every path to a commit; a
+  false gate blocks.
+- Engine loop ceiling (termination guarantee); determinism / byte-identical
+  replay.
+- `Expr.eval` totality; lint-clean ⇒ validate.
+- `lib/` depends on **yojson only** — cabal stays confined to `bin/`.
+
 ## v0.5
 
 A **corrective release** addressing findings from an external audit. Four fixes:

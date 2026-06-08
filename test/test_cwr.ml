@@ -1055,6 +1055,180 @@ let test_schema_no_overaccept () =
   | Error _ -> ()
   | Ok _ -> Alcotest.fail "out-of-range Max_iters literal must be rejected"
 
+(* ---- parser strictness: unknown keys rejected, per object type --------- *)
+
+(* For each closed object type, a workflow that adds a non-underscore "junk" key
+   to that object must be REJECTED by the parser. The table pairs a human label
+   with a workflow JSON whose ONLY defect is the junk key. *)
+let test_parser_rejects_unknown_keys () =
+  let cases =
+    [
+      ( "top-level workflow",
+        {|{ "name": "x", "junk": 1, "steps": [] }|} );
+      ( "agent step",
+        {|{ "name": "x", "steps": [
+             { "kind": "agent", "id": "a", "prompt": "p", "junk": 1 } ] }|} );
+      ( "gate step",
+        {|{ "name": "x", "steps": [
+             { "kind": "gate", "id": "g", "when": { "lit": true }, "junk": 1 } ] }|} );
+      ( "branch step",
+        {|{ "name": "x", "steps": [
+             { "kind": "branch", "when": { "lit": true },
+               "then": [], "else": [], "junk": 1 } ] }|} );
+      ( "loop step",
+        {|{ "name": "x", "steps": [
+             { "kind": "loop",
+               "governors": [ { "kind": "budget" } ], "body": [], "junk": 1 } ] }|} );
+      ( "commit step",
+        {|{ "name": "x", "steps": [
+             { "kind": "commit", "id": "c", "junk": 1 } ] }|} );
+      ( "max_iters governor",
+        {|{ "name": "x", "steps": [
+             { "kind": "loop", "body": [],
+               "governors": [ { "kind": "max_iters", "n": 3, "junk": 1 } ] } ] }|} );
+      ( "budget governor",
+        {|{ "name": "x", "steps": [
+             { "kind": "loop", "body": [],
+               "governors": [ { "kind": "budget", "junk": 1 } ] } ] }|} );
+      ( "fixpoint governor",
+        {|{ "name": "x", "steps": [
+             { "kind": "loop", "body": [],
+               "governors": [ { "kind": "fixpoint", "window": 2,
+                               "progress": { "lit": true }, "junk": 1 } ] } ] }|} );
+    ]
+  in
+  List.iter
+    (fun (label, json) ->
+      match Workflow_json.of_string json with
+      | Error _ -> ()
+      | Ok _ ->
+          Alcotest.failf
+            "parser must reject an unknown key on the %s object" label)
+    cases
+
+(* Underscore-prefixed metadata is accepted everywhere (the documented escape
+   hatch the examples use): a top-level [_doc] and a step-level [_note] parse. *)
+let test_parser_accepts_underscore_metadata () =
+  let json =
+    {|{ "name": "x", "_doc": "top-level note",
+        "steps": [
+          { "kind": "agent", "id": "a", "prompt": "p", "_note": "step note" },
+          { "kind": "loop", "body": [],
+            "governors": [ { "kind": "budget", "_why": "cheap stop" } ] } ] }|}
+  in
+  match Workflow_json.of_string json with
+  | Ok _ -> ()
+  | Error e ->
+      Alcotest.failf "underscore metadata must be accepted, got Error: %s" e
+
+(* ---- schema/parser parity (structural cross-check) ---------------------- *)
+
+(* The known-key set the PARSER accepts for each closed object, hard-coded here
+   so the test fails if either side drifts. *)
+let parser_known_keys =
+  [
+    ("workflow", [ "name"; "steps" ]);
+    ("agent", [ "kind"; "id"; "prompt"; "read_only"; "output_schema" ]);
+    ("gate", [ "kind"; "id"; "when" ]);
+    ("branch", [ "kind"; "when"; "then"; "else" ]);
+    ("loop", [ "kind"; "until"; "governors"; "body" ]);
+    ("commit", [ "kind"; "id" ]);
+    ("max_iters", [ "kind"; "n" ]);
+    ("budget", [ "kind" ]);
+    ("fixpoint", [ "kind"; "window"; "progress" ]);
+  ]
+
+(* Every closed object def in the schema must carry BOTH
+   [additionalProperties:false] AND a [^_] patternProperty; AND the set of
+   declared [properties] names must equal the parser's known-key set above. *)
+let test_schema_parser_parity () =
+  let top = match Workflow_schema.schema with `Assoc l -> l | _ -> [] in
+  let defs =
+    match List.assoc_opt "$defs" top with Some (`Assoc d) -> d | _ -> []
+  in
+  let def name = match List.assoc_opt name defs with Some d -> d | None -> `Null in
+  let one_of d =
+    match d with
+    | `Assoc l -> ( match List.assoc_opt "oneOf" l with Some (`List v) -> v | _ -> [])
+    | _ -> []
+  in
+  let kind_of v =
+    match v with
+    | `Assoc l -> (
+        match List.assoc_opt "properties" l with
+        | Some (`Assoc props) -> (
+            match List.assoc_opt "kind" props with
+            | Some (`Assoc kl) -> (
+                match List.assoc_opt "const" kl with
+                | Some (`String k) -> Some k
+                | _ -> None)
+            | _ -> None)
+        | _ -> None)
+    | _ -> None
+  in
+  let prop_names v =
+    match v with
+    | `Assoc l -> (
+        match List.assoc_opt "properties" l with
+        | Some (`Assoc props) -> List.sort compare (List.map fst props)
+        | _ -> [])
+    | _ -> []
+  in
+  let is_closed v =
+    match v with
+    | `Assoc l ->
+        List.assoc_opt "additionalProperties" l = Some (`Bool false)
+        && (match List.assoc_opt "patternProperties" l with
+           | Some (`Assoc pp) -> List.mem_assoc "^_" pp
+           | _ -> false)
+    | _ -> false
+  in
+  (* Top-level workflow object. *)
+  Alcotest.(check bool)
+    "workflow object is closed (additionalProperties:false + ^_)" true
+    (is_closed Workflow_schema.schema);
+  Alcotest.(check (list string))
+    "workflow properties == parser known keys"
+    (List.sort compare (List.assoc "workflow" parser_known_keys))
+    (prop_names Workflow_schema.schema);
+  (* Each step variant, keyed by its kind const. *)
+  List.iter
+    (fun v ->
+      match kind_of v with
+      | Some k ->
+          Alcotest.(check bool)
+            (Printf.sprintf "step %s closed (additionalProperties:false + ^_)" k)
+            true (is_closed v);
+          Alcotest.(check (list string))
+            (Printf.sprintf "step %s properties == parser known keys" k)
+            (List.sort compare (List.assoc k parser_known_keys))
+            (prop_names v)
+      | None -> Alcotest.fail "step variant missing a kind const")
+    (one_of (def "step"));
+  (* Each governor variant, keyed by its kind const. *)
+  List.iter
+    (fun v ->
+      match kind_of v with
+      | Some k ->
+          Alcotest.(check bool)
+            (Printf.sprintf "governor %s closed (additionalProperties:false + ^_)"
+               k)
+            true (is_closed v);
+          Alcotest.(check (list string))
+            (Printf.sprintf "governor %s properties == parser known keys" k)
+            (List.sort compare (List.assoc k parser_known_keys))
+            (prop_names v)
+      | None -> Alcotest.fail "governor variant missing a kind const")
+    (one_of (def "governor"));
+  (* Every expr branch is also closed (no kind const to key on). *)
+  List.iteri
+    (fun i b ->
+      Alcotest.(check bool)
+        (Printf.sprintf "expr branch %d closed (additionalProperties:false + ^_)"
+           i)
+        true (is_closed b))
+    (one_of (def "expr"))
+
 let () =
   Alcotest.run "cabal_workflow_runner"
     [
@@ -1163,5 +1337,16 @@ let () =
             test_schema_closed_objects;
           Alcotest.test_case "schema does not over-accept (junk key, huge int)"
             `Quick test_schema_no_overaccept;
+          Alcotest.test_case
+            "schema/parser parity: closed defs + properties == known keys"
+            `Quick test_schema_parser_parity;
+        ] );
+      ( "parser-strictness",
+        [
+          Alcotest.test_case
+            "unknown key rejected on each closed object type" `Quick
+            test_parser_rejects_unknown_keys;
+          Alcotest.test_case "underscore metadata accepted (_doc, _note)" `Quick
+            test_parser_accepts_underscore_metadata;
         ] );
     ]

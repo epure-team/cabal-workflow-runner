@@ -123,7 +123,11 @@ Three layers guard a generated workflow, each tighter than the last:
 1. **Schema (shape at generation).** `Workflow_schema` (`lib/workflow_schema.ml(i)`,
    **pure, yojson-only**) publishes the canonical **JSON Schema (draft 2020-12)** of the
    workflow format — derived from `Workflow_json` (the actual parser), so it describes
-   *exactly* what the parser accepts. Prompt your generator with
+   *exactly* what the parser accepts. The parser and the published schema **agree**:
+   every workflow / step / governor / expr object is **closed** — unknown keys are
+   rejected by **both** — except keys prefixed with `_` (ignored metadata, e.g. `_doc`),
+   and integers are bounded. A schema-valid workflow parses, and a parser-accepted
+   workflow is schema-valid. Prompt your generator with
    `cabal-workflow-runner schema` (or the committed
    [`schema/workflow.schema.json`](schema/workflow.schema.json), or
    `Workflow_schema.to_string ()`) so it emits **conformant workflows by construction**

@@ -3,6 +3,13 @@
     JSON schema (MVP). Gates / branches / loop stop conditions carry a {!Expr.t}
     expression; loops carry a list of governors.
 
+    Every workflow / step / governor / expr object is {b closed}: an unknown key
+    that is neither a known key for that object nor prefixed with an underscore
+    [_] is rejected (fail-closed). Keys beginning with [_] (e.g. [_doc], [_note])
+    are ignored metadata — the documented escape hatch the examples use. This
+    matches the published JSON Schema ({!Workflow_schema}) exactly. [output_schema]
+    is the one exception: it is intentionally an open field->type map.
+
     Expression encoding:
     - [{"path": "outputs.assess.severity"}] — dotted path into the run context;
     - [{"lit": <json>}] — a literal value;

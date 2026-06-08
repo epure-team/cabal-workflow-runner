@@ -213,13 +213,18 @@ Three layers guard a generated workflow, each tighter than the last:
    string`). It is **derived from `Workflow_json`** — the actual parser — and a test
    asserts the committed [`schema/workflow.schema.json`](schema/workflow.schema.json)
    byte-matches `Workflow_schema.to_string ()` and that the step `kind`s it enumerates
-   are exactly the ones the parser accepts, so it cannot drift from what runs. It does
-   **not accept what the parser rejects**: every expr operator object and every
-   step/governor object is **closed** (`additionalProperties:false`) — the parser
-   requires exactly one operator/`kind` key, so `{"path":"x","junk":2}` is schema-invalid
-   too — and the integer governor fields (`max_iters.n`, `fixpoint.window`) carry
-   `minimum:1` and a `maximum` (`1073741823` = 2³⁰−1) inside OCaml's safe `int` range, so
-   a literal too large for the parser to read as an `int` is also schema-invalid. Prompt a
+   are exactly the ones the parser accepts, so it cannot drift from what runs. **The
+   parser and the published schema agree: every workflow / step / governor / expr object
+   is closed — unknown keys are rejected by BOTH — except keys prefixed with `_` (ignored
+   metadata, e.g. `_doc`); integers are bounded. A schema-valid workflow parses, and a
+   parser-accepted workflow is schema-valid.** Concretely, the schema marks each such
+   object `additionalProperties:false` with a `patternProperties: {"^_": {}}` escape
+   hatch, exactly mirroring the parser, which rejects any key that is neither a known key
+   for that object nor `_`-prefixed (so `{"path":"x","junk":2}` is rejected by both, while
+   `_doc`/`_note` are accepted by both); and the integer governor fields (`max_iters.n`,
+   `fixpoint.window`) carry `minimum:1` and a `maximum` (`1073741823` = 2³⁰−1) inside
+   OCaml's safe `int` range, so a literal too large for the parser to read as an `int` is
+   also schema-invalid. (`output_schema` is intentionally an open field→type map.) Prompt a
    generator with `cabal-workflow-runner schema` (or `Workflow_schema.to_string ()`) so
    it emits **conformant workflows by construction** — correct `kind`s, the expr /
    governor encodings, required fields.

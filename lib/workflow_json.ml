@@ -35,6 +35,24 @@ let req_list key json =
   | Some _ -> err "field %S must be a list" key
   | None -> err "missing required field %S" key
 
+(* Closed-object discipline (mirrors [expr_of_json], which already rejects an
+   object with more than one operator key). After reading the known keys of an
+   object, reject any present key that is neither a known key nor a leading-
+   underscore metadata key (the documented [_doc]/[_note] escape hatch). [what]
+   names the object in the error message. [output_schema] is intentionally
+   exempt: it is an open field->type map. *)
+let reject_unknown_keys ~what ~known json =
+  match json with
+  | `Assoc fields ->
+      List.iter
+        (fun (k, _) ->
+          if
+            (not (List.mem k known))
+            && not (String.length k > 0 && k.[0] = '_')
+          then err "unknown key %S in %s" k what)
+        fields
+  | _ -> ()
+
 (* ---- Schema ------------------------------------------------------------- *)
 
 let ty_of_json = function
@@ -122,10 +140,20 @@ let opt_expr key json : Expr.t option =
 let governor_of_json (j : Yojson.Safe.t) : governor =
   let kind = req_string "kind" j in
   match kind with
-  | "max_iters" -> Max_iters (req_int "n" j)
-  | "budget" -> Budget
+  | "max_iters" ->
+      let g = Max_iters (req_int "n" j) in
+      reject_unknown_keys ~what:"max_iters governor" ~known:[ "kind"; "n" ] j;
+      g
+  | "budget" ->
+      reject_unknown_keys ~what:"budget governor" ~known:[ "kind" ] j;
+      Budget
   | "fixpoint" ->
-      Fixpoint { window = req_int "window" j; progress = req_expr "progress" j }
+      let g =
+        Fixpoint { window = req_int "window" j; progress = req_expr "progress" j }
+      in
+      reject_unknown_keys ~what:"fixpoint governor"
+        ~known:[ "kind"; "window"; "progress" ] j;
+      g
   | other -> err "unknown governor kind %S" other
 
 (* ---- steps -------------------------------------------------------------- *)
@@ -134,35 +162,57 @@ let rec step_of_json json =
   let kind = req_string "kind" json in
   match kind with
   | "agent" ->
-      Agent
-        {
-          id = req_string "id" json;
-          prompt = req_string "prompt" json;
-          read_only = opt_bool "read_only" false json;
-          output_schema = opt_schema "output_schema" json;
-        }
-  | "gate" -> Gate { id = req_string "id" json; when_ = req_expr "when" json }
+      let s =
+        Agent
+          {
+            id = req_string "id" json;
+            prompt = req_string "prompt" json;
+            read_only = opt_bool "read_only" false json;
+            output_schema = opt_schema "output_schema" json;
+          }
+      in
+      reject_unknown_keys ~what:"agent step"
+        ~known:[ "kind"; "id"; "prompt"; "read_only"; "output_schema" ] json;
+      s
+  | "gate" ->
+      let s = Gate { id = req_string "id" json; when_ = req_expr "when" json } in
+      reject_unknown_keys ~what:"gate step" ~known:[ "kind"; "id"; "when" ] json;
+      s
   | "branch" ->
-      Branch
-        {
-          when_ = req_expr "when" json;
-          then_ = List.map step_of_json (req_list "then" json);
-          else_ = List.map step_of_json (req_list "else" json);
-        }
+      let s =
+        Branch
+          {
+            when_ = req_expr "when" json;
+            then_ = List.map step_of_json (req_list "then" json);
+            else_ = List.map step_of_json (req_list "else" json);
+          }
+      in
+      reject_unknown_keys ~what:"branch step"
+        ~known:[ "kind"; "when"; "then"; "else" ] json;
+      s
   | "loop" ->
-      Loop
-        {
-          body = List.map step_of_json (req_list "body" json);
-          until = opt_expr "until" json;
-          governors = List.map governor_of_json (req_list "governors" json);
-        }
-  | "commit" -> Commit { id = req_string "id" json }
+      let s =
+        Loop
+          {
+            body = List.map step_of_json (req_list "body" json);
+            until = opt_expr "until" json;
+            governors = List.map governor_of_json (req_list "governors" json);
+          }
+      in
+      reject_unknown_keys ~what:"loop step"
+        ~known:[ "kind"; "body"; "until"; "governors" ] json;
+      s
+  | "commit" ->
+      let s = Commit { id = req_string "id" json } in
+      reject_unknown_keys ~what:"commit step" ~known:[ "kind"; "id" ] json;
+      s
   | other -> err "unknown step kind %S" other
 
 let of_json json =
   try
     let name = req_string "name" json in
     let steps = List.map step_of_json (req_list "steps" json) in
+    reject_unknown_keys ~what:"workflow" ~known:[ "name"; "steps" ] json;
     Ok { name; steps }
   with Parse_error msg -> Error msg
 

@@ -2,14 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://epure-team.github.io/cabal-workflow-runner/workflow.schema.json",
   "title": "cabal-workflow-runner workflow",
-  "description": "A declarative workflow for cabal-workflow-runner: a name plus a list of steps. This schema describes exactly the JSON that Workflow_json parses. Unknown object keys (e.g. the _doc convention) are tolerated. Schema constrains shape at generation; Lint catches semantics/safety pre-run; Validate is the run gate.",
+  "description": "A declarative workflow for cabal-workflow-runner: a name plus a list of steps. This schema describes exactly the JSON that Workflow_json parses. Every workflow / step / governor / expr object is closed: unknown keys are rejected, except keys prefixed with _ (ignored metadata, e.g. the _doc convention). Schema constrains shape at generation; Lint catches semantics/safety pre-run; Validate is the run gate.",
   "type": "object",
   "required": [ "name", "steps" ],
   "properties": {
     "name": { "type": "string" },
     "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } }
   },
-  "additionalProperties": true,
+  "patternProperties": { "^_": {} },
+  "additionalProperties": false,
   "$defs": {
     "step": {
       "description": "A workflow step, discriminated by the \"kind\" key.",
@@ -24,6 +25,7 @@
             "read_only": { "type": "boolean" },
             "output_schema": { "$ref": "#/$defs/output_schema" }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -34,6 +36,7 @@
             "id": { "type": "string" },
             "when": { "$ref": "#/$defs/expr" }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -45,6 +48,7 @@
             "then": { "type": "array", "items": { "$ref": "#/$defs/step" } },
             "else": { "type": "array", "items": { "$ref": "#/$defs/step" } }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -60,6 +64,7 @@
             },
             "body": { "type": "array", "items": { "$ref": "#/$defs/step" } }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -69,6 +74,7 @@
             "kind": { "const": "commit" },
             "id": { "type": "string" }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         }
       ]
@@ -80,18 +86,21 @@
           "type": "object",
           "required": [ "path" ],
           "properties": { "path": { "type": "string" } },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "exists" ],
           "properties": { "exists": { "type": "string" } },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "lit" ],
           "properties": { "lit": {} },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -105,6 +114,7 @@
               "maxItems": 2
             }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -118,6 +128,7 @@
               "maxItems": 2
             }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -131,6 +142,7 @@
               "maxItems": 2
             }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -144,6 +156,7 @@
               "maxItems": 2
             }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -157,6 +170,7 @@
               "maxItems": 2
             }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -170,6 +184,7 @@
               "maxItems": 2
             }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -183,6 +198,7 @@
               "maxItems": 2
             }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -191,6 +207,7 @@
           "properties": {
             "and": { "type": "array", "items": { "$ref": "#/$defs/expr" } }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -199,12 +216,14 @@
           "properties": {
             "or": { "type": "array", "items": { "$ref": "#/$defs/expr" } }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "not" ],
           "properties": { "not": { "$ref": "#/$defs/expr" } },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         }
       ]
@@ -219,12 +238,14 @@
             "kind": { "const": "max_iters" },
             "n": { "type": "integer", "minimum": 1, "maximum": 1073741823 }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "kind" ],
           "properties": { "kind": { "const": "budget" } },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         },
         {
@@ -239,6 +260,7 @@
             },
             "progress": { "$ref": "#/$defs/expr" }
           },
+          "patternProperties": { "^_": {} },
           "additionalProperties": false
         }
       ]

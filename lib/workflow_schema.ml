@@ -3,10 +3,12 @@
    Hand-derived from [Workflow_json] (the actual parser) so it accepts EXACTLY
    what the parser accepts:
 
-   - The parser looks fields up with [List.assoc_opt] and ignores anything it
-     does not name, so unknown keys (including the [_doc] / leading-underscore
-     convention used in examples) are tolerated everywhere. We model that with
-     [additionalProperties: true] on every object.
+   - Every workflow / step / governor / expr object is CLOSED: the parser
+     rejects any key that is neither a known key for that object nor a leading-
+     underscore metadata key (the documented [_doc] / [_note] escape hatch). We
+     model that with [additionalProperties:false] PLUS [patternProperties:
+     {"^_": {}}] on every such object. ([output_schema] is intentionally an open
+     field->type map and is the one exception.)
    - The parser dispatches steps on a [kind] discriminator and rejects any other
      kind; governors likewise. We model both as [oneOf] keyed on [kind].
    - The expr encoding is the single-operator-object form produced/consumed by
@@ -36,8 +38,7 @@ let bounded_int : Yojson.Safe.t =
     ]
 
 (* An object schema that requires [required] keys, gives [props] for the named
-   ones, and tolerates any extra key (the parser ignores unknown fields). Used at
-   the document top level, where the [_doc] convention adds extra keys. *)
+   ones, and tolerates any extra key (the parser ignores unknown fields). *)
 let object_with ~required ~props : Yojson.Safe.t =
   obj
     [
@@ -47,17 +48,19 @@ let object_with ~required ~props : Yojson.Safe.t =
       ("additionalProperties", `Bool true);
     ]
 
-(* A CLOSED object schema: the parser dispatches an expr/step/governor on exactly
-   one operator/[kind] and the expr parser rejects an object with extra keys
-   ({"path":"x","junk":2} is rejected). We model that with
-   [additionalProperties:false] so the schema does not accept what the parser
-   rejects. *)
+(* A CLOSED object schema: the parser rejects any key that is neither a known
+   key for the object nor a leading-underscore metadata key (the documented
+   [_doc]/[_note] escape hatch). We model that with [additionalProperties:false]
+   (rejects unknown keys) PLUS a [patternProperties] allowing [^_] keys (the
+   metadata escape hatch the parser permits), so the schema and the parser agree
+   exactly. Used for the workflow / step / governor / expr objects. *)
 let closed_object_with ~required ~props : Yojson.Safe.t =
   obj
     [
       ("type", s "object");
       ("required", arr (List.map s required));
       ("properties", obj props);
+      ("patternProperties", obj [ ("^_", obj []) ]);
       ("additionalProperties", `Bool false);
     ]
 
@@ -254,9 +257,11 @@ let schema : Yojson.Safe.t =
         s
           "A declarative workflow for cabal-workflow-runner: a name plus a list \
            of steps. This schema describes exactly the JSON that Workflow_json \
-           parses. Unknown object keys (e.g. the _doc convention) are tolerated. \
-           Schema constrains shape at generation; Lint catches semantics/safety \
-           pre-run; Validate is the run gate." );
+           parses. Every workflow / step / governor / expr object is closed: \
+           unknown keys are rejected, except keys prefixed with _ (ignored \
+           metadata, e.g. the _doc convention). Schema constrains shape at \
+           generation; Lint catches semantics/safety pre-run; Validate is the \
+           run gate." );
       ("type", s "object");
       ("required", arr [ s "name"; s "steps" ]);
       ( "properties",
@@ -265,7 +270,8 @@ let schema : Yojson.Safe.t =
             ("name", typ "string");
             ("steps", obj [ ("type", s "array"); ("items", ref_ "step") ]);
           ] );
-      ("additionalProperties", `Bool true);
+      ("patternProperties", obj [ ("^_", obj []) ]);
+      ("additionalProperties", `Bool false);
       ( "$defs",
         obj
           [
