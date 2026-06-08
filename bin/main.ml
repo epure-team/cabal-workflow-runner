@@ -76,6 +76,12 @@ let cmd_lint file floor_gates json =
       else print_lint_table ds;
       if Lint.has_errors ds then 1 else 0
 
+(* ---- schema subcommand ---- *)
+
+let cmd_schema () =
+  print_string (Workflow_schema.to_string ());
+  0
+
 (* ---- run subcommand ---- *)
 
 let cmd_run file floor_gates approve =
@@ -154,8 +160,16 @@ let run_cmd =
   Cmd.v (Cmd.info "run" ~doc)
     Term.(const cmd_run $ file_arg $ floor_arg $ approve_arg)
 
+let schema_cmd =
+  let doc =
+    "Print the canonical JSON Schema (draft 2020-12) of the workflow format to \
+     stdout. Point a workflow generator at this to emit conformant workflows by \
+     construction."
+  in
+  Cmd.v (Cmd.info "schema" ~doc) Term.(const cmd_schema $ const ())
+
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.3.0" ~doc in
-  let group = Cmd.group info [ lint_cmd; validate_cmd; run_cmd ] in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.4.0" ~doc in
+  let group = Cmd.group info [ lint_cmd; validate_cmd; run_cmd; schema_cmd ] in
   exit (Cmd.eval' group)

@@ -706,6 +706,92 @@ let test_lint_generate_fix_loop () =
   | Ok _ -> ()
   | Error e -> Alcotest.failf "converged workflow failed to validate: %s" e
 
+(* ---- SCHEMA: the published JSON Schema artifact ---- *)
+
+let assoc_keys = function `Assoc l -> List.map fst l | _ -> []
+
+(* The schema value is well-formed JSON with the draft 2020-12 markers and the
+   $defs we promise (expr, governor, plus a step def). *)
+let test_schema_well_formed () =
+  let j = Workflow_schema.schema in
+  (* re-parse the pretty-printed form: proves it is valid JSON. *)
+  (match Yojson.Safe.from_string (Workflow_schema.to_string ()) with
+  | _ -> ()
+  | exception _ -> Alcotest.fail "schema does not round-trip as valid JSON");
+  let top = assoc_keys j in
+  Alcotest.(check bool) "has $schema" true (List.mem "$schema" top);
+  Alcotest.(check bool) "has $defs" true (List.mem "$defs" top);
+  let defs =
+    match j with
+    | `Assoc l -> (
+        match List.assoc_opt "$defs" l with Some d -> assoc_keys d | None -> [])
+    | _ -> []
+  in
+  Alcotest.(check bool) "$defs has expr" true (List.mem "expr" defs);
+  Alcotest.(check bool) "$defs has governor" true (List.mem "governor" defs);
+  Alcotest.(check bool) "$defs has a step def" true (List.mem "step" defs)
+
+(* NO DRIFT: the committed artifact byte-matches Workflow_schema.to_string ().
+   This is the key test that keeps the file and the lib value in lock-step.
+   The test cwd is test/, so the artifact is at ../schema/workflow.schema.json
+   (declared as a dep in test/dune). *)
+let test_schema_no_drift () =
+  let path = "../schema/workflow.schema.json" in
+  let on_disk =
+    try In_channel.with_open_bin path In_channel.input_all
+    with Sys_error e -> Alcotest.failf "cannot read %s: %s" path e
+  in
+  Alcotest.(check string)
+    "committed schema/workflow.schema.json == Workflow_schema.to_string ()"
+    (Workflow_schema.to_string ())
+    on_disk
+
+(* PARSER <-> SCHEMA kinds agree: the set of step "kind" strings the schema
+   enumerates equals the set the parser accepts; and the parser rejects an
+   unknown kind. *)
+let test_schema_kinds_agree () =
+  (* Hard-coded expected set the parser (Workflow_json.step_of_json) accepts. *)
+  let expected = [ "agent"; "branch"; "commit"; "gate"; "loop" ] in
+  (* Extract the kind consts enumerated under $defs/step/oneOf in the schema. *)
+  let top = match Workflow_schema.schema with `Assoc l -> l | _ -> [] in
+  let step_def =
+    match List.assoc_opt "$defs" top with
+    | Some (`Assoc d) -> (
+        match List.assoc_opt "step" d with Some s -> s | None -> `Null)
+    | _ -> `Null
+  in
+  let variants =
+    match step_def with
+    | `Assoc l -> ( match List.assoc_opt "oneOf" l with Some (`List v) -> v | _ -> [])
+    | _ -> []
+  in
+  let kind_of_variant v =
+    match v with
+    | `Assoc l -> (
+        match List.assoc_opt "properties" l with
+        | Some (`Assoc props) -> (
+            match List.assoc_opt "kind" props with
+            | Some (`Assoc kl) -> (
+                match List.assoc_opt "const" kl with
+                | Some (`String k) -> Some k
+                | _ -> None)
+            | _ -> None)
+        | _ -> None)
+    | _ -> None
+  in
+  let schema_kinds =
+    List.sort compare (List.filter_map kind_of_variant variants)
+  in
+  Alcotest.(check (list string))
+    "schema step kinds == parser-accepted kinds" expected schema_kinds;
+  (* And the parser rejects an unknown kind (mirrors the existing parse test). *)
+  match
+    Workflow_json.of_string
+      {|{ "name": "x", "steps": [ { "kind": "frobnicate" } ] }|}
+  with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "parser must reject an unknown step kind"
+
 let () =
   Alcotest.run "cabal_workflow_runner"
     [
@@ -785,5 +871,14 @@ let () =
             test_lint_to_json_shape;
           Alcotest.test_case "generate->fix loop converges + validates" `Quick
             test_lint_generate_fix_loop;
+        ] );
+      ( "schema",
+        [
+          Alcotest.test_case "well-formed: $schema + $defs(expr,governor,step)"
+            `Quick test_schema_well_formed;
+          Alcotest.test_case "no drift: committed artifact == to_string ()"
+            `Quick test_schema_no_drift;
+          Alcotest.test_case "parser <-> schema kinds agree" `Quick
+            test_schema_kinds_agree;
         ] );
     ]

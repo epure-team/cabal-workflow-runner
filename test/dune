@@ -2,4 +2,5 @@
  (name test_cwr)
  (libraries cabal_workflow_runner alcotest)
  (deps
-  (glob_files %{project_root}/examples/*.json)))
+  (glob_files %{project_root}/examples/*.json)
+  (glob_files %{project_root}/schema/*.json)))

@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.4
+
+A **machine-readable JSON Schema of the workflow format**, so a meta-agent can
+constrain its generator to produce conformant workflows *by construction* — the
+first of three layers: **schema** (shape at generation) → **lint**
+(semantics/safety pre-run) → **validate** (the run gate). Library-first.
+
+### Added
+
+- **`Workflow_schema` (`lib/workflow_schema.ml(i)`)** — a pure, yojson-only module
+  exposing the canonical **JSON Schema (draft 2020-12)** of a workflow as a library
+  value (`schema : Yojson.Safe.t`, `to_string : unit -> string`). It uses
+  `$defs` + `$ref` for the recursive `expr`, `governor`, `step` and `output_schema`
+  parts, and is **derived from `Workflow_json`** (the actual parser) so it describes
+  exactly what the parser accepts (every step `kind`, the single-operator expr
+  encoding, the governor kinds, the `output_schema` type tags). Unknown object keys
+  (the `_doc` convention) are tolerated, matching the parser's leniency.
+- **`schema/workflow.schema.json`** — the committed, pretty-printed artifact a
+  generator/embedder is pointed at. Generated from the library value (like cabal's
+  `generate_opam_files`); a **no-drift** test asserts it byte-matches
+  `Workflow_schema.to_string ()`.
+- **CLI `schema`** — `cabal-workflow-runner schema` prints `Workflow_schema.to_string
+  ()` to stdout (exit 0). A thin wrapper.
+- **Tests:** schema is valid JSON with `$schema` + `$defs(expr, governor, step)`;
+  **no drift** (committed file == lib value, byte-for-byte); **parser ↔ schema kinds
+  agree** (the schema's enumerated step `kind`s equal `{agent, gate, branch, loop,
+  commit}` and the parser rejects an unknown kind). No JSON-Schema validator
+  dependency was added.
+
+### Docs
+
+- A "Constrain your generator with the schema" note in the meta-agent sections of
+  `README.md` and `SPEC.md` (the three layers: schema → lint → validate).
+- **Fixed a v0.2.1 doc gap:** `README.md` now documents `CWR_BACKEND`, `CWR_MODEL`
+  and `CWR_BUDGET` in a "Live run against a backend" subsection, referencing
+  `examples/smoke.workflow.json` (verified live to `Committed`).
+- `SPEC.md` §5: "workflow JSON Schema" moved from planned → done; remaining
+  follow-ups (on-disk ledger + `replay` CLI, YAML/MD front-end, `Spawn`/subworkflow
+  step) kept.
+
+### Preserved invariants
+
+- `lib/` depends on **yojson only** — cabal stays confined to `bin/`.
+- Abstract `Validate.Validated.t`; `Engine.run`/`replay` require it.
+- `Commit` needs a runtime token; floor gates guaranteed on every path to a commit.
+
 ## v0.3
 
 A **`Lint` library** designed to be embedded by a meta-agent that builds its own

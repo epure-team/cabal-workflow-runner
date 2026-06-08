@@ -1,0 +1,263 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epure-team.github.io/cabal-workflow-runner/workflow.schema.json",
+  "title": "cabal-workflow-runner workflow",
+  "description": "A declarative workflow for cabal-workflow-runner: a name plus a list of steps. This schema describes exactly the JSON that Workflow_json parses. Unknown object keys (e.g. the _doc convention) are tolerated. Schema constrains shape at generation; Lint catches semantics/safety pre-run; Validate is the run gate.",
+  "type": "object",
+  "required": [ "name", "steps" ],
+  "properties": {
+    "name": { "type": "string" },
+    "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "step": {
+      "description": "A workflow step, discriminated by the \"kind\" key.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [ "kind", "id", "prompt" ],
+          "properties": {
+            "kind": { "const": "agent" },
+            "id": { "type": "string" },
+            "prompt": { "type": "string" },
+            "read_only": { "type": "boolean" },
+            "output_schema": { "$ref": "#/$defs/output_schema" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "id", "when" ],
+          "properties": {
+            "kind": { "const": "gate" },
+            "id": { "type": "string" },
+            "when": { "$ref": "#/$defs/expr" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "when", "then", "else" ],
+          "properties": {
+            "kind": { "const": "branch" },
+            "when": { "$ref": "#/$defs/expr" },
+            "then": { "type": "array", "items": { "$ref": "#/$defs/step" } },
+            "else": { "type": "array", "items": { "$ref": "#/$defs/step" } }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "governors", "body" ],
+          "properties": {
+            "kind": { "const": "loop" },
+            "until": { "$ref": "#/$defs/expr" },
+            "governors": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/governor" },
+              "minItems": 1
+            },
+            "body": { "type": "array", "items": { "$ref": "#/$defs/step" } }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "id" ],
+          "properties": {
+            "kind": { "const": "commit" },
+            "id": { "type": "string" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "expr": {
+      "description": "A total-predicate-DSL expression: a single-operator object. See Workflow_json's expr encoding.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [ "path" ],
+          "properties": { "path": { "type": "string" } },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "exists" ],
+          "properties": { "exists": { "type": "string" } },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "lit" ],
+          "properties": { "lit": {} },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "eq" ],
+          "properties": {
+            "eq": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/expr" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "ne" ],
+          "properties": {
+            "ne": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/expr" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "lt" ],
+          "properties": {
+            "lt": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/expr" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "le" ],
+          "properties": {
+            "le": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/expr" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "gt" ],
+          "properties": {
+            "gt": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/expr" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "ge" ],
+          "properties": {
+            "ge": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/expr" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "in" ],
+          "properties": {
+            "in": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/expr" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "and" ],
+          "properties": {
+            "and": { "type": "array", "items": { "$ref": "#/$defs/expr" } }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "or" ],
+          "properties": {
+            "or": { "type": "array", "items": { "$ref": "#/$defs/expr" } }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "not" ],
+          "properties": { "not": { "$ref": "#/$defs/expr" } },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "governor": {
+      "description": "A loop governor (termination guarantee).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [ "kind", "n" ],
+          "properties": {
+            "kind": { "const": "max_iters" },
+            "n": { "type": "integer" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "kind" ],
+          "properties": { "kind": { "const": "budget" } },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "window", "progress" ],
+          "properties": {
+            "kind": { "const": "fixpoint" },
+            "window": { "type": "integer" },
+            "progress": { "$ref": "#/$defs/expr" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "output_schema": {
+      "description": "Maps each required field name to a type tag (\"string\"|\"int\"|\"number\"|\"bool\"|\"any\") or an {\"enum\":[string,...]} object.",
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [ "string", "int", "number", "bool", "any" ]
+          },
+          {
+            "type": "object",
+            "required": [ "enum" ],
+            "properties": {
+              "enum": { "type": "array", "items": { "type": "string" } }
+            },
+            "additionalProperties": true
+          }
+        ]
+      }
+    }
+  }
+}

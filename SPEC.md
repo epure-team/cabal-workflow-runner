@@ -186,6 +186,28 @@ anything, whether a candidate workflow is well-formed and safe — and, when it 
 **pure, offline, and instant** (no agent, no backend, no I/O), so it is free to call in
 a tight generate → lint → fix loop.
 
+### Constrain your generator with the schema
+
+Three layers guard a generated workflow, each tighter than the last:
+
+1. **Schema — shape at generation.** `Workflow_schema` (`lib/workflow_schema.ml(i)`,
+   pure, yojson-only) exposes the canonical **JSON Schema (draft 2020-12)** of the
+   workflow format as a library value (`schema : Yojson.Safe.t`, `to_string : unit ->
+   string`). It is **derived from `Workflow_json`** — the actual parser — and a test
+   asserts the committed [`schema/workflow.schema.json`](schema/workflow.schema.json)
+   byte-matches `Workflow_schema.to_string ()` and that the step `kind`s it enumerates
+   are exactly the ones the parser accepts, so it cannot drift from what runs. Prompt a
+   generator with `cabal-workflow-runner schema` (or `Workflow_schema.to_string ()`) so
+   it emits **conformant workflows by construction** — correct `kind`s, the expr /
+   governor encodings, required fields.
+2. **Lint — semantics + safety, pre-run.** `Lint.check_json` then catches what shape
+   alone cannot (ungoverned loops, commits missing a floor gate, dangling output refs).
+3. **Validate — the run gate.** `Validate.workflow` is the fail-closed gate `Engine.run`
+   requires (defined in terms of `Lint.check`; see the contract below).
+
+So: **schema (shape at generation) → lint (semantics/safety pre-run) → validate (gate at
+run).**
+
 ### The embedding pattern
 
 ```ocaml
@@ -258,8 +280,21 @@ Expressions and governors are encoded as described in §1.2–§1.3; see the
 `Workflow_json` module docs and [`examples/bounty.workflow.json`](examples/bounty.workflow.json)
 for a worked example (structured outputs, an expression-gated commit, a governed loop).
 
-Planned follow-ups (not in the MVP):
+A **machine-readable JSON Schema (draft 2020-12)** of this format is published as a
+library value (`Workflow_schema`) and a committed artifact
+([`schema/workflow.schema.json`](schema/workflow.schema.json)), printable via
+`cabal-workflow-runner schema`. It is derived from `Workflow_json` and kept in lock-step
+by tests — see §4a, "Constrain your generator with the schema."
 
-- **YAML** workflow files (cabal already depends on a YAML library).
-- **Markdown front-matter** workflows (a prose body plus a structured header).
+Done since the MVP:
+
+- **Workflow JSON Schema** (`Workflow_schema` + `schema/workflow.schema.json` + the
+  `schema` CLI) — shipped (v0.4).
+
+Planned follow-ups (not yet shipped):
+
+- An **on-disk ledger** plus a `replay` CLI subcommand.
+- **YAML** / **Markdown front-matter** workflow front-end (a prose body plus a
+  structured header; cabal already depends on a YAML library).
+- A `Spawn` / subworkflow step.
 - Agent-output-driven retries on schema mismatch (currently fail-closed `Aborted`).

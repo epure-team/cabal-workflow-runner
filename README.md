@@ -56,12 +56,40 @@ cabal-workflow-runner run examples/bounty.workflow.json \
   --approve "$APPROVAL_TOKEN"
 ```
 
+```sh
+# Print the canonical JSON Schema (draft 2020-12) of the workflow format. Point a
+# workflow generator at this so it emits conformant workflows by construction.
+cabal-workflow-runner schema > workflow.schema.json
+```
+
 `validate` rejects (exit 1) any workflow with an **ungoverned** loop (empty `governors`,
 or a `Max_iters`/`Fixpoint` with an out-of-range bound) or a commit that is not
 guaranteed-gated by the floor gates on every path. `run` dispatches agent steps to the
 first available cabal backend (forcing structured output, failing closed if none or if
 the agent returns no parseable JSON) and prints the outcome plus the recorded trace.
-Set `CWR_BUDGET` to cap the `Budget` governor (default 1,000,000).
+`schema` is a thin wrapper printing `Workflow_schema.to_string ()` (the committed copy
+lives at [`schema/workflow.schema.json`](schema/workflow.schema.json)).
+
+### Live run against a backend
+
+A `run` dispatches each agent step through cabal. Two environment variables target a
+specific (typically small/cheap/fast) model:
+
+- **`CWR_BACKEND`** — the cabal backend id to use (e.g. `claude-code`). Unset ⇒ the
+  first available backend in the registry.
+- **`CWR_MODEL`** — the model to pin (e.g. `haiku`). Unset ⇒ the backend's default.
+- **`CWR_BUDGET`** — caps the `Budget` governor (default 1,000,000).
+
+```sh
+CWR_BACKEND=claude-code CWR_MODEL=haiku \
+  cabal-workflow-runner run examples/smoke.workflow.json \
+    --floor g-observed --approve "$APPROVAL_TOKEN"
+```
+
+[`examples/smoke.workflow.json`](examples/smoke.workflow.json) is a dumb end-to-end
+workflow (structured output + schema, a gate, a governed loop, a branch, a token-gated
+commit) whose agents just echo fixed JSON so it runs cheaply; it was verified **live**
+all the way to `Committed`.
 
 ## Embedding the library
 
@@ -86,6 +114,21 @@ let () =
 ```
 
 ## Meta-agent: building workflows dynamically
+
+Three layers guard a generated workflow, each tighter than the last:
+
+1. **Schema (shape at generation).** `Workflow_schema` (`lib/workflow_schema.ml(i)`,
+   **pure, yojson-only**) publishes the canonical **JSON Schema (draft 2020-12)** of the
+   workflow format — derived from `Workflow_json` (the actual parser), so it describes
+   *exactly* what the parser accepts. Prompt your generator with
+   `cabal-workflow-runner schema` (or the committed
+   [`schema/workflow.schema.json`](schema/workflow.schema.json), or
+   `Workflow_schema.to_string ()`) so it emits **conformant workflows by construction**
+   — the right `kind`s, the expr/governor encodings, required fields.
+2. **Lint (semantics + safety, pre-run).** `Lint.check_json` then catches what shape
+   alone cannot: ungoverned loops, commits missing a floor gate, dangling output refs.
+3. **Validate (the run gate).** `Validate.workflow` is the fail-closed gate the engine
+   requires before any execution.
 
 The `Lint` library (`lib/lint.ml(i)`, **pure, offline, yojson-only**) is the feedback
 channel for a meta-agent that *generates* its own workflows. It is free to call in a
