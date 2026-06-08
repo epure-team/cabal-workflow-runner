@@ -318,6 +318,95 @@ let test_loop_fixpoint_terminates () =
   Alcotest.(check outcome_testable) "completed without commit"
     Completed_no_commit outcome
 
+(* ---- v0.5 Fix 1: the unconditional engine iteration ceiling ---- *)
+
+(* A Budget-ONLY loop whose backend returns a CONSTANT positive budget (the
+   shipped Backend_cabal semantics) and whose [until] never holds would run
+   forever under the old code. The engine ceiling stops it at exactly
+   [max_loop_iters] with reason "ceiling". *)
+let test_loop_ceiling_budget_constant () =
+  let agent_count = ref 0 in
+  let agent ~id ~prompt:_ ~read_only:_ =
+    incr agent_count;
+    (true, `Assoc [ ("id", `String id) ])
+  in
+  (* constant budget, always > 0 => Budget never fires (mirrors Backend_cabal). *)
+  let backend = Backend.stub ~agent ~budget:(fun () -> 1_000_000) () in
+  let wf =
+    {
+      name = "budget-constant-loop";
+      steps =
+        [
+          Loop
+            {
+              body =
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None } ];
+              until = Some (Expr.Lit (Expr.Bool false));
+              governors = [ Budget ];
+            };
+        ];
+    }
+  in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = Engine.run ~max_loop_iters:5 ~backend ~token:None v in
+  Alcotest.(check int) "ran body exactly 5 times (ceiling)" 5 !agent_count;
+  let stop =
+    List.find_map
+      (function Loop_stopped { iterations; reason } -> Some (iterations, reason) | _ -> None)
+      trace
+  in
+  Alcotest.(check bool) "stopped via ceiling after 5 iters" true
+    (stop = Some (5, "ceiling"));
+  Alcotest.(check outcome_testable) "completed without commit"
+    Completed_no_commit outcome;
+  (* the ceiling is a constant, so replay reproduces the same Loop_stopped. *)
+  let replayed = Engine.replay ~max_loop_iters:5 ~trace v in
+  Alcotest.(check outcome_testable) "replay identical" outcome replayed
+
+(* A Fixpoint-ONLY loop whose agent ALWAYS reports progressed:true never trips
+   Fixpoint; the ceiling stops it anyway. *)
+let test_loop_ceiling_fixpoint_always_progresses () =
+  let agent_count = ref 0 in
+  let agent ~id:_ ~prompt:_ ~read_only:_ =
+    incr agent_count;
+    (true, `Assoc [ ("progressed", `Bool true) ])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf =
+    {
+      name = "fixpoint-progress-loop";
+      steps =
+        [
+          Loop
+            {
+              body =
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None } ];
+              until = Some (Expr.Lit (Expr.Bool false));
+              governors =
+                [
+                  Fixpoint
+                    {
+                      window = 2;
+                      progress = Expr.Path [ "outputs"; "work"; "progressed" ];
+                    };
+                ];
+            };
+        ];
+    }
+  in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = Engine.run ~max_loop_iters:4 ~backend ~token:None v in
+  Alcotest.(check int) "ran body exactly 4 times (ceiling)" 4 !agent_count;
+  let stop =
+    List.find_map
+      (function Loop_stopped { iterations; reason } -> Some (iterations, reason) | _ -> None)
+      trace
+  in
+  Alcotest.(check bool) "stopped via ceiling after 4 iters" true
+    (stop = Some (4, "ceiling"));
+  Alcotest.(check outcome_testable) "completed without commit"
+    Completed_no_commit outcome
+
 (* ---- TEST 7 (spec): deterministic replay with a loop ---- *)
 
 let test_replay_with_loop () =
@@ -467,6 +556,81 @@ let test_commit_token_digest_only () =
     nl = 0 || aux 0
   in
   Alcotest.(check bool) "raw token absent from trace" false (contains trace_text tok)
+
+(* ---- v0.5 Fix 2: a failing Gate BLOCKS the run ---- *)
+
+(* A floor gate whose predicate evaluates FALSE must terminate the walk as
+   Blocked (naming the gate), never reaching the commit. *)
+let test_false_gate_blocks () =
+  let wf =
+    {
+      name = "false-gate";
+      steps =
+        [
+          Agent
+            { id = "a"; prompt = "p"; read_only = true; output_schema = None };
+          (* gate predicate is false: outputs.a.ok does not exist *)
+          Gate { id = "g"; when_ = Expr.Exists [ "outputs"; "a"; "ok" ] };
+          Commit { id = "submit" };
+        ];
+    }
+  in
+  let backend = json_backend [ ("a", `Assoc [ ("other", `String "x") ]) ] in
+  let v = validate_ok ~floor:[ "g" ] wf in
+  let outcome, trace = Engine.run ~backend ~token:(Some "tok") v in
+  (match outcome with
+  | Blocked reason ->
+      Alcotest.(check bool) "block reason names the gate" true
+        (reason = "gate \"g\" evaluated false")
+  | o ->
+      Alcotest.failf "expected Blocked on a false floor gate, got %s"
+        (Types.string_of_outcome o));
+  (* the commit must NOT have been reached *)
+  let committed =
+    List.exists (function Committed_step _ -> true | _ -> false) trace
+  in
+  Alcotest.(check bool) "commit not reached" false committed;
+  (* replay reproduces the Blocked outcome *)
+  let replayed = Engine.replay ~trace v in
+  Alcotest.(check outcome_testable) "replay identical" outcome replayed
+
+(* A true gate records Pass and continues (this is [gated_workflow], whose gate is
+   trivially true) — covered by the happy-path test; here we additionally confirm
+   the bounty example lints with ZERO diagnostics (no warnings) and the smoke
+   example reaches Committed. *)
+let test_bounty_lint_clean_zero_warnings () =
+  match Workflow_json.of_file "../examples/bounty.workflow.json" with
+  | Error e -> Alcotest.failf "could not load bounty example: %s" e
+  | Ok wf ->
+      let ds =
+        Lint.check ~floor_gates:[ "g-validated"; "g-observed"; "g-independent" ] wf
+      in
+      Alcotest.(check int) "bounty example: zero diagnostics (no warnings)" 0
+        (List.length ds)
+
+(* The smoke example's floor gate g-observed evaluates TRUE (observed:true), so
+   the run is not Blocked by the new gate semantics and reaches Committed. *)
+let test_smoke_still_committable () =
+  match Workflow_json.of_file "../examples/smoke.workflow.json" with
+  | Error e -> Alcotest.failf "could not load smoke example: %s" e
+  | Ok wf -> (
+      let v = validate_ok ~floor:[ "g-observed" ] wf in
+      (* a backend echoing the fixed JSON the prompts ask for *)
+      let backend =
+        json_backend
+          [
+            ("classify", `Assoc [ ("severity", `String "high"); ("observed", `Bool true) ]);
+            ("tick", `Assoc [ ("done", `Bool true); ("progressed", `Bool false) ]);
+            ("review", `Assoc [ ("ok", `Bool true) ]);
+          ]
+      in
+      let outcome, _ = Engine.run ~backend ~token:(Some "tok") v in
+      match outcome with
+      | Committed { id; _ } ->
+          Alcotest.(check string) "smoke commits at submit" "submit" id
+      | o ->
+          Alcotest.failf "expected smoke to commit, got %s"
+            (Types.string_of_outcome o))
 
 (* ---- KEEP: happy path ---- *)
 
@@ -792,6 +956,105 @@ let test_schema_kinds_agree () =
   | Error _ -> ()
   | Ok _ -> Alcotest.fail "parser must reject an unknown step kind"
 
+(* CLOSED OBJECTS: every expr branch and every step/governor object sets
+   [additionalProperties:false] (the parser requires exactly one operator/kind
+   key and rejects junk keys), and the integer governor fields carry a [maximum]
+   (so an out-of-OCaml-int-range literal is schema-invalid too). *)
+let test_schema_closed_objects () =
+  let top = match Workflow_schema.schema with `Assoc l -> l | _ -> [] in
+  let defs =
+    match List.assoc_opt "$defs" top with Some (`Assoc d) -> d | _ -> []
+  in
+  let def name = match List.assoc_opt name defs with Some d -> d | None -> `Null in
+  let one_of d =
+    match d with
+    | `Assoc l -> ( match List.assoc_opt "oneOf" l with Some (`List v) -> v | _ -> [])
+    | _ -> []
+  in
+  let additional v =
+    match v with
+    | `Assoc l -> List.assoc_opt "additionalProperties" l
+    | _ -> None
+  in
+  let is_closed v = additional v = Some (`Bool false) in
+  (* expr: every branch object is closed. *)
+  let expr_branches = one_of (def "expr") in
+  Alcotest.(check bool) "expr has branches" true (expr_branches <> []);
+  List.iteri
+    (fun i b ->
+      Alcotest.(check bool)
+        (Printf.sprintf "expr branch %d is additionalProperties:false" i)
+        true (is_closed b))
+    expr_branches;
+  (* step: every step object is closed. *)
+  let step_variants = one_of (def "step") in
+  Alcotest.(check bool) "step has variants" true (step_variants <> []);
+  List.iteri
+    (fun i v ->
+      Alcotest.(check bool)
+        (Printf.sprintf "step variant %d is additionalProperties:false" i)
+        true (is_closed v))
+    step_variants;
+  (* governor: every governor object is closed, and the integer fields (n,
+     window) carry a maximum. *)
+  let gov_variants = one_of (def "governor") in
+  Alcotest.(check bool) "governor has variants" true (gov_variants <> []);
+  let prop_field v field key =
+    match v with
+    | `Assoc l -> (
+        match List.assoc_opt "properties" l with
+        | Some (`Assoc props) -> (
+            match List.assoc_opt field props with
+            | Some (`Assoc fl) -> List.assoc_opt key fl
+            | _ -> None)
+        | _ -> None)
+    | _ -> None
+  in
+  let int_field_count = ref 0 in
+  List.iter
+    (fun v ->
+      Alcotest.(check bool) "governor variant is additionalProperties:false" true
+        (is_closed v);
+      List.iter
+        (fun field ->
+          match prop_field v field "maximum" with
+          | Some (`Int _) ->
+              incr int_field_count;
+              Alcotest.(check bool)
+                (Printf.sprintf "governor int field %s has minimum:1" field)
+                true
+                (prop_field v field "minimum" = Some (`Int 1))
+          | _ -> ())
+        [ "n"; "window" ])
+    gov_variants;
+  Alcotest.(check int) "two bounded integer governor fields (n, window)" 2
+    !int_field_count
+
+(* The schema must NOT accept what the parser REJECTS: a one-operator expr with a
+   junk extra key, and an integer governor bound out of OCaml's safe int range.
+   We assert the parser rejects them (the schema now mirrors this via
+   additionalProperties:false / maximum). *)
+let test_schema_no_overaccept () =
+  (* expr object with an extra junk key beyond the single operator. *)
+  (match
+     Workflow_json.of_string
+       {|{ "name": "x", "steps": [
+            { "kind": "gate", "id": "g",
+              "when": { "path": "outputs.a.x", "junk": 2 } } ] }|}
+   with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "expr with an extra key must be rejected by the parser");
+  (* a Max_iters literal too big to be an OCaml int parses as `Intlit and the
+     parser's req_int rejects it. *)
+  match
+    Workflow_json.of_string
+      {|{ "name": "x", "steps": [
+           { "kind": "loop", "governors": [ { "kind": "max_iters", "n": 100000000000000000000 } ],
+             "body": [] } ] }|}
+  with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "out-of-range Max_iters literal must be rejected"
+
 let () =
   Alcotest.run "cabal_workflow_runner"
     [
@@ -824,6 +1087,12 @@ let () =
             test_loop_budget_terminates;
           Alcotest.test_case "unbounded loop, Fixpoint only, terminates" `Quick
             test_loop_fixpoint_terminates;
+          Alcotest.test_case
+            "ceiling stops Budget-only loop with constant budget" `Quick
+            test_loop_ceiling_budget_constant;
+          Alcotest.test_case
+            "ceiling stops Fixpoint-only loop that always progresses" `Quick
+            test_loop_ceiling_fixpoint_always_progresses;
         ] );
       ( "validate-fail-closed",
         [
@@ -853,6 +1122,15 @@ let () =
           Alcotest.test_case "gated + token + pass => Committed" `Quick
             test_happy_path;
         ] );
+      ( "gate-blocks",
+        [
+          Alcotest.test_case "false floor gate => Blocked (commit not reached)"
+            `Quick test_false_gate_blocks;
+          Alcotest.test_case "bounty example lints clean (zero warnings)" `Quick
+            test_bounty_lint_clean_zero_warnings;
+          Alcotest.test_case "smoke example still reaches Committed" `Quick
+            test_smoke_still_committable;
+        ] );
       ( "lint",
         [
           Alcotest.test_case "invalid JSON => invalid-json, no raise" `Quick
@@ -880,5 +1158,10 @@ let () =
             `Quick test_schema_no_drift;
           Alcotest.test_case "parser <-> schema kinds agree" `Quick
             test_schema_kinds_agree;
+          Alcotest.test_case
+            "expr/step/governor objects closed; int fields bounded" `Quick
+            test_schema_closed_objects;
+          Alcotest.test_case "schema does not over-accept (junk key, huge int)"
+            `Quick test_schema_no_overaccept;
         ] );
     ]

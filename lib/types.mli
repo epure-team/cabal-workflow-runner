@@ -43,16 +43,23 @@ type step =
       (** Dispatch agent work; records [(success, structured_json)] and binds the
           output into the run context under ["outputs.<id>"]. *)
   | Gate of { id : string; when_ : Expr.t }
-      (** Pure verdict: [Pass] iff [Expr.eval when_] over the run context. *)
+      (** Pure verdict: [Pass] iff [Expr.eval when_] over the run context. A
+          [Pass] records the verdict and continues; a [Fail] BLOCKS the run
+          ([Blocked], naming the gate id) — a false floor gate can never reach a
+          commit. *)
   | Branch of { when_ : Expr.t; then_ : step list; else_ : step list }
       (** Evaluate [when_]; take [then_] when true, [else_] when false. *)
   | Loop of {
       body : step list;
       until : Expr.t option;  (** optional data-driven stop condition. *)
       governors : governor list;
-          (** {b >= 1 required} (validator enforces). The termination guarantee:
-              a loop may legitimately have NO [Max_iters] (unbounded but
-              governed) — what is forbidden is an EMPTY governors list. *)
+          (** {b >= 1 required} (validator enforces, by intent). These are
+              {e early-stop} heuristics: a loop may legitimately have NO
+              [Max_iters], and what the validator forbids is an EMPTY governors
+              list. The termination {b guarantee} is the engine's unconditional
+              iteration ceiling ([Engine.run ?max_loop_iters], default
+              [10_000]) — every loop stops at the ceiling regardless of
+              governors / [until] / budget / agent progress. *)
     }
   | Commit of { id : string }
       (** The ONLY step that can file/submit. Requires a runtime token. *)
@@ -77,7 +84,9 @@ type outcome =
       (** A [Commit] executed with a well-formed runtime token; [token_digest]
           is a hash of the token (the raw token is never stored). *)
   | Completed_no_commit  (** Workflow finished without reaching a commit. *)
-  | Blocked of string  (** A floor invariant blocked progress (e.g. no token). *)
+  | Blocked of string
+      (** A floor invariant blocked progress: no/ill-formed runtime token, or a
+          [Gate] whose predicate evaluated [false]. *)
   | Aborted of string  (** Structural / schema error encountered at runtime. *)
 
 (** A recorded effect, in execution order. Replay re-feeds these without a

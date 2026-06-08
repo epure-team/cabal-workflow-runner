@@ -170,6 +170,6 @@ let schema_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.4.0" ~doc in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.5.0" ~doc in
   let group = Cmd.group info [ lint_cmd; validate_cmd; run_cmd; schema_cmd ] in
   exit (Cmd.eval' group)

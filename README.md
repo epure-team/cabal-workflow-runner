@@ -7,14 +7,17 @@ control-flow **deterministically in OCaml** and dispatching **agent steps via ca
 
 Agents return **structured JSON** bound into a **run context**; gate / branch / loop
 decisions are a **total predicate DSL** over that context (always terminating, never
-raising). Loops may be **unbounded** but must declare ≥1 **governor** (`Max_iters`,
-`Budget`, or `Fixpoint`) — the termination guarantee.
+raising). Every loop is **hard-bounded by an engine iteration ceiling** (default
+`10_000`) — the termination guarantee; `Max_iters` / `Budget` / `Fixpoint` / `until` are
+early-stop heuristics under it (a loop must still declare ≥1 governor, by intent). A
+floor `Gate` that evaluates **false blocks** the run.
 
 You get data-driven workflows **without** losing determinism, because the interpreter
 is deterministic, the **safety floor is enforced by the engine/validator as an
 invariant over any workflow** (not by the workflow author), and runs **replay** from a
-recorded trace — the governor's inputs are recorded, so even an unbounded loop replays
-byte-identically. See [`SPEC.md`](SPEC.md) and [`CHANGELOG.md`](CHANGELOG.md).
+recorded trace — the governor's inputs (and the constant ceiling) are recorded, so even
+a loop that hits the ceiling replays byte-identically. See [`SPEC.md`](SPEC.md) and
+[`CHANGELOG.md`](CHANGELOG.md).
 
 The project is **domain-neutral**. [`examples/bounty.workflow.json`](examples/bounty.workflow.json)
 is just one illustration — the bounty pipeline expressed as a single workflow file.
@@ -131,8 +134,10 @@ Three layers guard a generated workflow, each tighter than the last:
    requires before any execution.
 
 The `Lint` library (`lib/lint.ml(i)`, **pure, offline, yojson-only**) is the feedback
-channel for a meta-agent that *generates* its own workflows. It is free to call in a
-tight generate → lint → fix loop (no agent, no backend, no I/O):
+channel for a meta-agent that *generates* its own workflows. With no agent, backend or
+I/O it is linear for realistic workflows (worst-case superlinear only on pathologically
+deep branch nesting, since the analyses re-walk both arms of every `Branch`), so it is
+cheap to call in a tight generate → lint → fix loop:
 
 ```ocaml
 open Cabal_workflow_runner

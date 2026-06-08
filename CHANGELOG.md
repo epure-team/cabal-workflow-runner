@@ -1,5 +1,86 @@
 # Changelog
 
+## v0.5
+
+A **corrective release** addressing findings from an external audit. Four fixes:
+two correctness/safety blockers in the engine, one schema soundness gap, and a
+round of doc honesty.
+
+### Fixed
+
+- **Loop termination is now an engine guarantee, not a backend/agent promise
+  (BLOCKER).** Previously a `Budget`-only loop could run forever (the shipped
+  cabal backend returns `budget ()` as a *constant*, so `Budget` never fired), and
+  a `Fixpoint`-only loop never terminated if the agent always reported progress.
+  `Engine.run` / `Engine.replay` now take `?max_loop_iters` (default `10_000`) and
+  every loop **always** stops once it has executed that many iterations —
+  recording `Loop_stopped { reason = "ceiling" }` — regardless of governors,
+  `until`, budget, or agent behaviour. `Budget` / `Fixpoint` / `until` are now
+  documented as *early-stop heuristics* under the ceiling, and `Max_iters` as an
+  explicit *lower* bound. The validator still requires ≥1 governor (intent), but
+  the termination guarantee is the ceiling. The ceiling is a constant, so replay
+  reproduces it byte-identically.
+- **A failing `Gate` now BLOCKS the run.** A `Gate` whose predicate evaluates
+  **false** terminates the walk as `Blocked` (naming the gate id) instead of
+  recording `Fail` and continuing. The floor now means "floor gates must *pass* on
+  every path to a commit." A `Gate` that evaluates true records `Pass` and
+  continues, unchanged.
+- **`examples/bounty.workflow.json` restructured.** It previously gated
+  `g-independent` on `outputs.final-review.verdict`, produced *later* inside the
+  branch — which both warned (`dangling-output-ref`) and, under the new gate
+  semantics, would have blocked. The independent review (`final-review`) and the
+  `draft-poc` output schema now run *before* the floor gates, so every gate
+  references only outputs produced before it. The example is now **lint-clean
+  (zero diagnostics, no warnings)** and reaches `commit` when the gate predicates
+  hold.
+- **JSON Schema no longer accepts what the parser rejects (major).** Every expr
+  operator object and every step/governor object is now **closed**
+  (`additionalProperties:false`) — matching the parser's exactly-one-operator/`kind`
+  requirement, so `{"path":"x","junk":2}` is schema-invalid. The integer governor
+  fields (`max_iters.n`, `fixpoint.window`) carry `minimum:1` and
+  `maximum:1073741823` (2³⁰−1, inside OCaml's safe `int` range), so a literal too
+  large for the parser to read as an `int` is schema-invalid too. The committed
+  `schema/workflow.schema.json` is regenerated (the no-drift test enforces
+  equality); the schema test now asserts the closed objects and the integer
+  bounds structurally (still no JSON-Schema validator dependency).
+
+### Docs
+
+- **Loop wording reframed** across `SPEC.md` / `README.md` / the `Engine` and
+  `Types` interfaces: every loop is hard-bounded by the engine ceiling; governors
+  and `until` are early-stop heuristics; no loop can run unboundedly regardless of
+  the backend's budget or the agent's progress reports.
+- **Floor wording updated:** floor gates must *pass* (not merely be present) on
+  every path to a commit; a false gate blocks.
+- **Schema↔parser conformance wording** made accurate (it now rejects the two
+  divergences above).
+- **`Lint` performance claim made honest:** no longer "instant / free"; now "pure,
+  offline, no agent/IO; linear for realistic workflows, worst-case superlinear on
+  pathologically deep branch nesting."
+- **`extract_json` (`bin/backend_cabal.ml`) docstring** notes it is best-effort,
+  not balanced-bracket-aware, and **fails closed** on ambiguous input
+  (valid-JSON-then-prose-with-braces may be rejected — the safe direction). The
+  disclosed cross-branch `dangling-output-ref` limitation note is kept.
+
+### Other
+
+- CLI `--version` → `0.5.0`.
+- New tests: a `Budget`-only loop with a *constant* budget stops at the ceiling
+  (`~max_loop_iters:5`, reason `"ceiling"`); a `Fixpoint`-only loop whose agent
+  always reports `progressed:true` also stops at the ceiling; a false floor gate
+  yields `Blocked`; the bounty example lints with zero diagnostics; the smoke
+  example still reaches `Committed`; the schema's expr/step/governor objects are
+  closed and its integer fields are bounded, and the parser rejects the junk-key /
+  out-of-range-integer divergences. The decrements-to-zero `Budget` early-stop and
+  `Fixpoint` early-stop tests are retained.
+
+### Preserved invariants
+
+- Abstract `Validate.Validated.t`; `Engine.run`/`replay` require it.
+- `Commit` needs a runtime token (hashed for the trace, never stored raw).
+- Floor gates guaranteed on every path to a commit.
+- `lib/` depends on **yojson only** — cabal stays confined to `bin/`.
+
 ## v0.4
 
 A **machine-readable JSON Schema of the workflow format**, so a meta-agent can

@@ -21,11 +21,19 @@ let budget () =
 (* Extract structured JSON from a cabal task result. We prefer the structured
    report's [raw_json]; failing that we try to parse [agent_text] as JSON. If
    neither yields a JSON object we fail closed (success := false). *)
-(* Robustly extract a JSON object/array from agent text. Small/fast models often
-   wrap the JSON in prose or a ```json fence; a strict parse would fail closed on
-   output that is "JSON plus noise". We try, in order: a direct parse; the body of
-   a leading ``` fence; then the substring from the first {/[ to the last matching
-   }/]. Returns [None] only when no JSON object/array can be recovered at all. *)
+(* Best-effort extraction of a JSON object/array from agent text. Small/fast
+   models often wrap the JSON in prose or a ```json fence; a strict parse would
+   fail closed on output that is "JSON plus noise". We try, in order: a direct
+   parse; the body of a leading ``` fence; then the substring from the first {/[
+   to the last matching }/].
+
+   This is NOT balanced-bracket-aware: it is a heuristic, and it FAILS CLOSED on
+   ambiguous input. In particular, valid-JSON-immediately-followed-by-prose that
+   itself contains braces (e.g. `{"a":1} note: see {below}`) takes the
+   first-{-to-last-} substring, which then fails to parse and yields [None] —
+   i.e. the agent step is treated as unsuccessful. That is the safe direction (we
+   never silently commit to a partial/misread object). Returns [None] when no JSON
+   object/array can be recovered at all. *)
 let extract_json (raw : string) : Yojson.Safe.t option =
   let parse str =
     match Yojson.Safe.from_string (String.trim str) with

@@ -27,9 +27,9 @@ commit). A `workflow` is a name plus a `step list`:
 | Step | Meaning | Determinism |
 |------|---------|-------------|
 | `Agent { id; prompt; read_only; output_schema }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. If `output_schema` is present the JSON is validated **fail-closed**. | Effect isolated to the backend; structured result recorded. |
-| `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). | Verdict recorded. |
+| `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). A `Pass` records the verdict and continues; a **`Fail` BLOCKS** the run (`Blocked`, naming the gate id). | Verdict recorded; a false gate is a terminal block. |
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
-| `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds **or** any governor fires. | **Governed** — possibly unbounded but ≥1 governor guarantees termination; the bound is a function of recorded inputs. |
+| `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
 | `Commit { id }` | The **only** step that can file/submit. | Requires a runtime token (below). |
 
 Illegal states are made hard to express: there is **no** step constructor that can
@@ -63,20 +63,30 @@ JSON encoding (parsed by `Workflow_json`): `{"path":"outputs.a.sev"}`, `{"lit":<
 `{"eq":[e1,e2]}` (and `ne`/`lt`/`le`/`gt`/`ge`/`in`), `{"and":[..]}`, `{"or":[..]}`,
 `{"not":e}`, `{"exists":"outputs.a.sev"}`.
 
-### 1.3 Governed (possibly-unbounded) loops
+### 1.3 Hard-bounded loops (ceiling) + governors
 
-A `Loop` carries an optional data-driven stop condition `until : Expr.t option` and a
-**non-empty** list of `governors`:
+Every loop is **hard-bounded by an engine iteration ceiling** (`Engine.run
+?max_loop_iters`, default `10_000`): a loop ALWAYS stops once it has executed `ceiling`
+iterations — recording `Loop_stopped { reason = "ceiling" }` — **regardless** of
+governors, `until`, budget, or the agent's progress reports. This is the termination
+**guarantee**: no loop can run unboundedly even if the backend's `budget ()` is a
+constant (as the shipped cabal backend's is) or the agent always reports progress. The
+ceiling is a constant, so replay reproduces it byte-identically.
 
-- `Max_iters n` — stop after `n` iterations (`n ≥ 1`);
+Under that ceiling, a `Loop` carries an optional data-driven stop condition `until :
+Expr.t option` and a **non-empty** list of `governors` that act as **early-stop
+heuristics**:
+
+- `Max_iters n` — an explicit **lower** bound: stop after `n` iterations (`n ≥ 1`);
 - `Budget` — stop once `backend.budget () <= 0`;
 - `Fixpoint { window; progress }` — stop after `window` consecutive iterations where
   `progress` evaluated `false` (`window ≥ 1`).
 
-Per iteration the engine binds `loop.iter`, runs `body` (binding its agent outputs),
-then stops if `until` holds **or** any governor fires. A loop may legitimately have
-**no `Max_iters`** (e.g. only `Budget` or `Fixpoint`) — that is the feature:
-**unbounded but governed**. What is forbidden is an **empty** `governors` list.
+Per iteration the engine first checks the ceiling, then binds `loop.iter`, runs `body`
+(binding its agent outputs), then stops if `until` holds **or** any governor fires. A
+loop may legitimately have **no `Max_iters`** (e.g. only `Budget` or `Fixpoint`): the
+ceiling still bounds it. What is forbidden by the validator is an **empty** `governors`
+list (intent), but the termination guarantee itself is the ceiling, not the governors.
 
 ## 2. The safety floor — enforced by the engine/validator, NOT the workflow
 
@@ -101,9 +111,12 @@ It returns `Error reason` (rejecting the workflow before any execution) when:
 - a `Commit` is reachable on a path where the `floor_gates` are **not** all
   guaranteed-evaluated before it.
 
-A gate counts toward the floor purely by its **id** being *evaluated* on every path;
-its `when_` verdict is irrelevant to the floor (the floor is "the gate was reached", the
-runtime token is the second lock).
+The validator is **structural**: it requires each floor gate's **id** to be
+*guaranteed-evaluated* on every path to a commit. The gates must additionally **PASS**:
+at runtime a `Gate` whose `when_` evaluates **false** terminates the walk as `Blocked`
+(naming the gate id), so a false floor gate can never reach a commit. The floor therefore
+means "floor gates must *pass* on every path to a commit"; the runtime token is the
+second lock.
 
 **Conservative static analysis.** Walking the steps, we thread the set of gates
 *guaranteed* to have been evaluated on **every** path reaching the current position:
@@ -148,10 +161,12 @@ parsing `agent_text` as JSON); if no parseable JSON is produced it **fails close
 the `CWR_BUDGET` env var if set. cabal usage is confined to this boundary: the
 `cabal_workflow_runner` **library depends on yojson only**; only `bin/` links cabal.
 
-`Engine.run ~backend ~token validated : outcome * trace` performs a deterministic walk:
-`Agent` → `run_agent`, bind `outputs.<id>`, validate `output_schema` (fail-closed);
-`Gate`/`Branch` → pure `Expr.eval` over the run context; `Loop` → governed iteration
-(see §1.3), stopping on `until` or any fired governor; `Commit` → require token
+`Engine.run ?max_loop_iters ~backend ~token validated : outcome * trace` performs a
+deterministic walk: `Agent` → `run_agent`, bind `outputs.<id>`, validate `output_schema`
+(fail-closed); `Gate` → pure `Expr.eval`; a `Pass` continues, a **`Fail` blocks** the
+run (`Blocked`, naming the gate); `Branch` → pure `Expr.eval` chooses the arm; `Loop` →
+iterate under the engine **ceiling** (`?max_loop_iters`, default `10_000`; see §1.3),
+also stopping early on `until` or any fired governor; `Commit` → require token
 (`Blocked` if absent/ill-formed) else `Committed`.
 
 **Determinism / replay.** The trace records, *in order, everything a stop/branch
@@ -183,8 +198,10 @@ match Validate.workflow ~floor_gates:["g-observed"; "g-independent"] wf with
 A meta-agent that *generates* its own workflows needs to know, **before** running
 anything, whether a candidate workflow is well-formed and safe — and, when it is not,
 **why**, in a form it can act on. The `Lint` library is that feedback channel. It is
-**pure, offline, and instant** (no agent, no backend, no I/O), so it is free to call in
-a tight generate → lint → fix loop.
+**pure and offline** (no agent, no backend, no I/O): linear for realistic workflows,
+worst-case superlinear on pathologically deep branch nesting (the floor/ref analyses
+re-walk both arms of every `Branch`). For any sane generated workflow it is effectively
+instant and cheap to call in a tight generate → lint → fix loop.
 
 ### Constrain your generator with the schema
 
@@ -196,7 +213,13 @@ Three layers guard a generated workflow, each tighter than the last:
    string`). It is **derived from `Workflow_json`** — the actual parser — and a test
    asserts the committed [`schema/workflow.schema.json`](schema/workflow.schema.json)
    byte-matches `Workflow_schema.to_string ()` and that the step `kind`s it enumerates
-   are exactly the ones the parser accepts, so it cannot drift from what runs. Prompt a
+   are exactly the ones the parser accepts, so it cannot drift from what runs. It does
+   **not accept what the parser rejects**: every expr operator object and every
+   step/governor object is **closed** (`additionalProperties:false`) — the parser
+   requires exactly one operator/`kind` key, so `{"path":"x","junk":2}` is schema-invalid
+   too — and the integer governor fields (`max_iters.n`, `fixpoint.window`) carry
+   `minimum:1` and a `maximum` (`1073741823` = 2³⁰−1) inside OCaml's safe `int` range, so
+   a literal too large for the parser to read as an `int` is also schema-invalid. Prompt a
    generator with `cabal-workflow-runner schema` (or `Workflow_schema.to_string ()`) so
    it emits **conformant workflows by construction** — correct `kind`s, the expr /
    governor encodings, required fields.

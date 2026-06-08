@@ -24,7 +24,7 @@
             "read_only": { "type": "boolean" },
             "output_schema": { "$ref": "#/$defs/output_schema" }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -34,7 +34,7 @@
             "id": { "type": "string" },
             "when": { "$ref": "#/$defs/expr" }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -45,7 +45,7 @@
             "then": { "type": "array", "items": { "$ref": "#/$defs/step" } },
             "else": { "type": "array", "items": { "$ref": "#/$defs/step" } }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -60,7 +60,7 @@
             },
             "body": { "type": "array", "items": { "$ref": "#/$defs/step" } }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -69,7 +69,7 @@
             "kind": { "const": "commit" },
             "id": { "type": "string" }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         }
       ]
     },
@@ -80,19 +80,19 @@
           "type": "object",
           "required": [ "path" ],
           "properties": { "path": { "type": "string" } },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "exists" ],
           "properties": { "exists": { "type": "string" } },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "lit" ],
           "properties": { "lit": {} },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -105,7 +105,7 @@
               "maxItems": 2
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -118,7 +118,7 @@
               "maxItems": 2
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -131,7 +131,7 @@
               "maxItems": 2
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -144,7 +144,7 @@
               "maxItems": 2
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -157,7 +157,7 @@
               "maxItems": 2
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -170,7 +170,7 @@
               "maxItems": 2
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -183,7 +183,7 @@
               "maxItems": 2
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -191,7 +191,7 @@
           "properties": {
             "and": { "type": "array", "items": { "$ref": "#/$defs/expr" } }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
@@ -199,13 +199,13 @@
           "properties": {
             "or": { "type": "array", "items": { "$ref": "#/$defs/expr" } }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "not" ],
           "properties": { "not": { "$ref": "#/$defs/expr" } },
-          "additionalProperties": true
+          "additionalProperties": false
         }
       ]
     },
@@ -217,25 +217,29 @@
           "required": [ "kind", "n" ],
           "properties": {
             "kind": { "const": "max_iters" },
-            "n": { "type": "integer" }
+            "n": { "type": "integer", "minimum": 1, "maximum": 1073741823 }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "kind" ],
           "properties": { "kind": { "const": "budget" } },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         {
           "type": "object",
           "required": [ "kind", "window", "progress" ],
           "properties": {
             "kind": { "const": "fixpoint" },
-            "window": { "type": "integer" },
+            "window": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1073741823
+            },
             "progress": { "$ref": "#/$defs/expr" }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         }
       ]
     },

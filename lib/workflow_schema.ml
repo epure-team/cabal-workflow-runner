@@ -23,8 +23,21 @@ let ref_ name : Yojson.Safe.t = obj [ ("$ref", s ("#/$defs/" ^ name)) ]
 (* { "type": "string" } etc. *)
 let typ t = obj [ ("type", s t) ]
 
+(* A bounded integer: [minimum:1] and a [maximum] inside OCaml's safe int range
+   so a literal yojson parses as [`Int] (not [`Intlit]). 2^30-1 is comfortably an
+   OCaml [int]; the parser rejects out-of-range integers (they become [`Intlit]),
+   so the schema must reject them too. *)
+let bounded_int : Yojson.Safe.t =
+  obj
+    [
+      ("type", s "integer");
+      ("minimum", `Int 1);
+      ("maximum", `Int 1073741823);
+    ]
+
 (* An object schema that requires [required] keys, gives [props] for the named
-   ones, and tolerates any extra key (the parser ignores unknown fields). *)
+   ones, and tolerates any extra key (the parser ignores unknown fields). Used at
+   the document top level, where the [_doc] convention adds extra keys. *)
 let object_with ~required ~props : Yojson.Safe.t =
   obj
     [
@@ -32,6 +45,20 @@ let object_with ~required ~props : Yojson.Safe.t =
       ("required", arr (List.map s required));
       ("properties", obj props);
       ("additionalProperties", `Bool true);
+    ]
+
+(* A CLOSED object schema: the parser dispatches an expr/step/governor on exactly
+   one operator/[kind] and the expr parser rejects an object with extra keys
+   ({"path":"x","junk":2} is rejected). We model that with
+   [additionalProperties:false] so the schema does not accept what the parser
+   rejects. *)
+let closed_object_with ~required ~props : Yojson.Safe.t =
+  obj
+    [
+      ("type", s "object");
+      ("required", arr (List.map s required));
+      ("properties", obj props);
+      ("additionalProperties", `Bool false);
     ]
 
 (* ---- expr ($defs/expr) -------------------------------------------------- *)
@@ -44,7 +71,7 @@ let object_with ~required ~props : Yojson.Safe.t =
    - not -> a single expr. *)
 let expr_def : Yojson.Safe.t =
   let single key value_schema =
-    object_with ~required:[ key ] ~props:[ (key, value_schema) ]
+    closed_object_with ~required:[ key ] ~props:[ (key, value_schema) ]
   in
   let pair key =
     single key
@@ -94,16 +121,16 @@ let governor_def : Yojson.Safe.t =
       ( "oneOf",
         arr
           [
-            object_with ~required:[ "kind"; "n" ]
-              ~props:[ ("kind", kind_const "max_iters"); ("n", typ "integer") ];
-            object_with ~required:[ "kind" ]
+            closed_object_with ~required:[ "kind"; "n" ]
+              ~props:[ ("kind", kind_const "max_iters"); ("n", bounded_int) ];
+            closed_object_with ~required:[ "kind" ]
               ~props:[ ("kind", kind_const "budget") ];
-            object_with
+            closed_object_with
               ~required:[ "kind"; "window"; "progress" ]
               ~props:
                 [
                   ("kind", kind_const "fixpoint");
-                  ("window", typ "integer");
+                  ("window", bounded_int);
                   ("progress", ref_ "expr");
                 ];
           ] );
@@ -153,7 +180,7 @@ let step_def : Yojson.Safe.t =
   let kind_const k = obj [ ("const", s k) ] in
   let step_list = obj [ ("type", s "array"); ("items", ref_ "step") ] in
   let agent =
-    object_with
+    closed_object_with
       ~required:[ "kind"; "id"; "prompt" ]
       ~props:
         [
@@ -165,7 +192,7 @@ let step_def : Yojson.Safe.t =
         ]
   in
   let gate =
-    object_with
+    closed_object_with
       ~required:[ "kind"; "id"; "when" ]
       ~props:
         [
@@ -175,7 +202,7 @@ let step_def : Yojson.Safe.t =
         ]
   in
   let branch =
-    object_with
+    closed_object_with
       ~required:[ "kind"; "when"; "then"; "else" ]
       ~props:
         [
@@ -186,7 +213,7 @@ let step_def : Yojson.Safe.t =
         ]
   in
   let loop =
-    object_with
+    closed_object_with
       ~required:[ "kind"; "governors"; "body" ]
       ~props:
         [
@@ -203,7 +230,7 @@ let step_def : Yojson.Safe.t =
         ]
   in
   let commit =
-    object_with ~required:[ "kind"; "id" ]
+    closed_object_with ~required:[ "kind"; "id" ]
       ~props:[ ("kind", kind_const "commit"); ("id", typ "string") ]
   in
   obj

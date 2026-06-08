@@ -21,7 +21,8 @@
           "output_schema": { "exhausted": "bool", "progressed": "bool" } },
         { "kind": "agent", "id": "draft-poc",
           "prompt": "Draft a proof-of-concept for the current candidate.",
-          "read_only": false }
+          "read_only": false,
+          "output_schema": { "ok": "bool" } }
       ] },
 
     { "kind": "agent", "id": "writeup",
@@ -29,28 +30,26 @@
       "read_only": false,
       "output_schema": { "severity": { "enum": ["low", "medium", "high", "critical"] } } },
 
+    { "kind": "agent", "id": "final-review",
+      "prompt": "Independent reviewer signs off on the finding.",
+      "read_only": true,
+      "output_schema": { "verdict": { "enum": ["approved", "rejected"] } } },
+
     { "kind": "gate", "id": "g-validated",
       "when": { "exists": "outputs.writeup.severity" } },
     { "kind": "gate", "id": "g-observed",
-      "when": { "exists": "outputs.draft-poc" } },
+      "when": { "exists": "outputs.draft-poc.ok" } },
     { "kind": "gate", "id": "g-independent",
       "when": { "eq": [ { "path": "outputs.final-review.verdict" }, { "lit": "approved" } ] } },
 
     { "kind": "branch",
-      "when": { "and": [
-        { "in": [ { "path": "outputs.writeup.severity" }, { "lit": ["high", "critical"] } ] },
-        { "eq": [ { "path": "outputs.final-review.verdict" }, { "lit": "approved" } ] }
-      ] },
+      "when": { "in": [ { "path": "outputs.writeup.severity" }, { "lit": ["high", "critical"] } ] },
       "then": [
-        { "kind": "agent", "id": "final-review",
-          "prompt": "Independent reviewer signs off on the finding.",
-          "read_only": true,
-          "output_schema": { "verdict": { "enum": ["approved", "rejected"] } } },
         { "kind": "commit", "id": "submit-bounty" }
       ],
       "else": [
         { "kind": "agent", "id": "abort-note",
-          "prompt": "Record why the finding did not clear independent review.",
+          "prompt": "Record why the finding did not clear triage.",
           "read_only": true }
       ] }
   ]

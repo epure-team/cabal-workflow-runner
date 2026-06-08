@@ -50,7 +50,14 @@ let bind_loop_iter st index = bind st "loop" (`Assoc [ ("iter", `Int index) ])
 (* run: deterministic interpreter driven by a backend.                 *)
 (* ------------------------------------------------------------------ *)
 
-let run ~backend ~token validated =
+(* Unconditional hard iteration ceiling for every loop. A loop ALWAYS stops once
+   it has executed this many iterations, regardless of governors / until / budget
+   / agent behaviour — it is the termination GUARANTEE (Budget/Fixpoint/until are
+   early-stop heuristics under it). Default chosen generously; tests pass a small
+   value. The ceiling is a constant, so replay reproduces byte-identically. *)
+let default_max_loop_iters = 10_000
+
+let run ?(max_loop_iters = default_max_loop_iters) ~backend ~token validated =
   let wf = Validate.Validated.workflow validated in
   let agent ~id ~prompt ~read_only =
     backend.Backend.run_agent ~id ~prompt ~read_only
@@ -81,9 +88,17 @@ let run ~backend ~token validated =
                 }
                 |> fun st -> emit st (Blocked_at { id; reason }))
         | _ -> st)
-    | Gate { id; when_ } ->
+    | Gate { id; when_ } -> (
         let verdict = if eval st when_ then Pass else Fail in
-        emit st (Gate_evaluated { id; verdict })
+        let st = emit st (Gate_evaluated { id; verdict }) in
+        match verdict with
+        | Pass -> st
+        | Fail ->
+            (* A floor gate evaluating false must BLOCK the walk: a false gate
+               cannot reach a commit. *)
+            let reason = Printf.sprintf "gate %S evaluated false" id in
+            let st = emit st (Blocked_at { id; reason }) in
+            { st with terminal = Some (Blocked reason) })
     | Branch { when_; then_; else_ } ->
         let verdict = if eval st when_ then Pass else Fail in
         let st = emit st (Branch_taken { verdict }) in
@@ -112,6 +127,9 @@ let run ~backend ~token validated =
     let fixpoint_counts = Array.make (List.length governors) 0 in
     let rec iter st index =
       if st.terminal <> None then st
+      else if index >= max_loop_iters then
+        (* hard engine ceiling: [index] iterations (0..index-1) already ran. *)
+        emit st (Loop_stopped { iterations = index; reason = "ceiling" })
       else begin
         let st = emit st (Loop_iter { index }) in
         let st = bind_loop_iter st index in
@@ -168,7 +186,7 @@ let run ~backend ~token validated =
 
 exception Replay_mismatch of string
 
-let replay ~trace validated =
+let replay ?(max_loop_iters = default_max_loop_iters) ~trace validated =
   let wf = Validate.Validated.workflow validated in
   let pending = ref trace in
   let next () =
@@ -210,11 +228,20 @@ let replay ~trace validated =
         | _ -> raise (Replay_mismatch "agent entry mismatch"))
     | Gate { id; when_ } -> (
         match next () with
-        | Gate_evaluated { verdict; id = rid } when rid = id ->
+        | Gate_evaluated { verdict; id = rid } when rid = id -> (
             let recomputed = if eval_ctx st when_ then Pass else Fail in
             if recomputed <> verdict then
               raise (Replay_mismatch "gate verdict diverged");
-            emit st (Gate_evaluated { id; verdict })
+            let st = emit st (Gate_evaluated { id; verdict }) in
+            match verdict with
+            | Pass -> st
+            | Fail -> (
+                (* the recorded run blocked here; consume its Blocked_at. *)
+                match next () with
+                | Blocked_at { id = rid; reason } when rid = id ->
+                    let st = emit st (Blocked_at { id; reason }) in
+                    { st with terminal = Some (Blocked reason) }
+                | _ -> raise (Replay_mismatch "gate block entry mismatch")))
         | _ -> raise (Replay_mismatch "gate entry mismatch"))
     | Branch { when_; then_; else_ } -> (
         match next () with
@@ -241,6 +268,9 @@ let replay ~trace validated =
     let fixpoint_counts = Array.make (List.length governors) 0 in
     let rec iter st index =
       if st.terminal <> None then st
+      else if index >= max_loop_iters then
+        (* mirror run: the ceiling stops the loop here; consume its entry. *)
+        consume_stop st index "ceiling"
       else
         match next () with
         | Loop_iter { index = ri } when ri = index ->
