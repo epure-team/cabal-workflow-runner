@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.11
+
+**Soft-fail agent steps (`on_failure`).** An `Agent` step gains an optional `on_failure`
+field: `"abort"` (default, unchanged — a `success = false` run fails closed → `Aborted`)
+or `"continue"` — a **soft** failure that records the failed `Agent_ran`, binds its output,
+and lets the walk continue. This is for **continuous loops** where one iteration's agent
+failure must not kill the whole run; the failed agent's output is still bound under
+`outputs.<id>`, so any predicate reading it is fail-closed (a missing field is false).
+`replay` reproduces a soft-failed step byte-identically (no `Blocked_at`, no `Aborted`).
+CLI `--version` → `0.11.0`.
+
+**Safety (enforced, not assumed):** the validator **rejects** `on_failure = "continue"` in
+any workflow that contains a `Commit` (the `soft-fail-with-commit` error) — soft-fail is
+permitted only in **commit-free** workflows. This is required because the commit-floor
+invariant tracks gate **IDs**, not whether a gate's predicate consumes the soft-failed
+agent's output; a trivially-true floor gate could otherwise let a commit fire past a
+soft-failed agent. With no `Commit` reachable, `"continue"` changes only whether a failed
+agent aborts the walk. Default behaviour is unchanged; a workflow that omits `on_failure`
+parses, validates, lints, and serialises exactly as before (the field is emitted only when
+`"continue"`). Schema (`workflow.schema.json`) updated; schema↔parser parity holds; new
+engine tests cover soft-fail + replay (`F3`) and the soft-fail-with-commit rejection.
+
 ## v0.10
 
 An **on-disk ledger** + **`replay`-from-file**: a run's recorded trace can now be persisted

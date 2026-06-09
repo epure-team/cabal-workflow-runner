@@ -23,6 +23,15 @@ let opt_bool key default json =
   | Some _ -> err "field %S must be a boolean" key
   | None -> default
 
+(* [on_failure] of an agent step: absent => [Abort] (the fail-closed default). *)
+let opt_on_failure key json : Types.on_failure =
+  match member_opt key json with
+  | None | Some (`String "abort") -> Types.Abort
+  | Some (`String "continue") -> Types.Continue
+  | Some (`String other) ->
+      err "field %S must be \"abort\" or \"continue\" (got %S)" key other
+  | Some _ -> err "field %S must be a string" key
+
 (* A bounded integer field, used for [max_iters.n] and [fixpoint.window]. The
    schema declares [1 <= v <= max_int]; we enforce the SAME bounds at parse so
    the parser accepts a workflow iff it is structurally schema-valid:
@@ -241,10 +250,13 @@ let rec step_of_json json =
             prompt = req_string "prompt" json;
             read_only = opt_bool "read_only" false json;
             output_schema = opt_schema "output_schema" json;
+            on_failure = opt_on_failure "on_failure" json;
           }
       in
       reject_unknown_keys ~what:"agent step"
-        ~known:[ "kind"; "id"; "prompt"; "read_only"; "output_schema" ] json;
+        ~known:
+          [ "kind"; "id"; "prompt"; "read_only"; "output_schema"; "on_failure" ]
+        json;
       s
   | "gate" ->
       let s = Gate { id = req_string "id" json; when_ = req_expr "when" json } in
@@ -360,7 +372,7 @@ let governor_to_json = function
         ]
 
 let rec step_to_json = function
-  | Agent { id; prompt; read_only; output_schema } ->
+  | Agent { id; prompt; read_only; output_schema; on_failure } ->
       `Assoc
         ([
            ("kind", `String "agent");
@@ -368,6 +380,11 @@ let rec step_to_json = function
            ("prompt", `String prompt);
            ("read_only", `Bool read_only);
          ]
+        (* Emit on_failure only when non-default (Continue), so a default workflow
+           round-trips byte-identically (absent => Abort on re-parse). *)
+        @ (match on_failure with
+          | Types.Abort -> []
+          | Types.Continue -> [ ("on_failure", `String "continue") ])
         @
         match output_schema with
         | None -> []

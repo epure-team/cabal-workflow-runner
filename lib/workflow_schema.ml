@@ -215,6 +215,7 @@ let step_def : Yojson.Safe.t =
           ("prompt", typ "string");
           ("read_only", typ "boolean");
           ("output_schema", ref_ "output_schema");
+          ("on_failure", obj [ ("enum", arr [ s "abort"; s "continue" ]) ]);
         ]
   in
   let gate =

@@ -23,7 +23,8 @@
             "id": { "type": "string" },
             "prompt": { "type": "string" },
             "read_only": { "type": "boolean" },
-            "output_schema": { "$ref": "#/$defs/output_schema" }
+            "output_schema": { "$ref": "#/$defs/output_schema" },
+            "on_failure": { "enum": [ "abort", "continue" ] }
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false

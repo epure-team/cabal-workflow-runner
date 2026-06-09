@@ -26,7 +26,7 @@ commit). A `workflow` is a name plus a `step list`:
 
 | Step | Meaning | Determinism |
 |------|---------|-------------|
-| `Agent { id; prompt; read_only; output_schema }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. A **`success = false` run fails closed** → `Aborted` (the run cannot continue past a failed agent). On success, if `output_schema` is present the JSON is validated **fail-closed**. | Effect isolated to the backend; structured result recorded. |
+| `Agent { id; prompt; read_only; output_schema; on_failure }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. A **`success = false` run fails closed** → `Aborted` **by default** (`on_failure = "abort"`); with **`on_failure = "continue"`** the failure is **soft** — the failed `Agent_ran` is recorded and the walk continues (for continuous loops where one iteration's failure must not kill the run). On success, if `output_schema` is present the JSON is validated **fail-closed**. | Effect isolated to the backend; structured result recorded. |
 | `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). A `Pass` records the verdict and continues; a **`Fail` BLOCKS** the run (`Blocked`, naming the gate id). | Verdict recorded; a false gate is a terminal block. |
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
 | `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
@@ -35,6 +35,15 @@ commit). A `workflow` is a name plus a `step list`:
 
 Illegal states are made hard to express: there is **no** step constructor that can
 carry an approval token, and `Commit` is the only constructor that can file/submit.
+
+`on_failure = "continue"` does **not** weaken the commit safety floor, because the
+validator **rejects** it in any workflow that contains a `Commit` (the
+`soft-fail-with-commit` error). Soft-fail is permitted only in **commit-free** workflows
+(e.g. a continuous coverage loop that never files). This is *enforced*, not assumed: the
+commit-floor invariant tracks gate **IDs**, not whether a gate's predicate consumes the
+failed agent's output, so a trivially-true floor gate could otherwise let a commit fire
+past a soft-failed agent. With no `Commit` reachable, `"continue"` changes only whether a
+failed agent *aborts the walk*; the default remains fail-closed `"abort"`.
 
 ### 1.1 Structured agent output + run context
 
