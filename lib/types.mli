@@ -31,6 +31,25 @@ end
     - [Commit] is the only constructor that can file/submit anything;
     - gates / branches / loops carry {b pure} {!Expr.t} predicates evaluated over
       recorded agent outputs — there is no backend gate primitive. *)
+type on_failure = Abort | Continue
+(** What to do when an [Agent] step's run is UNSUCCESSFUL.
+
+    - [Abort] (the default): fail closed — the run aborts ([Aborted]). The
+      one-shot, safety-first behaviour.
+    - [Continue]: a SOFT failure — record the failed [Agent_ran] and continue the
+      walk. The agent's (failure) output is still bound under ["outputs.<id>"], so
+      any predicate that reads it is fail-closed (a missing field evaluates
+      false). Use this in a CONTINUOUS loop where one iteration's agent failure
+      must not kill the whole run.
+
+    [Continue] does NOT weaken the commit safety floor, because the validator
+    REJECTS it in any workflow that contains a [Commit] (the [soft-fail-with-commit]
+    error): soft-fail is permitted only in COMMIT-FREE workflows. This is enforced,
+    not assumed — the commit-floor invariant tracks gate IDs, not whether a gate's
+    predicate consumes the failed agent's output, so a trivially-true floor gate
+    could otherwise let a commit fire despite a soft-failed agent. With no [Commit]
+    reachable, [Continue] only changes whether a failed agent ABORTS the walk. *)
+
 type step =
   | Agent of {
       id : string;
@@ -39,6 +58,9 @@ type step =
       output_schema : Schema.t option;
           (** If present, the agent's structured JSON is validated against it;
               a mismatch is fail-closed ([Aborted]). *)
+      on_failure : on_failure;
+          (** Behaviour on an unsuccessful run; defaults to [Abort] when the
+              workflow omits ["on_failure"]. *)
     }
       (** Dispatch agent work; records [(success, structured_json)] and binds the
           output into the run context under ["outputs.<id>"]. *)

@@ -93,22 +93,30 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
         go st rest
   and go_step st step =
     match step with
-    | Agent { id; prompt; read_only; output_schema } -> (
+    | Agent { id; prompt; read_only; output_schema; on_failure } -> (
         let success, output = agent ~id ~prompt ~read_only in
         let st = emit st (Agent_ran { id; success; output }) in
         let st = bind_output st id output in
-        (* An UNSUCCESSFUL agent run fails closed: it aborts the walk (mirroring
-           the schema-mismatch arm). Continuing past a failed agent would bind the
-           backend's error output and let a later always-true gate + token commit
-           despite the failure. The schema check is fail-closed and only on a
-           successful run. *)
+        (* An UNSUCCESSFUL agent run is fail-closed by default ([Abort]): it aborts
+           the walk (mirroring the schema-mismatch arm). Continuing past a failed
+           agent binds the backend's error output, but a commit is still barred —
+           the validator guarantees every commit is floor-gated, and those gates
+           read the (now-missing) output and Block. With [on_failure = Continue]
+           the failure is SOFT: the failed [Agent_ran] is recorded and its output
+           bound, and the walk CONTINUES — for a continuous loop where one
+           iteration's agent failure must not kill the run. The schema check below
+           is fail-closed and only on a successful run. *)
         if not success then begin
-          let reason =
-            Printf.sprintf
-              "agent step %S did not produce a successful structured output" id
-          in
-          let st = { st with terminal = Some (Aborted reason) } in
-          emit st (Blocked_at { id; reason })
+          match on_failure with
+          | Types.Continue -> st
+          | Types.Abort ->
+              let reason =
+                Printf.sprintf
+                  "agent step %S did not produce a successful structured output"
+                  id
+              in
+              let st = { st with terminal = Some (Aborted reason) } in
+              emit st (Blocked_at { id; reason })
         end
         else
           match output_schema with
@@ -284,24 +292,31 @@ let replay ?(max_loop_iters = default_max_loop_iters) ~trace validated =
         go st rest
   and go_step st step =
     match step with
-    | Agent { id; prompt = _; read_only = _; output_schema } -> (
+    | Agent { id; prompt = _; read_only = _; output_schema; on_failure } -> (
         match next () with
         | Agent_ran { success; output; id = rid } when rid = id -> (
             let st = emit st (Agent_ran { id; success; output }) in
             let st = bind_output st id output in
             if not success then begin
-              (* the recorded run aborted here (fail-closed); consume its
-                 Blocked_at and reproduce the Aborted outcome. *)
-              let reason =
-                Printf.sprintf
-                  "agent step %S did not produce a successful structured output"
-                  id
-              in
-              match next () with
-              | Blocked_at { id = bid; reason = _ } when bid = id ->
-                  let st = { st with terminal = Some (Aborted reason) } in
-                  emit st (Blocked_at { id; reason })
-              | _ -> raise (Replay_mismatch "agent block entry mismatch")
+              match on_failure with
+              | Types.Continue ->
+                  (* the recorded run SOFT-failed and continued: no Blocked_at was
+                     emitted, the walk proceeded. Mirror it exactly. *)
+                  st
+              | Types.Abort ->
+                  (* the recorded run aborted here (fail-closed); consume its
+                     Blocked_at and reproduce the Aborted outcome. *)
+                  let reason =
+                    Printf.sprintf
+                      "agent step %S did not produce a successful structured \
+                       output"
+                      id
+                  in
+                  (match next () with
+                  | Blocked_at { id = bid; reason = _ } when bid = id ->
+                      let st = { st with terminal = Some (Aborted reason) } in
+                      emit st (Blocked_at { id; reason })
+                  | _ -> raise (Replay_mismatch "agent block entry mismatch"))
             end
             else
               match output_schema with

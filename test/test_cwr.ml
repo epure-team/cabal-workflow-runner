@@ -19,6 +19,12 @@ let validate_ok ~floor wf =
   | Ok v -> v
   | Error e -> Alcotest.failf "expected valid workflow, got Error: %s" e
 
+(* substring test (no Str/Re dependency in this test exe). *)
+let contains_substring hay needle =
+  let nh = String.length hay and nn = String.length needle in
+  let rec at i = i + nn <= nh && (String.sub hay i nn = needle || at (i + 1)) in
+  nn = 0 || at 0
+
 let outcome_eq a b = Types.string_of_outcome a = Types.string_of_outcome b
 
 let outcome_testable =
@@ -43,7 +49,7 @@ let gated_workflow =
     steps =
       [
         Agent
-          { id = "draft"; prompt = "do work"; read_only = false; output_schema = None };
+          { id = "draft"; prompt = "do work"; read_only = false; output_schema = None; on_failure = Types.Abort };
         Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
         Commit { id = "submit" };
       ];
@@ -150,7 +156,7 @@ let branch_wf =
     name = "branchy";
     steps =
       [
-        Agent { id = "a"; prompt = "assess"; read_only = true; output_schema = None };
+        Agent { id = "a"; prompt = "assess"; read_only = true; output_schema = None; on_failure = Types.Abort };
         Branch
           {
             when_ =
@@ -158,9 +164,9 @@ let branch_wf =
                 ( Expr.Path [ "outputs"; "a"; "severity" ],
                   Expr.Lit (Expr.List [ Expr.String "high"; Expr.String "critical" ]) );
             then_ =
-              [ Agent { id = "esc"; prompt = "escalate"; read_only = false; output_schema = None } ];
+              [ Agent { id = "esc"; prompt = "escalate"; read_only = false; output_schema = None; on_failure = Types.Abort } ];
             else_ =
-              [ Agent { id = "drop"; prompt = "drop"; read_only = false; output_schema = None } ];
+              [ Agent { id = "drop"; prompt = "drop"; read_only = false; output_schema = None; on_failure = Types.Abort } ];
           };
       ];
   }
@@ -195,7 +201,7 @@ let test_schema_fail_closed () =
       steps =
         [
           Agent
-            { id = "a"; prompt = "p"; read_only = true; output_schema = Some schema };
+            { id = "a"; prompt = "p"; read_only = true; output_schema = Some schema; on_failure = Types.Abort };
           (* would commit if it got here, but the agent output lacks "severity" *)
           Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
           Commit { id = "submit" };
@@ -226,7 +232,7 @@ let test_failed_agent_fails_closed () =
       name = "failed-agent";
       steps =
         [
-          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None };
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort };
           Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
           Commit { id = "submit" };
         ];
@@ -253,6 +259,105 @@ let test_failed_agent_fails_closed () =
   let replayed = Engine.replay ~trace v in
   Alcotest.(check outcome_testable) "replay identical (Aborted)" outcome replayed
 
+(* SOFT-FAIL: an agent with on_failure=Continue that returns success=false must
+   NOT abort — the failed Agent_ran is recorded, its output bound, and the walk
+   CONTINUES to the next step. Here a failing "a" (Continue) is followed by a
+   succeeding "b"; the run reaches Completed_no_commit (no commit step), the trace
+   carries BOTH agents and NO Blocked_at/Aborted, and replay reproduces it. *)
+let test_soft_fail_agent_continues () =
+  let wf =
+    {
+      name = "soft-fail-agent";
+      steps =
+        [
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue };
+          Agent { id = "b"; prompt = "q"; read_only = false; output_schema = None; on_failure = Types.Abort };
+        ];
+    }
+  in
+  (* "a" fails, "b" succeeds *)
+  let agent ~id ~prompt:_ ~read_only:_ =
+    if id = "a" then (false, `Assoc [ ("error", `String "boom") ])
+    else (true, `Assoc [ ("ok", `Bool true) ])
+  in
+  let backend = Backend.stub ~agent () in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = Engine.run ~backend ~token:None v in
+  (match outcome with
+  | Completed_no_commit -> ()
+  | o ->
+      Alcotest.failf "expected Completed_no_commit on a soft-failed agent, got %s"
+        (Types.string_of_outcome o));
+  (* both agents ran; "a" recorded failed; no Blocked_at emitted. *)
+  let ran_a_failed =
+    List.exists
+      (function Agent_ran { id = "a"; success = false; _ } -> true | _ -> false)
+      trace
+  in
+  let ran_b_ok =
+    List.exists
+      (function Agent_ran { id = "b"; success = true; _ } -> true | _ -> false)
+      trace
+  in
+  let any_block = List.exists (function Blocked_at _ -> true | _ -> false) trace in
+  Alcotest.(check bool) "failed agent a recorded" true ran_a_failed;
+  Alcotest.(check bool) "agent b still ran (loop continued)" true ran_b_ok;
+  Alcotest.(check bool) "no Blocked_at on soft-fail" false any_block;
+  let replayed = Engine.replay ~trace v in
+  Alcotest.(check outcome_testable) "replay identical (Completed_no_commit)" outcome
+    replayed
+
+(* SOFT-FAIL + COMMIT is REJECTED at validation. on_failure=continue would let a
+   soft-failed agent reach a commit past a trivially-true floor gate (the
+   commit-floor invariant tracks gate IDs, not predicate content), so the
+   validator forbids the combination. A commit-free Continue workflow is accepted. *)
+let test_soft_fail_with_commit_rejected () =
+  let with_commit =
+    {
+      name = "soft-fail-commit";
+      steps =
+        [
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue };
+          Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
+          Commit { id = "submit" };
+        ];
+    }
+  in
+  (match Validate.workflow ~floor_gates:[ "g" ] with_commit with
+  | Error msg ->
+      Alcotest.(check bool) "error explains soft-fail+commit rejection" true
+        (contains_substring msg "commit-free workflows")
+  | Ok _ ->
+      Alcotest.fail "on_failure=continue with a Commit must be rejected");
+  (* the SAME workflow with the default abort IS accepted (sanity: it's the
+     Continue+Commit combination that's forbidden, not the commit). *)
+  let abort_commit =
+    {
+      with_commit with
+      steps =
+        [
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort };
+          Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
+          Commit { id = "submit" };
+        ];
+    }
+  in
+  (match Validate.workflow ~floor_gates:[ "g" ] abort_commit with
+  | Ok _ -> ()
+  | Error msg -> Alcotest.failf "abort+commit must be accepted, got: %s" msg);
+  (* a commit-free Continue workflow is accepted. *)
+  let commit_free =
+    {
+      name = "soft-fail-no-commit";
+      steps =
+        [ Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue } ];
+    }
+  in
+  match Validate.workflow ~floor_gates:[] commit_free with
+  | Ok _ -> ()
+  | Error msg ->
+      Alcotest.failf "commit-free continue workflow must be accepted, got: %s" msg
+
 (* ---- TEST 6 (spec): ungoverned loop rejected ---- *)
 
 let test_ungoverned_loop_rejected () =
@@ -264,7 +369,7 @@ let test_ungoverned_loop_rejected () =
           Loop
             {
               body =
-                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None } ];
+                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort } ];
               until = None;
               governors = [];
             };
@@ -327,7 +432,7 @@ let test_loop_budget_terminates () =
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None } ];
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort } ];
               (* until never holds *)
               until = Some (Expr.Lit (Expr.Bool false));
               governors = [ Budget ];
@@ -370,7 +475,7 @@ let test_loop_fixpoint_terminates () =
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None } ];
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort } ];
               until = Some (Expr.Lit (Expr.Bool false));
               governors =
                 [
@@ -419,7 +524,7 @@ let test_loop_ceiling_budget_constant () =
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None } ];
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort } ];
               until = Some (Expr.Lit (Expr.Bool false));
               governors = [ Budget ];
             };
@@ -459,7 +564,7 @@ let test_loop_ceiling_fixpoint_always_progresses () =
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None } ];
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort } ];
               until = Some (Expr.Lit (Expr.Bool false));
               governors =
                 [
@@ -501,11 +606,11 @@ let test_replay_with_loop () =
       name = "replayable";
       steps =
         [
-          Agent { id = "assess"; prompt = "p"; read_only = true; output_schema = None };
+          Agent { id = "assess"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort };
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "q"; read_only = false; output_schema = None } ];
+                [ Agent { id = "work"; prompt = "q"; read_only = false; output_schema = None; on_failure = Types.Abort } ];
               until = Some (Expr.Lit (Expr.Bool false));
               governors = [ Budget ];
             };
@@ -518,7 +623,7 @@ let test_replay_with_loop () =
                     Expr.Lit (Expr.List [ Expr.String "high" ]) );
               then_ = [ Commit { id = "submit" } ];
               else_ =
-                [ Agent { id = "noop"; prompt = "r"; read_only = true; output_schema = None } ];
+                [ Agent { id = "noop"; prompt = "r"; read_only = true; output_schema = None; on_failure = Types.Abort } ];
             };
         ];
     }
@@ -1141,7 +1246,7 @@ let test_validate_commit_one_branch_only () =
               when_ = Expr.Lit (Expr.Bool true);
               then_ = [ Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) } ];
               else_ =
-                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None } ];
+                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort } ];
             };
           Commit { id = "submit" };
         ];
@@ -1226,7 +1331,7 @@ let test_false_gate_blocks () =
       steps =
         [
           Agent
-            { id = "a"; prompt = "p"; read_only = true; output_schema = None };
+            { id = "a"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort };
           (* gate predicate is false: outputs.a.ok does not exist *)
           Gate { id = "g"; when_ = Expr.Exists [ "outputs"; "a"; "ok" ] };
           Commit { id = "submit" };
@@ -1344,7 +1449,7 @@ let test_lint_all_at_once () =
           Loop
             {
               body =
-                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None } ];
+                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort } ];
               until = None;
               governors = [];
             };
@@ -1401,12 +1506,13 @@ let test_lint_branch_one_arm_only_dangling () =
                       prompt = "p";
                       read_only = true;
                       output_schema = Some [ ("v", Schema.Int) ];
+                      on_failure = Types.Abort;
                     };
                 ];
               else_ =
                 [
                   Agent
-                    { id = "y"; prompt = "p"; read_only = true; output_schema = None };
+                    { id = "y"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort };
                 ];
             };
           (* references x.v, produced only in the then arm *)
@@ -1428,6 +1534,7 @@ let test_lint_branch_both_arms_ok () =
         prompt = "p";
         read_only = true;
         output_schema = Some [ ("v", Schema.Int) ];
+                      on_failure = Types.Abort;
       }
   in
   let wf =
@@ -1574,7 +1681,7 @@ let test_lint_generate_fix_loop () =
           Loop
             {
               body =
-                [ Agent { id = "w"; prompt = "p"; read_only = false; output_schema = None } ];
+                [ Agent { id = "w"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort } ];
               until = None;
               governors = [];
             };
@@ -1861,7 +1968,7 @@ let test_parser_accepts_underscore_metadata () =
 let parser_known_keys =
   [
     ("workflow", [ "name"; "steps" ]);
-    ("agent", [ "kind"; "id"; "prompt"; "read_only"; "output_schema" ]);
+    ("agent", [ "kind"; "id"; "prompt"; "read_only"; "output_schema"; "on_failure" ]);
     ("gate", [ "kind"; "id"; "when" ]);
     ("branch", [ "kind"; "when"; "then"; "else" ]);
     ("loop", [ "kind"; "until"; "governors"; "body" ]);
@@ -2259,7 +2366,7 @@ let test_ledger_persist_then_replay_from_file () =
       steps =
         [
           Agent
-            { id = "assess"; prompt = "p"; read_only = true; output_schema = None };
+            { id = "assess"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort };
           Run
             {
               id = "mk";
@@ -2376,6 +2483,12 @@ let () =
             `Quick test_schema_fail_closed;
           Alcotest.test_case "F1: failed agent step fails closed (Aborted)"
             `Quick test_failed_agent_fails_closed;
+          Alcotest.test_case
+            "F3: on_failure=continue soft-fails and continues (no abort)" `Quick
+            test_soft_fail_agent_continues;
+          Alcotest.test_case
+            "F4: on_failure=continue + Commit is rejected (commit-free only)"
+            `Quick test_soft_fail_with_commit_rejected;
         ] );
       ( "governed-loops",
         [

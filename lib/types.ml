@@ -45,12 +45,15 @@ module Schema = struct
     go schema
 end
 
+type on_failure = Abort | Continue
+
 type step =
   | Agent of {
       id : string;
       prompt : string;
       read_only : bool;
       output_schema : Schema.t option;
+      on_failure : on_failure;
     }
   | Gate of { id : string; when_ : Expr.t }
   | Branch of { when_ : Expr.t; then_ : step list; else_ : step list }

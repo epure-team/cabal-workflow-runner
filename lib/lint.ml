@@ -321,6 +321,22 @@ let rec any_commit steps =
       | _ -> false)
     steps
 
+(* Any agent step (anywhere in the tree) declaring [on_failure = Continue]. A
+   soft-failing agent is incompatible with a Commit: the commit-floor invariant
+   tracks only gate IDs, not whether a floor gate's PREDICATE consumes the failed
+   agent's output, so a trivially-true floor gate would let a commit fire despite
+   the soft-failed agent. We therefore forbid the combination (Error below),
+   keeping soft-fail to commit-free continuous loops. *)
+let rec any_continue_agent steps =
+  List.exists
+    (function
+      | Agent { on_failure = Types.Continue; _ } -> true
+      | Branch { then_; else_; _ } ->
+          any_continue_agent then_ || any_continue_agent else_
+      | Loop { body; _ } -> any_continue_agent body
+      | _ -> false)
+    steps
+
 (* Flag steps that follow a Commit at the same level (a commit ends the run). *)
 let rec unreachable_steps ~loc_prefix acc steps =
   let _, _seen_commit =
@@ -433,6 +449,26 @@ let check ?(floor_gates = []) (wf : Types.workflow) : diagnostic list =
   unreachable_steps ~loc_prefix:"steps" acc wf.steps;
   (* Warnings: run steps execute commands (+ destructive-command notice). *)
   run_steps ~loc_prefix:"steps" acc wf.steps;
+  (* Error: a soft-failing agent (on_failure=continue) in a workflow that can
+     Commit. The commit-floor invariant guarantees a Commit is gate-ID-preceded
+     but NOT that those gates' predicates consume the soft-failed agent's output —
+     so a trivially-true floor gate would let a commit fire despite the failure.
+     Forbid the combination: on_failure=continue is for COMMIT-FREE continuous
+     loops only. (This is what makes "continue does not weaken the commit floor"
+     a true, enforced invariant rather than an assumption about gate authoring.) *)
+  if any_commit wf.steps && any_continue_agent wf.steps then
+    acc :=
+      {
+        severity = Error;
+        code = "soft-fail-with-commit";
+        message =
+          "an agent step has on_failure=\"continue\" in a workflow that contains \
+           a Commit; soft-fail is permitted only in commit-free workflows (a \
+           soft-failed agent could otherwise reach a commit past a trivially-true \
+           floor gate)";
+        loc = "steps";
+      }
+      :: !acc;
   (* Warning: no commit at all. *)
   if not (any_commit wf.steps) then
     acc :=
