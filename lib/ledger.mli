@@ -35,3 +35,17 @@ val of_ndjson : string -> (Types.trace, string) result
     raises. Blank lines (e.g. a trailing newline) are ignored.
 
     Round-trip: [of_ndjson (to_ndjson t) = Ok t] for every [t : Types.trace]. *)
+
+val entry_to_json : Types.trace_entry -> Yojson.Safe.t
+(** Serialise a single {!Types.trace_entry} to a JSON object tagged by a
+    ["kind"] field.  Used by [bin/] to write the [Ctx_snapshot] header as the
+    first NDJSON line of an on-disk ledger. Never raises. *)
+
+val entry_of_json : Yojson.Safe.t -> Types.trace_entry
+(** Deserialise a single JSON object back to a {!Types.trace_entry}.
+    Raises {!Decode_error} on any structural mismatch.  Used by [bin/] to
+    parse the [Ctx_snapshot] header from the first line of an on-disk ledger.
+    Callers must guard with [try ... with Decode_error _ | Yojson.Json_error _ -> ...]. *)
+
+exception Decode_error of string
+(** Raised by {!entry_of_json} on a structural mismatch. *)

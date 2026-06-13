@@ -6,6 +6,17 @@ open Types
 
 let verdict_to_json = function Pass -> `String "pass" | Fail -> `String "fail"
 
+let outcome_to_json = function
+  | Committed { id; token_digest } ->
+      `Assoc [ ("kind", `String "committed"); ("id", `String id);
+               ("token_digest", `String token_digest) ]
+  | Completed_no_commit ->
+      `Assoc [ ("kind", `String "completed_no_commit") ]
+  | Blocked reason ->
+      `Assoc [ ("kind", `String "blocked"); ("reason", `String reason) ]
+  | Aborted reason ->
+      `Assoc [ ("kind", `String "aborted"); ("reason", `String reason) ]
+
 let file_change_kind_to_json k = `String (string_of_file_change_kind k)
 
 let file_change_to_json (fc : file_change) : Yojson.Safe.t =
@@ -27,7 +38,7 @@ let run_result_to_json (r : run_result) : Yojson.Safe.t =
       ("files", `List (List.map file_change_to_json r.files));
     ]
 
-let entry_to_json (e : trace_entry) : Yojson.Safe.t =
+let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
   let tagged kind fields = `Assoc (("kind", `String kind) :: fields) in
   match e with
   | Agent_ran { id; success; output } ->
@@ -53,6 +64,25 @@ let entry_to_json (e : trace_entry) : Yojson.Safe.t =
         [ ("id", `String id); ("token_digest", `String token_digest) ]
   | Blocked_at { id; reason } ->
       tagged "blocked_at" [ ("id", `String id); ("reason", `String reason) ]
+  | Parallel_started -> tagged "parallel_started" []
+  | Parallel_branch_completed { branch_idx; trace; outcome; branch_outputs } ->
+      tagged "parallel_branch_completed"
+        [ ("branch_idx", `Int branch_idx);
+          ("trace", `List (List.map entry_to_json trace));
+          ("outcome", outcome_to_json outcome);
+          ("branch_outputs", `Assoc branch_outputs) ]
+  | Parallel_completed { outcome } ->
+      tagged "parallel_completed" [ ("outcome", outcome_to_json outcome) ]
+  | Foreach_iter_started { index; element } ->
+      tagged "foreach_iter_started"
+        [ ("index", `Int index); ("element", element) ]
+  | Foreach_iter_completed { index; outcome } ->
+      tagged "foreach_iter_completed"
+        [ ("index", `Int index); ("outcome", outcome_to_json outcome) ]
+  | Foreach_completed { iterations } ->
+      tagged "foreach_completed" [ ("iterations", `Int iterations) ]
+  | Ctx_snapshot { ctx } ->
+      tagged "ctx_snapshot" [ ("ctx", `Assoc ctx) ]
 
 (* [Yojson.Safe.to_string] emits no embedded newline for a single object, so one
    object per line is well-formed NDJSON. Each line is newline-terminated. *)
@@ -132,7 +162,17 @@ let dec_run_result json =
     files;
   }
 
-let entry_of_json (json : Yojson.Safe.t) : trace_entry =
+let outcome_of_json json =
+  match dec_string "kind" json with
+  | "committed" ->
+      Committed { id = dec_string "id" json;
+                  token_digest = dec_string "token_digest" json }
+  | "completed_no_commit" -> Completed_no_commit
+  | "blocked" -> Blocked (dec_string "reason" json)
+  | "aborted" -> Aborted (dec_string "reason" json)
+  | other -> err "unknown outcome kind %S" other
+
+let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
   match dec_string "kind" json with
   | "agent_ran" ->
       Agent_ran
@@ -165,6 +205,38 @@ let entry_of_json (json : Yojson.Safe.t) : trace_entry =
         }
   | "blocked_at" ->
       Blocked_at { id = dec_string "id" json; reason = dec_string "reason" json }
+  | "parallel_started" -> Parallel_started
+  | "parallel_branch_completed" ->
+      let branch_idx = dec_int "branch_idx" json in
+      let trace =
+        match assoc_field "trace" json with
+        | `List l -> List.map entry_of_json l
+        | _ -> err "field \"trace\" must be a list"
+      in
+      let outcome = outcome_of_json (assoc_field "outcome" json) in
+      let branch_outputs =
+        match assoc_field "branch_outputs" json with
+        | `Assoc fields -> fields
+        | _ -> err "field \"branch_outputs\" must be an object"
+      in
+      Parallel_branch_completed { branch_idx; trace; outcome; branch_outputs }
+  | "parallel_completed" ->
+      let outcome = outcome_of_json (assoc_field "outcome" json) in
+      Parallel_completed { outcome }
+  | "foreach_iter_started" ->
+      Foreach_iter_started
+        { index = dec_int "index" json; element = assoc_field "element" json }
+  | "foreach_iter_completed" ->
+      let outcome = outcome_of_json (assoc_field "outcome" json) in
+      Foreach_iter_completed { index = dec_int "index" json; outcome }
+  | "foreach_completed" ->
+      Foreach_completed { iterations = dec_int "iterations" json }
+  | "ctx_snapshot" ->
+      let ctx = match assoc_field "ctx" json with
+        | `Assoc fields -> fields
+        | _ -> err "field \"ctx\" must be an object"
+      in
+      Ctx_snapshot { ctx }
   | other -> err "unknown entry kind %S" other
 
 (* Split on '\n'; ignore blank lines (so a trailing newline is fine). Any line

@@ -70,13 +70,15 @@ type step =
       observe : string list option;
     }
   | Commit of { id : string }
+  | Parallel of { branches : step list list }
+  | Foreach of { over : string; steps : step list }
 
 and governor =
   | Max_iters of int
   | Budget
   | Fixpoint of { window : int; progress : Expr.t }
 
-type workflow = { name : string; steps : step list }
+type workflow = { name : string; steps : step list; version : string option }
 
 type gate_verdict =
   | Pass
@@ -156,6 +158,25 @@ type trace_entry =
           replay re-binds it WITHOUT re-executing the command. *)
   | Committed_step of { id : string; token_digest : string }
   | Blocked_at of { id : string; reason : string }
+  | Parallel_started
+  | Parallel_branch_completed of {
+      branch_idx : int;
+      trace : trace_entry list;
+      outcome : outcome;
+      branch_outputs : (string * Yojson.Safe.t) list;
+          (** Snapshot of ctx["outputs"] at branch completion; used by replay
+              to reconstruct host ctx without re-walking the sub-trace. *)
+    }
+  | Parallel_completed of { outcome : outcome }
+  | Foreach_iter_started of { index : int; element : Yojson.Safe.t }
+  | Foreach_iter_completed of { index : int; outcome : outcome }
+  | Foreach_completed of { iterations : int }
+  | Ctx_snapshot of { ctx : (string * Yojson.Safe.t) list }
+      (** Ledger-layer header recording the initial_ctx that was passed to
+          [Engine.run]. Written as the FIRST line of an on-disk ledger so that
+          [replay --ledger file] can reconstruct the same initial context.
+          NOT emitted by the engine and NOT fed to [Engine.replay] as a trace
+          entry — it is stripped by [cmd_replay] before parsing the trace. *)
 
 type trace = trace_entry list
 

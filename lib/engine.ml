@@ -78,8 +78,8 @@ let path_bearing_head = function
   | head :: _ -> String.contains head '/'
   | [] -> false
 
-let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
-    ~backend ~token validated =
+let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initial_ctx = [])
+    ~sw:(_sw : Eio.Switch.t) ~backend ~token validated =
   let wf = Validate.Validated.workflow validated in
   let agent ~id ~prompt ~read_only =
     backend.Backend.run_agent ~id ~prompt ~read_only
@@ -202,6 +202,123 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
           let st = emit st (Blocked_at { id; reason }) in
           { st with terminal = Some (Blocked reason) }
         end
+    | Foreach { over; steps = body } -> (
+        match List.assoc_opt over st.ctx with
+        | Some (`List items) ->
+            let prior_item = List.assoc_opt "item" st.ctx in
+            let (st, n) = List.fold_left (fun (st, i) element ->
+              if st.terminal <> None then (st, i + 1)
+              else
+                let st = emit st (Foreach_iter_started { index = i; element }) in
+                (* bind the current element as ctx["item"] *)
+                let st = bind st "item" element in
+                let st = go st body in
+                let outcome = match st.terminal with
+                  | Some o -> o
+                  | None -> Completed_no_commit
+                in
+                let st = emit st (Foreach_iter_completed { index = i; outcome }) in
+                (st, i + 1)
+            ) (st, 0) items in
+            (* Restore item binding that existed before this foreach (or remove it) *)
+            let st = match prior_item with
+              | Some v -> bind st "item" v
+              | None -> { st with ctx = List.remove_assoc "item" st.ctx }
+            in
+            emit st (Foreach_completed { iterations = n })
+        | Some other ->
+            let msg = Printf.sprintf "foreach.over=%S is not a JSON array (got %s)"
+              over (Yojson.Safe.to_string other) in
+            { st with terminal = Some (Blocked msg) }
+        | None ->
+            let msg = Printf.sprintf "foreach.over=%S not found in ctx" over in
+            { st with terminal = Some (Blocked msg) })
+    | Parallel { branches } ->
+        let n = List.length branches in
+        (* None = branch was cancelled before completing *)
+        let results : (Types.outcome * Types.trace * (string * Yojson.Safe.t) list) option array =
+          Array.make n None in
+        let st = emit st Parallel_started in
+        (* Run all branches concurrently via Eio fibers. Cancel-all on first abort. *)
+        (try
+          Eio.Switch.run (fun branch_sw ->
+            List.iteri (fun i branch_steps ->
+              Eio.Fiber.fork ~sw:branch_sw (fun () ->
+                let branch_st = { st with rev_trace = [] } in
+                let branch_st =
+                  (try go branch_st branch_steps
+                   with
+                   | Eio.Cancel.Cancelled _ as e -> raise e
+                   | exn ->
+                       { branch_st with
+                         terminal = Some (Aborted (Printexc.to_string exn)) })
+                in
+                let outcome = match branch_st.terminal with
+                  | Some o -> o
+                  | None -> Completed_no_commit
+                in
+                let trace = List.rev branch_st.rev_trace in
+                results.(i) <- Some (outcome, trace, branch_st.ctx);
+                (* Signal sibling cancellation on branch failure *)
+                (match outcome with
+                 | Aborted _ | Blocked _ -> Eio.Switch.fail branch_sw Exit
+                 | _ -> ()))
+            ) branches
+          )
+        with Exit -> ());  (* expected cancellation signal *)
+        (* Fill any slots that were cancelled before completing *)
+        Array.iteri (fun i slot ->
+          if slot = None then
+            results.(i) <- Some (Aborted "cancelled-by-sibling", [], [])
+        ) results;
+        (* Emit one Parallel_branch_completed per branch in index order.
+           Store branch_outputs so replay can reconstruct ctx without re-walking. *)
+        let st = Array.fold_left (fun (st, i) result_opt ->
+          let (outcome, trace, branch_ctx) = Option.get result_opt in
+          let branch_outputs =
+            match List.assoc_opt "outputs" branch_ctx with
+            | Some (`Assoc fields) -> fields
+            | _ -> []
+          in
+          let st = emit st (Parallel_branch_completed { branch_idx = i; trace; outcome; branch_outputs }) in
+          (st, i + 1)
+        ) (st, 0) results |> fst in
+        (* Deep-merge outputs from all branches into host ctx.
+           Each branch may have written to "outputs"; we merge them all in. *)
+        let st = Array.fold_left (fun st result_opt ->
+          let (_outcome, _trace, branch_ctx) = Option.get result_opt in
+          match List.assoc_opt "outputs" branch_ctx with
+          | None -> st
+          | Some (`Assoc branch_outputs) ->
+              let prior =
+                match List.assoc_opt "outputs" st.ctx with
+                | Some (`Assoc fields) -> fields
+                | _ -> []
+              in
+              let merged = List.fold_left (fun acc (k, v) ->
+                (k, v) :: List.remove_assoc k acc
+              ) prior branch_outputs in
+              bind st "outputs" (`Assoc merged)
+          | Some _ -> st  (* malformed; skip *)
+        ) st results in
+        (* Compute worst outcome across all branches *)
+        let worst = Array.fold_left (fun acc result_opt ->
+          let (outcome, _, _) = Option.get result_opt in
+          match (acc, outcome) with
+          | Aborted r, _ -> Aborted r
+          | _, Aborted r -> Aborted r
+          | Blocked r, _ -> Blocked r
+          | _, Blocked r -> Blocked r
+          | Committed _ as c, _ -> c
+          | _, (Committed _ as c) -> c
+          | Completed_no_commit, Completed_no_commit -> Completed_no_commit
+        ) Completed_no_commit results in
+        let st = match worst with
+          | Aborted _ | Blocked _ ->
+              { st with terminal = Some worst }
+          | _ -> st
+        in
+        emit st (Parallel_completed { outcome = worst })
   (* Governed loop. Per iteration: bind loop.iter, run body, then stop if
      [until] holds OR any governor fires. The bound is a pure function of
      recorded inputs (agent outputs, budget readings, fixpoint verdicts), so the
@@ -262,7 +379,7 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
     in
     iter st 0
   in
-  finish (go { rev_trace = []; ctx = []; terminal = None } wf.steps)
+  finish (go { rev_trace = []; ctx = initial_ctx; terminal = None } wf.steps)
 
 (* ------------------------------------------------------------------ *)
 (* replay: re-interpret from the recorded trace, no backend consulted. *)
@@ -270,7 +387,8 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
 
 exception Replay_mismatch of string
 
-let replay ?(max_loop_iters = default_max_loop_iters) ~trace validated =
+let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = []) ~sw:(_sw : Eio.Switch.t)
+    ~trace validated =
   let wf = Validate.Validated.workflow validated in
   let pending = ref trace in
   let next () =
@@ -382,6 +500,109 @@ let replay ?(max_loop_iters = default_max_loop_iters) ~trace validated =
             let st = emit st (Blocked_at { id; reason }) in
             { st with terminal = Some (Blocked reason) }
         | _ -> raise (Replay_mismatch "commit entry mismatch"))
+    | Foreach { over; steps = body } -> (
+        (* Consume Parallel_started is wrong here — consume Foreach markers.
+           The global [pending] ref is walked in iteration order:
+             Foreach_iter_started{index=0; element=...}
+             <body sub-trace for iteration 0>
+             Foreach_iter_completed{index=0; outcome=...}
+             ...
+             Foreach_completed{iterations=N}
+           We check whether the ctx key was an array and act accordingly. *)
+        match List.assoc_opt over st.ctx with
+        | Some (`List items) ->
+            let prior_item = List.assoc_opt "item" st.ctx in
+            let st, n = List.fold_left (fun (st, i) element ->
+              match next () with
+              | Foreach_iter_started { index = ri; element = re } when ri = i ->
+                  if re <> element then
+                    raise (Replay_mismatch "foreach element mismatch");
+                  let st = emit st (Foreach_iter_started { index = i; element }) in
+                  let st = bind st "item" element in
+                  let st = go st body in
+                  let outcome = match st.terminal with
+                    | Some o -> o
+                    | None -> Completed_no_commit
+                  in
+                  (match next () with
+                   | Foreach_iter_completed { index = ri; outcome = ro } when ri = i ->
+                       if ro <> outcome then
+                         raise (Replay_mismatch "foreach iter outcome mismatch");
+                       let st = emit st (Foreach_iter_completed { index = i; outcome }) in
+                       (st, i + 1)
+                   | _ -> raise (Replay_mismatch "foreach_iter_completed entry mismatch"))
+              | _ -> raise (Replay_mismatch "foreach_iter_started entry mismatch")
+            ) (st, 0) items in
+            (* Restore item binding that existed before this foreach (or remove it) *)
+            let st = match prior_item with
+              | Some v -> bind st "item" v
+              | None -> { st with ctx = List.remove_assoc "item" st.ctx }
+            in
+            (match next () with
+             | Foreach_completed { iterations = ri } when ri = n ->
+                 emit st (Foreach_completed { iterations = n })
+             | _ -> raise (Replay_mismatch "foreach_completed entry mismatch"))
+        | Some other ->
+            (* Non-array value: run set Blocked; reproduce it here. *)
+            let msg = Printf.sprintf "foreach.over=%S is not a JSON array (got %s)"
+              over (Yojson.Safe.to_string other) in
+            { st with terminal = Some (Blocked msg) }
+        | None ->
+            (* Missing key: run set Blocked; reproduce it here. *)
+            let msg = Printf.sprintf "foreach.over=%S not found in ctx" over in
+            { st with terminal = Some (Blocked msg) })
+    | Parallel { branches } -> (
+        (* Consume: Parallel_started,
+                   Parallel_branch_completed{branch_idx=0; trace=[...]; outcome}
+                   ...
+                   Parallel_branch_completed{branch_idx=n-1; ...}
+                   Parallel_completed{outcome}
+           Each branch's sub-trace is replayed using a LOCAL ref, not pending. *)
+        match next () with
+        | Parallel_started ->
+            let st = emit st Parallel_started in
+            let n = List.length branches in
+            (* Replay each branch using its embedded sub-trace. *)
+            let st, worst = List.fold_left (fun (st, worst) (i, branch_steps) ->
+              match next () with
+              | Parallel_branch_completed { branch_idx = ri; trace; outcome; branch_outputs } when ri = i ->
+                  let _ = branch_steps in  (* sub-trace already encodes branch body *)
+                  let st = emit st (Parallel_branch_completed { branch_idx = i; trace; outcome; branch_outputs }) in
+                  (* Restore branch outputs into host ctx using the stored snapshot. *)
+                  let st =
+                    if branch_outputs = [] then st
+                    else
+                      let prior =
+                        match List.assoc_opt "outputs" st.ctx with
+                        | Some (`Assoc fields) -> fields
+                        | _ -> []
+                      in
+                      let merged = List.fold_left (fun acc (k, v) ->
+                        (k, v) :: List.remove_assoc k acc
+                      ) prior branch_outputs in
+                      bind st "outputs" (`Assoc merged)
+                  in
+                  let worst = match (worst, outcome) with
+                    | Aborted r, _ | _, Aborted r -> Aborted r
+                    | Blocked r, _ | _, Blocked r -> Blocked r
+                    | Committed _ as c, _ | _, (Committed _ as c) -> c
+                    | Completed_no_commit, Completed_no_commit -> Completed_no_commit
+                  in
+                  (st, worst)
+              | _ -> raise (Replay_mismatch
+                  (Printf.sprintf "parallel_branch_completed[%d] mismatch" i))
+            ) (st, Completed_no_commit) (List.mapi (fun i b -> (i, b)) branches) in
+            let st = match worst with
+              | Aborted _ | Blocked _ ->
+                  { st with terminal = Some worst }
+              | _ -> st
+            in
+            let _ = n in
+            (match next () with
+             | Parallel_completed { outcome = ro } when ro = worst ->
+                 emit st (Parallel_completed { outcome = worst })
+             | _ -> raise (Replay_mismatch "parallel_completed entry mismatch"))
+        | _ -> raise (Replay_mismatch "parallel_started entry mismatch"))
   and replay_loop st body until governors =
     let fixpoint_counts = Array.make (List.length governors) 0 in
     let rec iter st index =
@@ -460,7 +681,7 @@ let replay ?(max_loop_iters = default_max_loop_iters) ~trace validated =
     iter st 0
   in
   let outcome, _trace =
-    finish (go { rev_trace = []; ctx = []; terminal = None } wf.steps)
+    finish (go { rev_trace = []; ctx = initial_ctx; terminal = None } wf.steps)
   in
   (* The walk must have consumed the WHOLE trace: a trace that is a valid prefix
      followed by extra (garbage) entries must NOT replay successfully. *)

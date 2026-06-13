@@ -36,7 +36,25 @@ let print_trace trace =
       | Types.Committed_step { id; token_digest } ->
           Printf.printf "  commit   %-16s token_digest=%s\n" id token_digest
       | Types.Blocked_at { id; reason } ->
-          Printf.printf "  block    %-16s %s\n" id reason)
+          Printf.printf "  block    %-16s %s\n" id reason
+      | Types.Parallel_started ->
+          Printf.printf "  parallel started\n"
+      | Types.Parallel_branch_completed { branch_idx; outcome; trace = _; branch_outputs = _ } ->
+          Printf.printf "  parallel branch[%d] %s\n" branch_idx
+            (Types.string_of_outcome outcome)
+      | Types.Parallel_completed { outcome } ->
+          Printf.printf "  parallel completed %s\n"
+            (Types.string_of_outcome outcome)
+      | Types.Foreach_iter_started { index; element } ->
+          Printf.printf "  foreach  iter=%d element=%s\n" index
+            (Yojson.Safe.to_string element)
+      | Types.Foreach_iter_completed { index; outcome } ->
+          Printf.printf "  foreach  iter=%d %s\n" index
+            (Types.string_of_outcome outcome)
+      | Types.Foreach_completed { iterations } ->
+          Printf.printf "  foreach  completed %d iter(s)\n" iterations
+      | Types.Ctx_snapshot _ ->
+          (* ledger-layer header, never appears in an engine trace *) ())
     trace
 
 (* ---- validate subcommand ---- *)
@@ -89,7 +107,7 @@ let cmd_schema () =
 
 (* ---- run subcommand ---- *)
 
-let cmd_run file floor_gates approve allow_run ledger =
+let cmd_run file floor_gates approve allow_run ledger ctx_json =
   match load_and_validate ~floor_gates file with
   | Error e ->
       Printf.eprintf "%s\n" e;
@@ -99,9 +117,21 @@ let cmd_run file floor_gates approve allow_run ledger =
           Eio.Switch.run (fun sw ->
               let cwd = Sys.getcwd () in
               let backend = Backend_cabal.make ~sw ~env ~working_dir:cwd in
+              let initial_ctx = match ctx_json with
+                | None -> []
+                | Some raw ->
+                    (match Yojson.Safe.from_string raw with
+                     | `Assoc fields -> fields
+                     | _ ->
+                         Printf.eprintf "--ctx must be a JSON object\n";
+                         exit 1
+                     | exception Yojson.Json_error msg ->
+                         Printf.eprintf "--ctx parse error: %s\n" msg;
+                         exit 1)
+              in
               let outcome, trace =
-                Engine.run ~run_allowlist:allow_run ~backend ~token:approve
-                  validated
+                Engine.run ~sw ~run_allowlist:allow_run ~backend ~token:approve
+                  ~initial_ctx validated
               in
               Printf.printf "outcome: %s\ntrace:\n"
                 (Types.string_of_outcome outcome);
@@ -116,6 +146,10 @@ let cmd_run file floor_gates approve allow_run ledger =
                      effects already happened. *)
                   try
                     Out_channel.with_open_bin path (fun oc ->
+                        let header = Ledger.entry_to_json
+                          (Types.Ctx_snapshot { ctx = initial_ctx }) in
+                        Out_channel.output_string oc
+                          (Yojson.Safe.to_string header ^ "\n");
                         Out_channel.output_string oc (Ledger.to_ndjson trace));
                     Printf.printf "ledger written: %s\n" path
                   with Sys_error msg ->
@@ -142,24 +176,61 @@ let cmd_replay file floor_gates ledger =
       | Error msg ->
           Printf.eprintf "cannot read ledger: %s\n" msg;
           1
-      | Ok raw -> (
-          match Ledger.of_ndjson raw with
+      | Ok contents -> (
+          (* Split into lines; the FIRST non-empty line may be a Ctx_snapshot
+             header (written by cmd_run since v0.11). Strip it and recover
+             initial_ctx. Legacy ledgers without the header fall through with
+             empty initial_ctx and all lines fed to of_ndjson. *)
+          let lines = String.split_on_char '\n' contents
+                      |> List.filter (fun s -> String.trim s <> "") in
+          let initial_ctx, trace_lines =
+            match lines with
+            | first :: rest -> (
+                match Ledger.entry_of_json (Yojson.Safe.from_string first) with
+                | Types.Ctx_snapshot { ctx } -> (ctx, rest)
+                | _ -> ([], lines)
+                | exception _ -> ([], lines))
+            | [] -> ([], [])
+          in
+          let trace_str = String.concat "\n" trace_lines in
+          match Ledger.of_ndjson trace_str with
           | Error e ->
               Printf.eprintf "corrupt ledger: %s\n" e;
               1
-          | Ok trace -> (
+          | Ok trace ->
               (* Re-feed the recorded trace; NO backend is consulted and no
                  command is ever dispatched/executed (same as in-memory replay).
                  A workflow/ledger mismatch surfaces as Replay_mismatch. *)
-              match Engine.replay ~trace validated with
-              | outcome ->
-                  Printf.printf "replayed outcome: %s\ntrace:\n"
-                    (Types.string_of_outcome outcome);
-                  print_trace trace;
-                  0
-              | exception Engine.Replay_mismatch reason ->
-                  Printf.eprintf "replay mismatch: %s\n" reason;
-                  2)))
+              let result = ref 0 in
+              Eio_main.run (fun _env ->
+                Eio.Switch.run (fun sw ->
+                  match Engine.replay ~sw ~trace ~initial_ctx validated with
+                  | outcome ->
+                      Printf.printf "replayed outcome: %s\ntrace:\n"
+                        (Types.string_of_outcome outcome);
+                      print_trace trace
+                  | exception Engine.Replay_mismatch reason ->
+                      Printf.eprintf "replay mismatch: %s\n" reason;
+                      result := 2));
+              !result))
+
+(* ---- to-claude-workflow subcommand ---- *)
+
+let cmd_to_claude_workflow file =
+  match Workflow_json.of_file file with
+  | Error e ->
+      Printf.eprintf "parse error: %s\n" e;
+      1
+  | Ok wf ->
+      let js, notes = Compiler.compile_workflow wf in
+      print_string js;
+      if notes <> [] then begin
+        Printf.eprintf "\nCompilation notes (%d):\n" (List.length notes);
+        List.iter (fun (n : Compiler.note) ->
+          Printf.eprintf "  [%s] %s\n" n.kind n.description
+        ) notes
+      end;
+      0
 
 (* ---- cmdliner wiring ---- *)
 
@@ -235,12 +306,20 @@ let ledger_arg =
            byte-identically with the 'replay' subcommand, in a separate \
            process. The ledger is runtime output, never workflow input.")
 
+let ctx_arg =
+  Arg.(
+    value
+    & opt (some string) None
+    & info [ "ctx" ] ~docv:"JSON"
+        ~doc:
+          "Pre-populate the run context with a top-level JSON object.            Each top-level key becomes a bare ctx key accessible to            foreach.over and expressions. Absent => empty context.")
+
 let run_cmd =
   let doc = "Run a workflow deterministically, dispatching agents via cabal." in
   Cmd.v (Cmd.info "run" ~doc)
     Term.(
       const cmd_run $ file_arg $ floor_arg $ approve_arg $ allow_run_arg
-      $ ledger_arg)
+      $ ledger_arg $ ctx_arg)
 
 let replay_ledger_arg =
   Arg.(
@@ -271,11 +350,22 @@ let schema_cmd =
   in
   Cmd.v (Cmd.info "schema" ~doc) Term.(const cmd_schema $ const ())
 
+let to_claude_workflow_cmd =
+  let doc =
+    "Compile a CWR workflow JSON file to Claude Workflow JavaScript. One-way \
+     compiler only (CWR → JS). Outputs the compiled JS to stdout and prints \
+     compilation notes (steps with no direct JS equivalent) to stderr."
+  in
+  Cmd.v
+    (Cmd.info "to-claude-workflow" ~doc)
+    Term.(const cmd_to_claude_workflow $ file_arg)
+
 let () =
   let doc = "Deterministic workflow engine on cabal." in
   let info = Cmd.info "cabal-workflow-runner" ~version:"0.11.0" ~doc in
   let group =
     Cmd.group info
-      [ lint_cmd; validate_cmd; run_cmd; replay_cmd; schema_cmd ]
+      [ lint_cmd; validate_cmd; run_cmd; replay_cmd; schema_cmd;
+        to_claude_workflow_cmd ]
   in
   exit (Cmd.eval' group)

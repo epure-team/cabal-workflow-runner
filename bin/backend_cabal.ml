@@ -117,9 +117,11 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
      records every [Budget_read] in the trace and replay re-feeds the recorded
      values (replay never calls this). *)
   let budget_counter = ref (initial_budget ()) in
+  let budget_mutex = Eio.Mutex.create () in
   let budget () =
-    decr budget_counter;
-    !budget_counter
+    Eio.Mutex.use_rw ~protect:true budget_mutex (fun () ->
+      decr budget_counter;
+      !budget_counter)
   in
   let select () =
     match Sys.getenv_opt "CWR_BACKEND" with

@@ -16,6 +16,8 @@
 val run :
   ?max_loop_iters:int ->
   ?run_allowlist:string list ->
+  ?initial_ctx:(string * Yojson.Safe.t) list ->
+  sw:Eio.Switch.t ->
   backend:Backend.t ->
   token:string option ->
   Validate.Validated.t ->
@@ -71,7 +73,12 @@ exception Replay_mismatch of string
     valid prefix followed by garbage does NOT replay successfully). *)
 
 val replay :
-  ?max_loop_iters:int -> trace:Types.trace -> Validate.Validated.t -> Types.outcome
+  ?max_loop_iters:int ->
+  ?initial_ctx:(string * Yojson.Safe.t) list ->
+  sw:Eio.Switch.t ->
+  trace:Types.trace ->
+  Validate.Validated.t ->
+  Types.outcome
 (** [replay ?max_loop_iters ~trace validated] re-interprets [validated] re-feeding
     the RECORDED agent outputs and budget readings in [trace] (no backend is
     consulted), re-evaluating the total DSL over the rebuilt context and asserting

@@ -102,6 +102,13 @@ type step =
           from absolute paths in its args; the allowlist is the trust control. *)
   | Commit of { id : string }
       (** The ONLY step that can file/submit. Requires a runtime token. *)
+  | Parallel of { branches : step list list }
+      (** Run multiple step-list branches concurrently via Eio fibers.
+          Requires >= 2 branches (parser rejects fewer). All branches run
+          concurrently; on first abort, remaining branches are cancelled. *)
+  | Foreach of { over : string; steps : step list }
+      (** Iterate over the JSON array at [ctx[over]], running [steps] once per
+          element (bound as [ctx["item"]]). Sequential, not concurrent. *)
 
 (** A loop governor — each can independently fire to stop the loop. *)
 and governor =
@@ -111,7 +118,13 @@ and governor =
       (** stop after [window] consecutive iterations with [progress = false]
           ([window >= 1]). *)
 
-type workflow = { name : string; steps : step list }
+type workflow = {
+  name : string;
+  steps : step list;
+  version : string option;
+      (** Optional workflow format version. ["1.0"] is the canonical version for
+          workflows using parallel or foreach steps. Absent => pre-1.0 / unversioned. *)
+}
 
 type gate_verdict =
   | Pass
@@ -183,6 +196,31 @@ type trace_entry =
           exactly once, on the live run, never on replay). *)
   | Committed_step of { id : string; token_digest : string }
   | Blocked_at of { id : string; reason : string }
+  | Parallel_started
+      (** Records the start of a parallel step execution. *)
+  | Parallel_branch_completed of {
+      branch_idx : int;
+      trace : trace_entry list;
+      outcome : outcome;
+      branch_outputs : (string * Yojson.Safe.t) list;
+    }
+      (** Records the outcome, sub-trace, and output snapshot of one branch.
+          [branch_outputs] is the ctx["outputs"] assoc at branch completion;
+          replay uses it to reconstruct host ctx without re-walking the sub-trace. *)
+  | Parallel_completed of { outcome : outcome }
+      (** Records the overall outcome of a parallel step after all branches finish. *)
+  | Foreach_iter_started of { index : int; element : Yojson.Safe.t }
+      (** Records the start of one foreach iteration. *)
+  | Foreach_iter_completed of { index : int; outcome : outcome }
+      (** Records the outcome of one foreach iteration. *)
+  | Foreach_completed of { iterations : int }
+      (** Records completion of a foreach step with the number of iterations run. *)
+  | Ctx_snapshot of { ctx : (string * Yojson.Safe.t) list }
+      (** Ledger-layer header recording the initial_ctx that was passed to
+          {!Engine.run}. Written as the FIRST line of an on-disk ledger so that
+          [replay --ledger file] can reconstruct the same initial context.
+          NOT emitted by the engine and NOT fed to {!Engine.replay} as a trace
+          entry — it is stripped by [cmd_replay] before parsing the trace. *)
 
 type trace = trace_entry list
 (** Trace entries in execution order (first executed step first). *)
