@@ -98,7 +98,7 @@ jobs:
           opam exec -- dune build bin/main.exe
           ARCH=$(uname -m)
           BIN="cabal-workflow-runner-macos-$ARCH"
-          cp _build/default/bin/main.exe "$BIN"
+          install -m 755 _build/default/bin/main.exe "$BIN"
           strip "$BIN"
 
       - uses: actions/upload-artifact@v4
