@@ -2,3 +2,9 @@
  (name main)
  (public_name cabal-workflow-runner)
  (libraries cabal_workflow_runner cabal eio_main cmdliner yojson unix))
+
+; --profile static: fully static binary via musl (Linux only).
+; Not applied by default so macOS builds are unaffected.
+(env
+ (static
+  (link_flags (-ccopt -static))))

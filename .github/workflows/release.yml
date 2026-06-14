@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Each build job produces one binary artifact.
+# The final "release" job collects them all and publishes a GitHub release.
+
+jobs:
+
+  # ── Linux amd64 ──────────────────────────────────────────────────────────
+  # Builds inside an Alpine/musl Docker container for a truly static binary.
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binary (Alpine / musl)
+        run: |
+          docker run --rm \
+            --user 0:0 \
+            -e OPAMROOTISOK=1 \
+            -e OPAMROOT=/home/opam/.opam \
+            -e HOME=/root \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            ocaml/opam:alpine-3.21-ocaml-5.3 \
+            sh -c '
+              set -ex
+              apk add --no-cache git musl-dev liburing-dev pkgconf
+              git config --global --add safe.directory /workspace
+              opam update -u --yes
+              opam pin add -n cabal https://github.com/epure-team/cabal.git --yes
+              opam install . --deps-only --yes
+              opam exec -- dune build --profile static bin/main.exe
+              cp _build/default/bin/main.exe cabal-workflow-runner-linux-amd64
+              strip cabal-workflow-runner-linux-amd64
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: cabal-workflow-runner-linux-amd64
+
+  # ── Linux arm64 ──────────────────────────────────────────────────────────
+  # Same approach, native arm64 runner so no QEMU overhead.
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binary (Alpine / musl)
+        run: |
+          docker run --rm \
+            --user 0:0 \
+            -e OPAMROOTISOK=1 \
+            -e OPAMROOT=/home/opam/.opam \
+            -e HOME=/root \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            ocaml/opam:alpine-3.21-ocaml-5.3 \
+            sh -c '
+              set -ex
+              apk add --no-cache git musl-dev liburing-dev pkgconf
+              git config --global --add safe.directory /workspace
+              opam update -u --yes
+              opam pin add -n cabal https://github.com/epure-team/cabal.git --yes
+              opam install . --deps-only --yes
+              opam exec -- dune build --profile static bin/main.exe
+              cp _build/default/bin/main.exe cabal-workflow-runner-linux-arm64
+              strip cabal-workflow-runner-linux-arm64
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: cabal-workflow-runner-linux-arm64
+
+  # ── macOS (self-hosted: ladon) ────────────────────────────────────────────
+  # No fully-static linking on macOS; produces a binary linked only against
+  # system frameworks (universally available). Arch detected at build time.
+  build-macos:
+    runs-on: [self-hosted, macos]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin cabal and install deps
+        run: |
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          opam pin add -n cabal https://github.com/epure-team/cabal.git --yes
+          opam install . --deps-only --yes
+
+      - name: Build
+        run: |
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          opam exec -- dune build bin/main.exe
+          ARCH=$(uname -m)
+          BIN="cabal-workflow-runner-macos-$ARCH"
+          cp _build/default/bin/main.exe "$BIN"
+          strip "$BIN"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: cabal-workflow-runner-macos-*
+
+  # ── Publish release ───────────────────────────────────────────────────────
+  release:
+    needs: [build-linux-amd64, build-linux-arm64, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
