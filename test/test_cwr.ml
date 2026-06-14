@@ -2911,14 +2911,292 @@ let test_compiler_gate_commit_steps () =
           Commit { id = "submit" } ] }
   in
   let js, notes = Compiler.compile_workflow wf in
-  Alcotest.(check bool) "gate: CWR gate comment" true
-    (contains_substring js "[CWR gate:");
+  (* Gate now compiles faithfully: if (!(true)) { throw ... } — no [CWR gate:] comment *)
+  Alcotest.(check bool) "gate: faithful if/throw form" true
+    (contains_substring js "if (!(true)) { throw new Error(\"gate g failed\"); }");
+  Alcotest.(check bool) "gate: no CWR gate stub comment" true
+    (not (contains_substring js "[CWR gate:"));
   Alcotest.(check bool) "commit: CWR commit comment" true
     (contains_substring js "[CWR commit");
-  Alcotest.(check bool) "gate note present" true
-    (List.exists (fun (n : Compiler.note) -> n.kind = "gate") notes);
+  Alcotest.(check bool) "gate note absent (faithful compilation)" true
+    (not (List.exists (fun (n : Compiler.note) -> n.kind = "gate") notes));
   Alcotest.(check bool) "commit note present" true
     (List.exists (fun (n : Compiler.note) -> n.kind = "commit") notes)
+
+(* ---- new compiler tests: expr translator, meta, agent options, loop governors ---- *)
+
+let test_compiler_meta_header () =
+  let wf = { name = "my-pipeline"; version = Some "1.0"; steps = [] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "meta block present" true
+    (contains_substring js "export const meta = {");
+  Alcotest.(check bool) "meta name correct" true
+    (contains_substring js "name: 'my-pipeline'");
+  Alcotest.(check bool) "meta description empty" true
+    (contains_substring js "description: ''")
+
+let test_compiler_expr_edge_cases () =
+  (* And [] → true; Or [] → false *)
+  let wf_and = { name = "e"; version = None;
+    steps = [ Gate { id = "g1"; when_ = Expr.And [] } ] } in
+  let js_and, notes_and = Compiler.compile_workflow wf_and in
+  Alcotest.(check bool) "And []: condition is true" true
+    (contains_substring js_and "if (!(true))");
+  Alcotest.(check bool) "And []: no gate note" true
+    (not (List.exists (fun (n : Compiler.note) -> n.kind = "gate") notes_and));
+
+  let wf_or = { name = "e"; version = None;
+    steps = [ Gate { id = "g2"; when_ = Expr.Or [] } ] } in
+  let js_or, _ = Compiler.compile_workflow wf_or in
+  Alcotest.(check bool) "Or []: condition is false" true
+    (contains_substring js_or "if (!(false))")
+
+let test_compiler_expr_path () =
+  (* Path outside outputs → args.key *)
+  let wf = { name = "p"; version = None;
+    steps = [ Gate { id = "g"; when_ = Expr.Path ["item"] } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "Path [item] → args.item" true
+    (contains_substring js "args.item");
+
+  (* Path inside outputs → id.field *)
+  let wf2 = { name = "p2"; version = None;
+    steps = [ Gate { id = "g2";
+                     when_ = Expr.Path ["outputs"; "agent_a"; "score"] } ] } in
+  let js2, _ = Compiler.compile_workflow wf2 in
+  Alcotest.(check bool) "Path [outputs;agent_a;score] → agent_a.score" true
+    (contains_substring js2 "agent_a.score")
+
+let test_compiler_gate_real_expr () =
+  let wf = { name = "ge"; version = None;
+    steps = [ Gate { id = "check";
+      when_ = Expr.Eq (Expr.Path ["outputs"; "a"; "score"], Expr.Lit (Expr.Int 5)) } ] } in
+  let js, notes = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "gate: real expr Eq" true
+    (contains_substring js "a.score === 5");
+  Alcotest.(check bool) "gate: throw form" true
+    (contains_substring js "throw new Error(\"gate check failed\")");
+  Alcotest.(check bool) "gate: no gate note" true
+    (not (List.exists (fun (n : Compiler.note) -> n.kind = "gate") notes))
+
+let test_compiler_branch_real_expr () =
+  let wf = { name = "br"; version = None;
+    steps = [ Branch { when_ = Expr.Lit (Expr.Bool true);
+                       then_ = [ make_agent "t" ];
+                       else_ = [ make_agent "f" ] } ] } in
+  let js, notes = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "branch: real if condition" true
+    (contains_substring js "if (true) {");
+  Alcotest.(check bool) "branch: else present" true
+    (contains_substring js "} else {");
+  Alcotest.(check bool) "branch: no branch note" true
+    (not (List.exists (fun (n : Compiler.note) -> n.kind = "branch") notes))
+
+let test_compiler_agent_schema () =
+  let schema = Types.Schema.[ ("verdict", String); ("score", Int) ] in
+  let wf = { name = "s"; version = None;
+    steps = [ Agent { id = "check"; prompt = "evaluate";
+                      read_only = false; output_schema = Some schema;
+                      on_failure = Types.Abort } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "agent schema: type object" true
+    (contains_substring js {|type: "object"|});
+  Alcotest.(check bool) "agent schema: verdict string" true
+    (contains_substring js {|"verdict": {type: "string"}|});
+  Alcotest.(check bool) "agent schema: score integer" true
+    (contains_substring js {|"score": {type: "integer"}|});
+  Alcotest.(check bool) "agent schema: required array" true
+    (contains_substring js {|required: ["verdict", "score"]|})
+
+let test_compiler_agent_schema_types () =
+  (* Bool → "boolean", Any → {}, Enum → enum array *)
+  let schema = Types.Schema.[ ("flag", Bool); ("data", Any);
+                               ("kind", Enum ["a"; "b"]) ] in
+  let wf = { name = "t"; version = None;
+    steps = [ Agent { id = "x"; prompt = "p"; read_only = false;
+                      output_schema = Some schema; on_failure = Types.Abort } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "Bool → boolean" true
+    (contains_substring js {|"flag": {type: "boolean"}|});
+  Alcotest.(check bool) "Any → {}" true
+    (contains_substring js {|"data": {}|});
+  Alcotest.(check bool) "Enum → enum array" true
+    (contains_substring js {|"kind": {type: "string", enum: ["a", "b"]}|})
+
+let test_compiler_agent_on_failure () =
+  (* Continue → try/catch; Abort → no try *)
+  let wf_cont = { name = "c"; version = None;
+    steps = [ Agent { id = "soft"; prompt = "p"; read_only = false;
+                      output_schema = None; on_failure = Types.Continue } ] } in
+  let js_cont, _ = Compiler.compile_workflow wf_cont in
+  Alcotest.(check bool) "Continue: try block present" true
+    (contains_substring js_cont "try {");
+  Alcotest.(check bool) "Continue: catch present" true
+    (contains_substring js_cont "catch (e)");
+  Alcotest.(check bool) "Continue: soft fail null" true
+    (contains_substring js_cont "= null; /* soft fail */");
+
+  let wf_abort = { name = "a"; version = None;
+    steps = [ Agent { id = "hard"; prompt = "p"; read_only = false;
+                      output_schema = None; on_failure = Types.Abort } ] } in
+  let js_abort, _ = Compiler.compile_workflow wf_abort in
+  Alcotest.(check bool) "Abort: no try block" true
+    (not (contains_substring js_abort "try {"));
+  Alcotest.(check bool) "Abort: const binding" true
+    (contains_substring js_abort "const hard = await agent(")
+
+let test_compiler_agent_read_only () =
+  let wf = { name = "ro"; version = None;
+    steps = [ Agent { id = "fetch"; prompt = "read data"; read_only = true;
+                      output_schema = None; on_failure = Types.Abort } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "read_only: comment present" true
+    (contains_substring js "// [read-only]");
+  Alcotest.(check bool) "read_only: agent call still present" true
+    (contains_substring js "const fetch = await agent(")
+
+let test_compiler_loop_max_iters () =
+  let wf = { name = "lp"; version = None;
+    steps = [ Loop { body = [ make_agent "step" ];
+                     until = None;
+                     governors = [ Max_iters 5 ] } ] } in
+  let js, notes = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "Max_iters: counter before while" true
+    (contains_substring js "_maxiters_0 = 0");
+  Alcotest.(check bool) "Max_iters: break check" true
+    (contains_substring js "++_maxiters_0 >= 5");
+  Alcotest.(check bool) "Max_iters: while present" true
+    (contains_substring js "while (true)");
+  Alcotest.(check bool) "Max_iters: no loop note" true
+    (not (List.exists (fun (n : Compiler.note) -> n.kind = "loop") notes))
+
+let test_compiler_loop_budget () =
+  let wf = { name = "lb"; version = None;
+    steps = [ Loop { body = [ make_agent "step" ];
+                     until = None;
+                     governors = [ Budget ] } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "Budget: remaining check" true
+    (contains_substring js "budget.remaining() <= 0")
+
+let test_compiler_loop_until () =
+  let wf = { name = "lu"; version = None;
+    steps = [ Loop { body = [ make_agent "step" ];
+                     until = Some (Expr.Lit (Expr.Bool true));
+                     governors = [] } ] } in
+  let js, notes = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "until: if break present" true
+    (contains_substring js "if (true) break;");
+  (* governor-less loop gets a note *)
+  Alcotest.(check bool) "no-governor loop: note present" true
+    (List.exists (fun (n : Compiler.note) -> n.kind = "loop") notes)
+
+let test_compiler_loop_fixpoint () =
+  let wf = { name = "lf"; version = None;
+    steps = [ Loop { body = [ make_agent "step" ];
+                     until = None;
+                     governors = [ Fixpoint { window = 2;
+                       progress = Expr.Lit (Expr.Bool true) } ] } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "Fixpoint: counter before while" true
+    (contains_substring js "_fixcount_0 = 0");
+  Alcotest.(check bool) "Fixpoint: window check" true
+    (contains_substring js ">= 2")
+
+let test_compiler_js_escape_completeness () =
+  (* Prompts with control chars must not produce octal \ddd escapes — use \uXXXX instead.
+     js_escape_string must cover \r and C0 control chars. *)
+  let ctrl_prompt = "tab\there\rreturn\x01ctrl" in
+  let wf = { name = "esc"; version = None;
+    steps = [ Agent { id = "a"; prompt = ctrl_prompt; read_only = false;
+                      output_schema = None; on_failure = Types.Abort } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "\\t escaped" true (contains_substring js "\\t");
+  Alcotest.(check bool) "\\r escaped" true (contains_substring js "\\r");
+  Alcotest.(check bool) "ctrl \\u0001 escaped" true (contains_substring js "\\u0001");
+  Alcotest.(check bool) "no raw octal \\001" true
+    (not (contains_substring js "\\001"));
+
+  (* Schema keys with hyphens must be quoted *)
+  let schema = Types.Schema.[ ("content-type", String) ] in
+  let wf2 = { name = "sq"; version = None;
+    steps = [ Agent { id = "b"; prompt = "p"; read_only = false;
+                      output_schema = Some schema; on_failure = Types.Abort } ] } in
+  let js2, _ = Compiler.compile_workflow wf2 in
+  Alcotest.(check bool) "hyphen schema key: quoted" true
+    (contains_substring js2 {|"content-type": {type: "string"}|});
+  Alcotest.(check bool) "hyphen schema key: not bare" true
+    (not (contains_substring js2 "content-type: {"));
+
+  (* Leading-digit ID must be prefixed *)
+  let wf3 = { name = "ld"; version = None;
+    steps = [ Agent { id = "1abc"; prompt = "p"; read_only = false;
+                      output_schema = None; on_failure = Types.Abort } ] } in
+  let js3, _ = Compiler.compile_workflow wf3 in
+  Alcotest.(check bool) "leading-digit id: prefixed with _" true
+    (contains_substring js3 "const _1abc = ");
+  Alcotest.(check bool) "leading-digit id: no bare const 1abc" true
+    (not (contains_substring js3 "const 1abc = "));
+
+  (* Space in ID must be sanitized *)
+  let wf4 = { name = "sp"; version = None;
+    steps = [ Agent { id = "step one"; prompt = "p"; read_only = false;
+                      output_schema = None; on_failure = Types.Abort } ] } in
+  let js4, _ = Compiler.compile_workflow wf4 in
+  Alcotest.(check bool) "space in id: replaced with _" true
+    (contains_substring js4 "const step_one = ");
+  Alcotest.(check bool) "space in id: label preserves original" true
+    (contains_substring js4 {|label: "step one"|})
+
+let test_compiler_name_newline () =
+  (* A workflow name with \n must not split the header comment into bare JS code. *)
+  let wf = { name = "line1\nline2"; version = None; steps = [] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "newline in name: escaped in comment" true
+    (contains_substring js "// Workflow: line1\\nline2");
+  Alcotest.(check bool) "newline in name: no raw newline after //" true
+    (not (contains_substring js "// Workflow: line1\nline2"));
+  Alcotest.(check bool) "newline in name: meta name also escaped" true
+    (contains_substring js {|name: 'line1\nline2'|})
+
+let test_compiler_hyphenated_ids () =
+  (* Step IDs with hyphens are valid CWR but invalid JS identifiers.
+     The compiler must replace '-' with '_' in variable names and path references. *)
+  let wf = { name = "h"; version = None;
+    steps = [
+      Agent { id = "deep-dive"; prompt = "p"; read_only = false;
+              output_schema = None; on_failure = Types.Abort };
+      Gate { id = "g";
+             when_ = Expr.Path ["outputs"; "deep-dive"; "done"] };
+    ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "hyphen: variable binding sanitized" true
+    (contains_substring js "const deep_dive = ");
+  Alcotest.(check bool) "hyphen: no bare hyphen variable" true
+    (not (contains_substring js "const deep-dive = "));
+  Alcotest.(check bool) "hyphen: path reference sanitized" true
+    (contains_substring js "deep_dive.done");
+  Alcotest.(check bool) "hyphen: label preserved as-is" true
+    (contains_substring js {|label: "deep-dive"|})
+
+let test_compiler_nested_loops () =
+  (* Outer loop: Max_iters 3; inner loop: Max_iters 2 — must get distinct suffixes *)
+  let inner = Loop { body = [ make_agent "inner_step" ];
+                     until = None;
+                     governors = [ Max_iters 2 ] } in
+  let wf = { name = "nl"; version = None;
+    steps = [ Loop { body = [ inner ];
+                     until = None;
+                     governors = [ Max_iters 3 ] } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "nested: outer counter _0" true
+    (contains_substring js "_maxiters_0");
+  Alcotest.(check bool) "nested: inner counter _1" true
+    (contains_substring js "_maxiters_1");
+  Alcotest.(check bool) "nested: outer limit 3" true
+    (contains_substring js ">= 3");
+  Alcotest.(check bool) "nested: inner limit 2" true
+    (contains_substring js ">= 2")
 
 (* ---- foreach iteration tests (with initial_ctx) ---- *)
 
@@ -3389,7 +3667,58 @@ let () =
             "run step => [CWR run: cmd=... allowlist note" `Quick
             test_compiler_run_step;
           Alcotest.test_case
-            "gate/commit steps => [CWR ...] comments + notes" `Quick
+            "gate/commit steps => faithful gate if/throw, commit note" `Quick
             test_compiler_gate_commit_steps;
+          Alcotest.test_case
+            "meta header export const meta = {name,description}" `Quick
+            test_compiler_meta_header;
+          Alcotest.test_case
+            "expr edge cases: And [] → true, Or [] → false" `Quick
+            test_compiler_expr_edge_cases;
+          Alcotest.test_case
+            "expr path: outputs→id.field, other→args.key" `Quick
+            test_compiler_expr_path;
+          Alcotest.test_case
+            "gate real expr: Eq path+int → id.field === 5" `Quick
+            test_compiler_gate_real_expr;
+          Alcotest.test_case
+            "branch real expr: if/else structure, no branch note" `Quick
+            test_compiler_branch_real_expr;
+          Alcotest.test_case
+            "agent schema: JSON Schema object with required array" `Quick
+            test_compiler_agent_schema;
+          Alcotest.test_case
+            "agent schema types: Bool→boolean, Any→{}, Enum→enum" `Quick
+            test_compiler_agent_schema_types;
+          Alcotest.test_case
+            "agent on_failure: Continue→try/catch, Abort→const" `Quick
+            test_compiler_agent_on_failure;
+          Alcotest.test_case
+            "agent read_only: // [read-only] comment" `Quick
+            test_compiler_agent_read_only;
+          Alcotest.test_case
+            "loop Max_iters: counter var + >= N break after body" `Quick
+            test_compiler_loop_max_iters;
+          Alcotest.test_case
+            "loop Budget: budget.remaining() check after body" `Quick
+            test_compiler_loop_budget;
+          Alcotest.test_case
+            "loop until: if (expr) break; after body" `Quick
+            test_compiler_loop_until;
+          Alcotest.test_case
+            "loop Fixpoint: _fixcount var + window break" `Quick
+            test_compiler_loop_fixpoint;
+          Alcotest.test_case
+            "nested loops: distinct counter suffixes _0 and _1" `Quick
+            test_compiler_nested_loops;
+          Alcotest.test_case
+            "hyphenated ids: sanitized to _ in var/path, label preserved" `Quick
+            test_compiler_hyphenated_ids;
+          Alcotest.test_case
+            "js escape: control chars, schema key quoting, leading-digit/space ids" `Quick
+            test_compiler_js_escape_completeness;
+          Alcotest.test_case
+            "name with newline: escaped in comment and meta, no bare LF" `Quick
+            test_compiler_name_newline;
         ] );
     ]
