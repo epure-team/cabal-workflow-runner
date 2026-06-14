@@ -14,6 +14,20 @@ let project_path rel =
       if Sys.file_exists rel then rel
       else Filename.concat ".." rel
 
+let check_snapshot snap_rel actual =
+  let path = project_path snap_rel in
+  match Sys.getenv_opt "UPDATE_SNAPSHOTS" with
+  | Some _ ->
+      let oc = open_out path in
+      output_string oc actual;
+      close_out oc
+  | None ->
+      let ic = open_in path in
+      let n = in_channel_length ic in
+      let expected = really_input_string ic n in
+      close_in ic;
+      Alcotest.(check string) ("snapshot: " ^ snap_rel) expected actual
+
 let validate_ok ~floor wf =
   match Validate.workflow ~floor_gates:floor wf with
   | Ok v -> v
@@ -3198,6 +3212,146 @@ let test_compiler_nested_loops () =
   Alcotest.(check bool) "nested: inner limit 2" true
     (contains_substring js ">= 2")
 
+(* ---- compiler: missing Expr.t operator coverage ---- *)
+
+let test_compiler_expr_comparison_ops () =
+  let gate expr = { name = "c"; version = None;
+    steps = [ Gate { id = "g"; when_ = expr } ] }
+  in
+  (* Ne *)
+  let js_ne, _ = Compiler.compile_workflow
+    (gate (Expr.Ne (Expr.Path ["outputs"; "a"; "status"], Expr.Lit (Expr.String "ok")))) in
+  Alcotest.(check bool) "Ne: !== operator" true
+    (contains_substring js_ne {|(a.status !== "ok")|});
+  (* Lt *)
+  let js_lt, _ = Compiler.compile_workflow
+    (gate (Expr.Lt (Expr.Path ["outputs"; "a"; "n"], Expr.Lit (Expr.Int 10)))) in
+  Alcotest.(check bool) "Lt: < operator" true
+    (contains_substring js_lt "(a.n < 10)");
+  (* Le *)
+  let js_le, _ = Compiler.compile_workflow
+    (gate (Expr.Le (Expr.Path ["outputs"; "a"; "n"], Expr.Lit (Expr.Int 10)))) in
+  Alcotest.(check bool) "Le: <= operator" true
+    (contains_substring js_le "(a.n <= 10)");
+  (* Gt *)
+  let js_gt, _ = Compiler.compile_workflow
+    (gate (Expr.Gt (Expr.Path ["outputs"; "a"; "n"], Expr.Lit (Expr.Int 0)))) in
+  Alcotest.(check bool) "Gt: > operator" true
+    (contains_substring js_gt "(a.n > 0)");
+  (* Ge *)
+  let js_ge, _ = Compiler.compile_workflow
+    (gate (Expr.Ge (Expr.Path ["outputs"; "a"; "score"], Expr.Lit (Expr.Int 7)))) in
+  Alcotest.(check bool) "Ge: >= operator" true
+    (contains_substring js_ge "(a.score >= 7)")
+
+let test_compiler_expr_in () =
+  (* In (elem, container) → container.includes(elem) *)
+  let wf = { name = "in_"; version = None;
+    steps = [ Gate { id = "g";
+      when_ = Expr.In (Expr.Path ["outputs"; "a"; "sev"],
+                       Expr.Lit (Expr.List [Expr.String "high"; Expr.String "critical"])) } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "In: list.includes(path)" true
+    (contains_substring js {|["high", "critical"]).includes(a.sev)|})
+
+let test_compiler_expr_exists () =
+  let wf = { name = "ex"; version = None;
+    steps = [ Gate { id = "g"; when_ = Expr.Exists ["outputs"; "a"; "field"] } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "Exists: !== null" true
+    (contains_substring js "a.field !== null");
+  Alcotest.(check bool) "Exists: !== undefined" true
+    (contains_substring js "a.field !== undefined")
+
+let test_compiler_expr_not () =
+  let wf = { name = "not_"; version = None;
+    steps = [ Gate { id = "g"; when_ = Expr.Not (Expr.Lit (Expr.Bool false)) } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "Not: !(expr) form" true
+    (contains_substring js "!(false)")
+
+(* ---- compiler: branch with complex boolean expression ---- *)
+
+let test_compiler_branch_complex_expr () =
+  let cond = Expr.And [
+    Expr.Gt (Expr.Path ["outputs"; "a"; "score"], Expr.Lit (Expr.Int 5));
+    Expr.Not (Expr.Path ["outputs"; "a"; "done"]);
+  ] in
+  let wf = { name = "bc"; version = None;
+    steps = [ Branch { when_ = cond;
+                       then_ = [ make_agent "t" ];
+                       else_ = [ make_agent "f" ] } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "branch complex: && present" true
+    (contains_substring js " && ");
+  Alcotest.(check bool) "branch complex: Gt operator" true
+    (contains_substring js "a.score > 5");
+  Alcotest.(check bool) "branch complex: Not of path" true
+    (contains_substring js "!(a.done)")
+
+(* ---- compiler: multi-governor loop ---- *)
+
+let test_compiler_multi_governor_loop () =
+  let wf = { name = "mg"; version = None;
+    steps = [ Loop { body = [ make_agent "step" ];
+                     until = None;
+                     governors = [
+                       Max_iters 3;
+                       Fixpoint { window = 2;
+                                  progress = Expr.Path ["outputs"; "step"; "done"] };
+                     ] } ] } in
+  let js, notes = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "multi-gov: maxiters counter declared" true
+    (contains_substring js "_maxiters_0 = 0");
+  Alcotest.(check bool) "multi-gov: fixcount counter declared" true
+    (contains_substring js "_fixcount_0 = 0");
+  Alcotest.(check bool) "multi-gov: maxiters break at 3" true
+    (contains_substring js "++_maxiters_0 >= 3");
+  Alcotest.(check bool) "multi-gov: fixpoint window 2" true
+    (contains_substring js ">= 2");
+  Alcotest.(check bool) "multi-gov: no loop note (has governors)" true
+    (not (List.exists (fun (n : Compiler.note) -> n.kind = "loop") notes))
+
+(* ---- compiler: agent schema + Continue combined ---- *)
+
+let test_compiler_agent_schema_and_continue () =
+  let schema = Types.Schema.[ ("result", String) ] in
+  let wf = { name = "sc"; version = None;
+    steps = [ Agent { id = "soft"; prompt = "do it"; read_only = false;
+                      output_schema = Some schema; on_failure = Types.Continue } ] } in
+  let js, _ = Compiler.compile_workflow wf in
+  Alcotest.(check bool) "schema+continue: let binding" true
+    (contains_substring js "let soft;");
+  Alcotest.(check bool) "schema+continue: try block" true
+    (contains_substring js "try {");
+  Alcotest.(check bool) "schema+continue: catch block" true
+    (contains_substring js "catch (e)");
+  Alcotest.(check bool) "schema+continue: schema option present" true
+    (contains_substring js {|"result": {type: "string"}|})
+
+(* ---- compiler: snapshot regression tests for example workflows ---- *)
+
+let test_compiler_snapshot_smoke () =
+  match Workflow_json.of_file (project_path "examples/smoke.workflow.json") with
+  | Error e -> Alcotest.failf "smoke parse: %s" e
+  | Ok wf ->
+      let js, _ = Compiler.compile_workflow wf in
+      check_snapshot "test/snapshots/smoke.workflow.js" js
+
+let test_compiler_snapshot_bounty () =
+  match Workflow_json.of_file (project_path "examples/bounty.workflow.json") with
+  | Error e -> Alcotest.failf "bounty parse: %s" e
+  | Ok wf ->
+      let js, _ = Compiler.compile_workflow wf in
+      check_snapshot "test/snapshots/bounty.workflow.js" js
+
+let test_compiler_snapshot_run_demo () =
+  match Workflow_json.of_file (project_path "examples/run-demo.workflow.json") with
+  | Error e -> Alcotest.failf "run-demo parse: %s" e
+  | Ok wf ->
+      let js, _ = Compiler.compile_workflow wf in
+      check_snapshot "test/snapshots/run-demo.workflow.js" js
+
 (* ---- foreach iteration tests (with initial_ctx) ---- *)
 
 let test_foreach_iterates () =
@@ -3720,5 +3874,35 @@ let () =
           Alcotest.test_case
             "name with newline: escaped in comment and meta, no bare LF" `Quick
             test_compiler_name_newline;
+          Alcotest.test_case
+            "expr comparison ops: Ne !== , Lt < , Le <= , Gt > , Ge >=" `Quick
+            test_compiler_expr_comparison_ops;
+          Alcotest.test_case
+            "expr In: list.includes(elem)" `Quick
+            test_compiler_expr_in;
+          Alcotest.test_case
+            "expr Exists: path !== null && !== undefined" `Quick
+            test_compiler_expr_exists;
+          Alcotest.test_case
+            "expr Not: !(expr) form" `Quick
+            test_compiler_expr_not;
+          Alcotest.test_case
+            "branch complex expr: And[Gt, Not] → && and !(path)" `Quick
+            test_compiler_branch_complex_expr;
+          Alcotest.test_case
+            "multi-governor loop: Max_iters + Fixpoint both emitted" `Quick
+            test_compiler_multi_governor_loop;
+          Alcotest.test_case
+            "agent schema + Continue: try/catch wraps call with schema option" `Quick
+            test_compiler_agent_schema_and_continue;
+          Alcotest.test_case
+            "snapshot: smoke.workflow.json compiles to pinned JS" `Quick
+            test_compiler_snapshot_smoke;
+          Alcotest.test_case
+            "snapshot: bounty.workflow.json compiles to pinned JS" `Quick
+            test_compiler_snapshot_bounty;
+          Alcotest.test_case
+            "snapshot: run-demo.workflow.json compiles to pinned JS" `Quick
+            test_compiler_snapshot_run_demo;
         ] );
     ]
