@@ -3,16 +3,16 @@ open Types
 
 (* ---- helpers ---- *)
 
-(* Resolve a project-relative path (e.g. "examples/smoke.workflow.json") robustly,
-   so the test binary runs both under [dune test]'s sandbox AND standalone via
-   [dune exec test/test_cwr.exe] from the repo root. Dune sets DUNE_SOURCEROOT to
-   the project root for both [dune exec] and [dune test]; we join against it. The
-   fallback is the legacy cwd-relative "../<rel>" form that resolves inside the
-   [dune test] sandbox (cwd = test/). *)
+(* Resolve a project-relative path (e.g. "examples/smoke.workflow.json") robustly.
+   Dune sets DUNE_SOURCEROOT to the project root for both [dune test] and
+   [dune exec]; we join against it. Without it (direct binary invocation), try cwd
+   first (project root) then the parent (legacy dune sandbox path). *)
 let project_path rel =
   match Sys.getenv_opt "DUNE_SOURCEROOT" with
   | Some root -> Filename.concat root rel
-  | None -> Filename.concat ".." rel
+  | None ->
+      if Sys.file_exists rel then rel
+      else Filename.concat ".." rel
 
 let validate_ok ~floor wf =
   match Validate.workflow ~floor_gates:floor wf with
