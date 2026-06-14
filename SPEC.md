@@ -196,6 +196,105 @@ and a louder `run-step-destructive-command` warning for known-destructive binari
 small, documented, **best-effort** set, **not** a security control). Both are warnings, so
 they never make `has_errors` true and never block validation.
 
+### 1.5 The `parallel` step — concurrent branches
+
+A `Parallel` step runs multiple branches **concurrently** via Eio fibers and joins when all
+branches complete (or when one fails):
+
+```json
+{ "kind": "parallel", "branches": [
+    [ { "kind": "agent", "id": "r1", "prompt": "…" } ],
+    [ { "kind": "agent", "id": "r2", "prompt": "…" } ]
+] }
+```
+
+**Branch semantics.**
+- Each element of `branches` is a `step list` executed as an independent sub-walk sharing the
+  same entry context (`ctx`) at the point the `Parallel` step is reached.
+- Agent outputs from each branch are recorded in that branch's sub-trace and merged into the
+  host context under `outputs.<id>` after all branches complete. Deep-merge: if two branches
+  write to distinct ids under `outputs`, both ids survive.
+
+**Cancel-all on first failure.** If any branch reaches an `Aborted` or `Blocked` outcome, all
+sibling fibers are cancelled via `Eio.Switch.fail`. The `cancelled-by-sibling` outcome is
+assigned to any branch that did not complete before cancellation. The overall parallel outcome
+is the worst of all branch outcomes (`Aborted > Blocked > Committed > Completed_no_commit`).
+A `Parallel_completed` entry is always emitted.
+
+**Safety floor — commits inside parallel branches are rejected.** The lint/validate check
+`commit-in-parallel` (error severity) rejects any `Commit` reachable inside a parallel branch.
+Commits are terminal steps: a commit inside a parallel branch would prevent the switch from
+joining all branches cleanly. **Commits must appear outside parallel steps.**
+
+**Floor-gate intersection.** A gate guaranteed in **all** branches counts as guaranteed after
+the parallel step (consistent with `Branch`'s intersection discipline). A gate guaranteed in
+only some branches does NOT satisfy the floor for a subsequent commit.
+
+**Output-collision detection.** Two branches with the same agent id cause a `parallel-output-collision`
+error diagnostic: their outputs would overwrite each other nondeterministically.
+
+**Replay determinism.** The live run records each branch's sub-trace inside
+`Parallel_branch_completed { branch_idx; trace; outcome; branch_outputs }`. Replay re-feeds
+each branch's sub-trace without re-executing fibers, producing the same outcome byte-identically.
+The allowlist is not consulted on replay (nothing re-executes).
+
+**Trace entries emitted:**
+- `Parallel_started` — emitted before any branch fiber starts.
+- `Parallel_branch_completed { branch_idx; trace; outcome; branch_outputs }` — one per branch,
+  in index order (0, 1, …), emitted after all branches join.
+- `Parallel_completed { outcome }` — emitted last with the worst overall outcome.
+
+### 1.6 The `foreach` step — iterating over a context array
+
+A `Foreach` step iterates a body step list over every element of a JSON array in the run context:
+
+```json
+{ "kind": "foreach", "over": "items", "steps": [
+    { "kind": "agent", "id": "process", "prompt": "Process item: {{item}}" }
+] }
+```
+
+**`over` key resolution.** `over` is a **bare top-level ctx key** (not a dotted path). The
+engine looks up `ctx["items"]` directly. Typical use: pre-populate the context via
+`Engine.run ~initial_ctx:[("items", `List [...])]`. Inside a workflow, a preceding agent or
+`Run` step cannot write a bare top-level key directly — the engine only binds `"outputs"`,
+`"loop"`, and `"item"` at the top level. The `--ctx` CLI option allows operator-supplied
+initial context.
+
+**`item` binding.** On each iteration, `ctx["item"]` is bound to the current array element.
+The `item` binding is **scoped to the foreach**: after the foreach completes, the prior value
+of `ctx["item"]` (if any) is restored, or `"item"` is removed if it was not present before the
+foreach. This prevents leaking the last element to subsequent steps and allows nested foreach
+loops without clobbering the outer `item`.
+
+**Empty array.** An empty array (`[]`) produces zero iterations; no body step is executed and
+`Foreach_completed { iterations = 0 }` is emitted.
+
+**Missing or non-array key.** If `ctx[over]` is absent or not a `List`, the step is `Blocked`
+with a descriptive message naming the key.
+
+**Replay.** The live run records `Foreach_iter_started`, body sub-trace, `Foreach_iter_completed`
+for each iteration, and `Foreach_completed`. Replay re-feeds the recorded elements and verifies
+element identity. The `initial_ctx` used for the original run must be supplied to `Engine.replay`
+via `?initial_ctx` for the array to be available.
+
+**Trace entries emitted (per successful foreach):**
+- `Foreach_iter_started { index; element }` — one per element, before the body executes.
+- `Foreach_iter_completed { index; outcome }` — one per element, after the body completes.
+- `Foreach_completed { iterations }` — once at the end, with the total number of iterations.
+
+### 1.7 The `version` field on workflow root
+
+The workflow root object accepts an optional `"version"` string field:
+
+```json
+{ "name": "my-workflow", "version": "1.0", "steps": [ … ] }
+```
+
+`version` is informational only — the engine does not interpret it. It is surfaced in the
+compiled-to-Claude-Workflow header comment (`// Compiled from CWR v1.0`) and propagated
+through the ledger/replay path unchanged.
+
 ## 2. The safety floor — enforced by the engine/validator, NOT the workflow
 
 This is the crux. The *mechanism* is hardcoded; the *specific gate ids* are a
@@ -470,6 +569,9 @@ humans/agents; the `loc` is a JSON path to the offending node, e.g. `steps[3].bo
 | `missing-output-schema` | warning | a referenced agent step declares no `output_schema` (its output can't be validated). |
 | `no-commit` | warning | the workflow has no `Commit` step at all. |
 | `unreachable-after-commit` | warning | a step follows a `Commit` at the same level (a commit ends the run). |
+| `commit-in-parallel` | error | a `Commit` is reachable inside a `parallel` branch (commits must appear outside parallel steps). |
+| `parallel-output-collision` | error | two parallel branches declare the same agent `id` (their outputs would collide). |
+| `soft-fail-with-commit` | error | an agent has `on_failure="continue"` in a workflow that contains a `Commit` (soft-fail is permitted only in commit-free workflows). |
 | `run-step-executes-commands` | warning | a `run` step executes a shell command (informational; it runs only if the operator's runtime allowlist permits its binary). |
 | `run-step-destructive-command` | warning | a `run` step invokes a known-destructive binary (`rm`/`dd`/… — best-effort advisory, **not** a security control; the runtime allowlist is the trust boundary). |
 

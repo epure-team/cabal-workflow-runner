@@ -61,6 +61,38 @@ module String_set = Set.Make (String)
 
 let loc_index prefix i = Printf.sprintf "%s[%d]" prefix i
 
+(* ---- reachability helpers (used by floor analysis and top-level check) ---- *)
+
+let rec any_commit steps =
+  List.exists
+    (function
+      | Commit _ -> true
+      | Branch { then_; else_; _ } -> any_commit then_ || any_commit else_
+      | Loop { body; _ } -> any_commit body
+      | Parallel { branches } -> List.exists any_commit branches
+      | Foreach { steps = body; _ } -> any_commit body
+      | Agent _ | Gate _ | Run _ -> false)
+    steps
+
+(* Check if a single step (at any depth) contains a Commit. Used for
+   commit-in-parallel detection. *)
+and any_commit_step step = any_commit [ step ]
+
+(* Collect all agent ids reachable inside a step list (recursively). Used for
+   parallel-output-collision detection. *)
+and collect_agent_ids_step step : string list =
+  match step with
+  | Agent { id; _ } -> [ id ]
+  | Branch { then_; else_; _ } ->
+      collect_agent_ids then_ @ collect_agent_ids else_
+  | Loop { body; _ } -> collect_agent_ids body
+  | Parallel { branches } -> List.concat_map collect_agent_ids branches
+  | Foreach { steps = body; _ } -> collect_agent_ids body
+  | Gate _ | Run _ | Commit _ -> []
+
+and collect_agent_ids steps =
+  List.concat_map collect_agent_ids_step steps
+
 let rec floor_steps ~floor ~loc_prefix ~guaranteed acc steps =
   let _, g =
     List.fold_left
@@ -147,6 +179,78 @@ and floor_step ~floor ~loc ~guaranteed acc step =
          as guaranteed: a loop may execute zero iterations. *)
       ignore
         (floor_steps ~floor ~loc_prefix:(loc ^ ".body") ~guaranteed acc body);
+      guaranteed
+  | Parallel { branches } ->
+      (* commit-in-parallel: any Commit reachable inside any branch is an Error.
+         We collect which commits are already flagged to suppress soft-fail-with-commit
+         for those same commits. *)
+      List.iteri
+        (fun m branch ->
+          List.iteri
+            (fun k step ->
+              let branch_loc = Printf.sprintf "%s.branches[%d][%d]" loc m k in
+              ignore (floor_step ~floor ~loc:branch_loc ~guaranteed acc step);
+              if any_commit_step step then
+                acc :=
+                  {
+                    severity = Error;
+                    code = "commit-in-parallel";
+                    message =
+                      Printf.sprintf
+                        "Commit is reachable inside a parallel branch at %s; \
+                         commits are not permitted inside parallel branches"
+                        branch_loc;
+                    loc = branch_loc;
+                  }
+                  :: !acc)
+            branch)
+        branches;
+      (* parallel-output-collision: collect agent ids from each branch, find duplicates *)
+      let branch_ids = List.map (fun branch -> collect_agent_ids branch) branches in
+      let all_ids = List.concat branch_ids in
+      let seen = Hashtbl.create 16 in
+      List.iteri
+        (fun m ids ->
+          List.iter
+            (fun id ->
+              match Hashtbl.find_opt seen id with
+              | Some prev_m when prev_m <> m ->
+                  acc :=
+                    {
+                      severity = Error;
+                      code = "parallel-output-collision";
+                      message =
+                        Printf.sprintf
+                          "agent id %S appears in multiple parallel branches \
+                           (branches %d and %d); outputs would collide"
+                          id prev_m m;
+                      loc;
+                    }
+                    :: !acc
+              | None -> Hashtbl.add seen id m
+              | Some _ -> ())
+            ids)
+        branch_ids;
+      ignore all_ids;
+      (* Floor-gate analysis: intersection of guaranteed sets across all branches.
+         A gate is guaranteed after the parallel step only if it is guaranteed
+         in EVERY branch. *)
+      let branch_guaranteed_sets =
+        List.mapi
+          (fun m branch ->
+            floor_steps ~floor ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc m)
+              ~guaranteed acc branch)
+          branches
+      in
+      (match branch_guaranteed_sets with
+      | [] -> guaranteed
+      | first :: rest ->
+          List.fold_left String_set.inter first rest)
+  | Foreach { over = _; steps = body } ->
+      (* Foreach follows loop semantics: body gates are NOT added to the
+         guaranteed set (the array may be empty, body may never execute). *)
+      ignore
+        (floor_steps ~floor ~loc_prefix:(loc ^ ".steps") ~guaranteed acc body);
       guaranteed
 
 (* ---- output-reference analysis (Warning diagnostics) -------------------- *)
@@ -309,17 +413,44 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
         governors;
       p_body
   | Commit _ -> produced
+  | Parallel { branches } ->
+      (* Each branch sees [produced] so far. After parallel, an output is
+         available only if ALL branches produce it — intersection semantics,
+         mirroring Branch. Within a branch, that branch's outputs are available. *)
+      let branch_produced_sets =
+        List.mapi
+          (fun m branch ->
+            refs_steps
+              ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc m)
+              ~produced ~warned_missing acc branch)
+          branches
+      in
+      (match branch_produced_sets with
+      | [] -> produced
+      | first :: rest ->
+          let merge_fields a b =
+            match (a, b) with
+            | Some fa, Some fb -> Some (List.filter (fun f -> List.mem f fb) fa)
+            | _ -> None
+          in
+          List.fold_left
+            (fun acc_p p ->
+              List.filter_map
+                (fun (id, fields_a) ->
+                  match List.assoc_opt id p with
+                  | Some fields_b -> Some (id, merge_fields fields_a fields_b)
+                  | None -> None)
+                acc_p)
+            first rest)
+  | Foreach { over = _; steps = body } ->
+      (* The body runs once per element; outputs produced inside the body are
+         accessible after foreach (unlike loop, foreach always has at least 0
+         iterations but the outputs accumulate). We follow loop semantics here
+         and propagate body outputs forward, since typical use is: foreach body
+         produces something, then steps after foreach read it. *)
+      refs_steps ~loc_prefix:(loc ^ ".steps") ~produced ~warned_missing acc body
 
 (* ---- unreachable-after-commit + no-commit (Warnings) -------------------- *)
-
-let rec any_commit steps =
-  List.exists
-    (function
-      | Commit _ -> true
-      | Branch { then_; else_; _ } -> any_commit then_ || any_commit else_
-      | Loop { body; _ } -> any_commit body
-      | _ -> false)
-    steps
 
 (* Any agent step (anywhere in the tree) declaring [on_failure = Continue]. A
    soft-failing agent is incompatible with a Commit: the commit-floor invariant
@@ -334,7 +465,9 @@ let rec any_continue_agent steps =
       | Branch { then_; else_; _ } ->
           any_continue_agent then_ || any_continue_agent else_
       | Loop { body; _ } -> any_continue_agent body
-      | _ -> false)
+      | Parallel { branches } -> List.exists any_continue_agent branches
+      | Foreach { steps = body; _ } -> any_continue_agent body
+      | Agent _ | Gate _ | Run _ | Commit _ -> false)
     steps
 
 (* Flag steps that follow a Commit at the same level (a commit ends the run). *)
@@ -357,12 +490,20 @@ let rec unreachable_steps ~loc_prefix acc steps =
           (i + 1, seen)
         end
         else begin
-          (* recurse into branch/loop bodies for their own intra-level commits *)
+          (* recurse into branch/loop/parallel/foreach bodies for their own intra-level commits *)
           (match step with
           | Branch { then_; else_; _ } ->
               unreachable_steps ~loc_prefix:(loc ^ ".then") acc then_;
               unreachable_steps ~loc_prefix:(loc ^ ".else") acc else_
           | Loop { body; _ } -> unreachable_steps ~loc_prefix:(loc ^ ".body") acc body
+          | Parallel { branches } ->
+              List.iteri
+                (fun m branch ->
+                  unreachable_steps
+                    ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc m) acc branch)
+                branches
+          | Foreach { steps = body; _ } ->
+              unreachable_steps ~loc_prefix:(loc ^ ".steps") acc body
           | _ -> ());
           let seen' = match step with Commit _ -> true | _ -> false in
           (i + 1, seen')
@@ -430,6 +571,14 @@ let rec run_steps ~loc_prefix acc steps =
           run_steps ~loc_prefix:(loc ^ ".then") acc then_;
           run_steps ~loc_prefix:(loc ^ ".else") acc else_
       | Loop { body; _ } -> run_steps ~loc_prefix:(loc ^ ".body") acc body
+      | Parallel { branches } ->
+          List.iteri
+            (fun m branch ->
+              run_steps
+                ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc m) acc branch)
+            branches
+      | Foreach { steps = body; _ } ->
+          run_steps ~loc_prefix:(loc ^ ".steps") acc body
       | _ -> ())
     steps
 

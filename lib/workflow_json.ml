@@ -306,14 +306,45 @@ let rec step_of_json json =
       let s = Commit { id = req_string "id" json } in
       reject_unknown_keys ~what:"commit step" ~known:[ "kind"; "id" ] json;
       s
+  | "parallel" ->
+      let raw_branches = req_list "branches" json in
+      let branches =
+        List.map
+          (function
+            | `List steps -> List.map step_of_json steps
+            | _ -> err "each branch in \"branches\" must be an array")
+          raw_branches
+      in
+      if List.length branches < 2 then
+        err "parallel-too-few-branches";
+      let s = Parallel { branches } in
+      reject_unknown_keys ~what:"parallel step" ~known:[ "kind"; "branches" ] json;
+      s
+  | "foreach" ->
+      let s =
+        Foreach
+          {
+            over = req_string "over" json;
+            steps = List.map step_of_json (req_list "steps" json);
+          }
+      in
+      reject_unknown_keys ~what:"foreach step"
+        ~known:[ "kind"; "over"; "steps" ] json;
+      s
   | other -> err "unknown step kind %S" other
 
 let of_json json =
   try
     let name = req_string "name" json in
     let steps = List.map step_of_json (req_list "steps" json) in
-    reject_unknown_keys ~what:"workflow" ~known:[ "name"; "steps" ] json;
-    Ok { name; steps }
+    let version =
+      match member_opt "version" json with
+      | None -> None
+      | Some (`String v) -> Some v
+      | Some _ -> err "field \"version\" must be a string"
+    in
+    reject_unknown_keys ~what:"workflow" ~known:[ "name"; "steps"; "version" ] json;
+    Ok { name; steps; version }
   with Parse_error msg -> Error msg
 
 let of_string s =
@@ -422,7 +453,27 @@ let rec step_to_json = function
         | None -> []
         | Some l -> [ ("observe", `List (List.map (fun s -> `String s) l)) ])
   | Commit { id } -> `Assoc [ ("kind", `String "commit"); ("id", `String id) ]
+  | Parallel { branches } ->
+      `Assoc
+        [
+          ("kind", `String "parallel");
+          ( "branches",
+            `List
+              (List.map
+                 (fun branch -> `List (List.map step_to_json branch))
+                 branches) );
+        ]
+  | Foreach { over; steps } ->
+      `Assoc
+        [
+          ("kind", `String "foreach");
+          ("over", `String over);
+          ("steps", `List (List.map step_to_json steps));
+        ]
 
-let to_json { name; steps } =
+let to_json { name; steps; version } =
   `Assoc
-    [ ("name", `String name); ("steps", `List (List.map step_to_json steps)) ]
+    ([ ("name", `String name); ("steps", `List (List.map step_to_json steps)) ]
+    @ match version with
+      | None -> []
+      | Some v -> [ ("version", `String v) ])

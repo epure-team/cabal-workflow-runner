@@ -7,7 +7,8 @@
   "required": [ "name", "steps" ],
   "properties": {
     "name": { "type": "string" },
-    "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } }
+    "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } },
+    "version": { "type": "string" }
   },
   "patternProperties": { "^_": {} },
   "additionalProperties": false,
@@ -99,6 +100,34 @@
           "properties": {
             "kind": { "const": "commit" },
             "id": { "type": "string" }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "branches" ],
+          "properties": {
+            "kind": { "const": "parallel" },
+            "branches": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/step" }
+              }
+            }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "over", "steps" ],
+          "properties": {
+            "kind": { "const": "foreach" },
+            "over": { "type": "string" },
+            "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } }
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false

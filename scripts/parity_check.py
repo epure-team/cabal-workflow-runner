@@ -57,6 +57,8 @@ def loop(govs): return {"kind": "loop", "governors": govs, "body": [A("b")]}
 def wf(steps, **extra): return {"name": "w", "steps": steps, **extra}
 def mi(n): return loop([{"kind": "max_iters", "n": n}])
 def fpw(w): return loop([{"kind": "fixpoint", "window": w, "progress": {"lit": True}}])
+def parallel(branches): return {"kind": "parallel", "branches": branches}
+def foreach(over, steps): return {"kind": "foreach", "over": over, "steps": steps}
 
 CASES = [
     ("baseline valid", wf([A("a")])),
@@ -127,6 +129,24 @@ CASES = [
                                      "cmd": ["echo"]}])),
     ("run timeout_ms=0", wf([{"kind": "run", "id": "r", "cmd": ["echo"],
                               "working_dir": "s", "timeout_ms": 0}])),
+    # parallel step
+    ("parallel ok (2 branches)", wf([parallel([[A("a")], [A("b")]])])),
+    ("parallel ok (3 branches)", wf([parallel([[A("a")], [A("b")], [A("c")]])])),
+    ("parallel 1 branch (too few)", wf([parallel([[A("a")]]), ])),
+    ("parallel 0 branches (too few)", wf([parallel([])])),
+    ("parallel missing branches", wf([{"kind": "parallel"}])),
+    ("parallel +junk", wf([{**parallel([[A("a")], [A("b")]]), "junk": 1}])),
+    ("parallel +_note", wf([{**parallel([[A("a")], [A("b")]]), "_note": "n"}])),
+    # foreach step
+    ("foreach ok", wf([foreach("results", [A("a")])])),
+    ("foreach empty body", wf([foreach("results", [])])),
+    ("foreach missing over", wf([{"kind": "foreach", "steps": [A("a")]}])),
+    ("foreach missing steps", wf([{"kind": "foreach", "over": "results"}])),
+    ("foreach +junk", wf([{**foreach("results", [A("a")]), "junk": 1}])),
+    ("foreach +_note", wf([{**foreach("results", [A("a")]), "_note": "n"}])),
+    # workflow version field
+    ("workflow with version", wf([A("a")], version="1.0")),
+    ("workflow version not string", {"name": "w", "steps": [A("a")], "version": 42}),
 ]
 
 div = 0

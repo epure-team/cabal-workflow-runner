@@ -288,11 +288,36 @@ let step_def : Yojson.Safe.t =
     closed_object_with ~required:[ "kind"; "id" ]
       ~props:[ ("kind", kind_const "commit"); ("id", typ "string") ]
   in
+  let parallel =
+    closed_object_with
+      ~required:[ "kind"; "branches" ]
+      ~props:
+        [
+          ("kind", kind_const "parallel");
+          ( "branches",
+            obj
+              [
+                ("type", s "array");
+                ("minItems", `Int 2);
+                ("items", step_list);
+              ] );
+        ]
+  in
+  let foreach =
+    closed_object_with
+      ~required:[ "kind"; "over"; "steps" ]
+      ~props:
+        [
+          ("kind", kind_const "foreach");
+          ("over", typ "string");
+          ("steps", step_list);
+        ]
+  in
   obj
     [
       ( "description",
         s "A workflow step, discriminated by the \"kind\" key." );
-      ("oneOf", arr [ agent; gate; branch; loop; run; commit ]);
+      ("oneOf", arr [ agent; gate; branch; loop; run; commit; parallel; foreach ]);
     ]
 
 (* ---- top level ---------------------------------------------------------- *)
@@ -321,6 +346,7 @@ let schema : Yojson.Safe.t =
           [
             ("name", typ "string");
             ("steps", obj [ ("type", s "array"); ("items", ref_ "step") ]);
+            ("version", typ "string");
           ] );
       ("patternProperties", obj [ ("^_", obj []) ]);
       ("additionalProperties", `Bool false);
