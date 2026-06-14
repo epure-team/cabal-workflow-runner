@@ -30,12 +30,12 @@ jobs:
             sh -c '
               set -ex
               apk add --no-cache git musl-dev liburing-dev pkgconf
-              git config --global --add safe.directory /workspace
+              git config --global safe.directory '*'
               opam update -u --yes
               opam pin add -n cabal https://github.com/epure-team/cabal.git --yes
               opam install . --deps-only --yes
               opam exec -- dune build --profile static bin/main.exe
-              cp _build/default/bin/main.exe cabal-workflow-runner-linux-amd64
+              install -m 755 _build/default/bin/main.exe cabal-workflow-runner-linux-amd64
               strip cabal-workflow-runner-linux-amd64
             '
 
@@ -64,12 +64,12 @@ jobs:
             sh -c '
               set -ex
               apk add --no-cache git musl-dev liburing-dev pkgconf
-              git config --global --add safe.directory /workspace
+              git config --global safe.directory '*'
               opam update -u --yes
               opam pin add -n cabal https://github.com/epure-team/cabal.git --yes
               opam install . --deps-only --yes
               opam exec -- dune build --profile static bin/main.exe
-              cp _build/default/bin/main.exe cabal-workflow-runner-linux-arm64
+              install -m 755 _build/default/bin/main.exe cabal-workflow-runner-linux-arm64
               strip cabal-workflow-runner-linux-arm64
             '
 
