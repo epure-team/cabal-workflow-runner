@@ -28,7 +28,8 @@
             "on_failure": { "enum": [ "abort", "continue" ] },
             "protocol": { "type": "string" },
             "brief": { "type": "string" },
-            "agent_type": { "type": "string" }
+            "agent_type": { "type": "string" },
+            "model": { "type": "string" }
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false

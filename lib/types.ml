@@ -57,6 +57,7 @@ type step =
       protocol : string option;
       brief : string option;
       agent_type : string option;
+      model : string option;
     }
   | Gate of { id : string; when_ : Expr.t }
   | Branch of { when_ : Expr.t; then_ : step list; else_ : step list }

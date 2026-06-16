@@ -128,12 +128,20 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
     | Some name when String.trim name <> "" -> Registry.get (String.trim name)
     | _ -> Registry.first_available ~sw ~env
   in
-  let model =
+  (* Global default model from the environment; a per-step [model] overrides it. *)
+  let default_model =
     match Sys.getenv_opt "CWR_MODEL" with
     | Some m when String.trim m <> "" -> Some (String.trim m)
     | _ -> None
   in
-  let run_agent ~id ~prompt ~read_only ~agent_type =
+  let run_agent ~id ~prompt ~read_only ~agent_type ~model =
+    (* Per-step model override wins over the global CWR_MODEL default. A blank
+       per-step value falls back to the default rather than pinning "". *)
+    let model =
+      match model with
+      | Some m when String.trim m <> "" -> Some (String.trim m)
+      | _ -> default_model
+    in
     let backend_opt =
       match agent_type with
       | Some name when String.trim name <> "" ->

@@ -81,8 +81,8 @@ let path_bearing_head = function
 let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initial_ctx = [])
     ~sw:(_sw : Eio.Switch.t) ~backend ~token validated =
   let wf = Validate.Validated.workflow validated in
-  let agent ~id ~prompt ~read_only ~agent_type =
-    backend.Backend.run_agent ~id ~prompt ~read_only ~agent_type
+  let agent ~id ~prompt ~read_only ~agent_type ~model =
+    backend.Backend.run_agent ~id ~prompt ~read_only ~agent_type ~model
   in
   let eval st e = Expr.eval ~ctx:(ctx_for st) e in
   let rec go st steps =
@@ -93,7 +93,7 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initi
         go st rest
   and go_step st step =
     match step with
-    | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type } ->
+    | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model } ->
         let read_opt label = function
           | None -> `Ok ""
           | Some p ->
@@ -110,7 +110,7 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initi
           let parts = List.filter (fun s -> s <> "") [ pc; bc; prompt ] in
           String.concat "\n\n" parts
         in
-        let success, output = agent ~id ~prompt:effective_prompt ~read_only ~agent_type in
+        let success, output = agent ~id ~prompt:effective_prompt ~read_only ~agent_type ~model in
         let st = emit st (Agent_ran { id; success; output }) in
         let st = bind_output st id output in
         (* An UNSUCCESSFUL agent run is fail-closed by default ([Abort]): it aborts
@@ -481,7 +481,7 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = []) ~sw:(_
   and go_step st step =
     match step with
     | Agent { id; prompt = _; read_only = _; output_schema; on_failure;
-              protocol = _; brief = _; agent_type = _ } -> (
+              protocol = _; brief = _; agent_type = _; model = _ } -> (
         match next () with
         | Agent_ran { success; output; id = rid } when rid = id -> (
             let st = emit st (Agent_ran { id; success; output }) in

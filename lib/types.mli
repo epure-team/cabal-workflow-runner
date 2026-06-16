@@ -72,6 +72,11 @@ type step =
           (** Optional agent-type identifier forwarded to the backend for routing
               (e.g. ["code-reviewer"]) and emitted as [{agentType: "..."}] in the
               compiled Claude Workflow JS. *)
+      model : string option;
+          (** Optional per-step model override (e.g. ["claude-fable-5"]). When
+              present it overrides the backend's global [CWR_MODEL] for this step
+              only; when absent the backend default applies. Emitted as
+              [{model: "..."}] in the compiled Claude Workflow JS. *)
     }
       (** Dispatch agent work; records [(success, structured_json)] and binds the
           output into the run context under ["outputs.<id>"]. *)

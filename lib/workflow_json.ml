@@ -259,12 +259,13 @@ let rec step_of_json json =
             protocol = opt_string "protocol" json;
             brief = opt_string "brief" json;
             agent_type = opt_string "agent_type" json;
+            model = opt_string "model" json;
           }
       in
       reject_unknown_keys ~what:"agent step"
         ~known:
           [ "kind"; "id"; "prompt"; "read_only"; "output_schema"; "on_failure";
-            "protocol"; "brief"; "agent_type" ]
+            "protocol"; "brief"; "agent_type"; "model" ]
         json;
       s
   | "gate" ->
@@ -440,7 +441,7 @@ let governor_to_json = function
         ]
 
 let rec step_to_json = function
-  | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type } ->
+  | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model } ->
       `Assoc
         ([
            ("kind", `String "agent");
@@ -456,6 +457,7 @@ let rec step_to_json = function
         @ (match protocol with None -> [] | Some p -> [ ("protocol", `String p) ])
         @ (match brief with None -> [] | Some b -> [ ("brief", `String b) ])
         @ (match agent_type with None -> [] | Some t -> [ ("agent_type", `String t) ])
+        @ (match model with None -> [] | Some m -> [ ("model", `String m) ])
         @
         match output_schema with
         | None -> []
