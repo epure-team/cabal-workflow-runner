@@ -3200,7 +3200,18 @@ let test_compiler_name_newline () =
   let wf_ps = { name = "a\xE2\x80\xA9b"; version = None; steps = [] } in
   let js_ps, _ = Compiler.compile_workflow wf_ps in
   Alcotest.(check bool) "U+2029 in name: escaped in comment" true
-    (contains_substring js_ps "// Workflow: a\\u2029b")
+    (contains_substring js_ps "// Workflow: a\\u2029b");
+
+  (* The `version` field is also interpolated into the header comment and is an
+     unconstrained string, so a line terminator in it must not split the comment
+     and leak its tail as bare JS either. *)
+  let wf_ver =
+    { name = "v"; version = Some "1\nconst const ="; steps = [] } in
+  let js_ver, _ = Compiler.compile_workflow wf_ver in
+  Alcotest.(check bool) "newline in version: escaped in comment" true
+    (contains_substring js_ver "// Compiled from CWR v1\\nconst const =");
+  Alcotest.(check bool) "newline in version: no raw bare-code line" true
+    (not (contains_substring js_ver "// Compiled from CWR v1\nconst const ="))
 
 let test_compiler_comment_lineterm_hardening () =
   (* Every parser-accepted workflow string interpolated into the compiled JS must

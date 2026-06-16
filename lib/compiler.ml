@@ -350,7 +350,8 @@ let compile_workflow (wf : Types.workflow) : string * note list =
     | None -> "(unversioned)"
   in
   let name_safe = js_comment_safe wf.name in
-  Buffer.add_string buf (Printf.sprintf "// Compiled from CWR %s\n" version_str);
+  Buffer.add_string buf
+    (Printf.sprintf "// Compiled from CWR %s\n" (js_comment_safe version_str));
   Buffer.add_string buf (Printf.sprintf "// Workflow: %s\n\n" name_safe);
   Buffer.add_string buf
     (Printf.sprintf "export const meta = { name: '%s', description: '' };\n\n"
