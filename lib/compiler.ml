@@ -16,6 +16,12 @@ let indent_str n = String.make (n * 2) ' '
    (kind, description) pair. *)
 type note = { kind : string; description : string }
 
+(* Raised when a workflow is valid CWR but cannot be emitted as valid
+   JavaScript — e.g. two step ids in the same JS scope that sanitize to the same
+   variable name, which would produce a duplicate declaration. Fail closed
+   rather than emit silently-broken JS that only [node --check] would catch. *)
+exception Compile_error of string
+
 (* The compilation context threaded through the recursive emitter. *)
 type ctx = {
   buf : Buffer.t;
@@ -26,6 +32,13 @@ type ctx = {
       (** Read a file by path; returns [None] if the file can't be opened. Used
           to inline [protocol]/[brief] file contents into agent() calls. The
           default (set by [compile_workflow]) reads from the filesystem. *)
+  bindings : (string, string) Hashtbl.t;
+      (** JS variable names already declared in the CURRENT scope, each mapped to
+          a human description of its source (for the error message). Every nested
+          JS scope (branch arm, loop/foreach/parallel body) gets a fresh table
+          via [enter_scope]; a name may repeat across sibling scopes but a
+          duplicate within one would be a redeclaration that does not parse, so
+          [bind_var] raises [Compile_error]. *)
 }
 
 let emit ctx s =
@@ -69,6 +82,30 @@ let add_note ctx ~kind ~description =
   ctx.notes := { kind; description } :: !(ctx.notes)
 
 let indent ctx = { ctx with indent = ctx.indent + 1 }
+
+(* Enter a nested JS scope: bump indent AND start a fresh binding table, so a
+   variable name may legitimately repeat across sibling scopes (branch arms,
+   loop/foreach/parallel bodies) yet never within one. [reserved] pre-declares
+   names the scope itself introduces (e.g. the foreach [item] parameter), so a
+   step id colliding with one of them fails closed instead of shadow-redeclaring
+   it (which JS rejects). *)
+let enter_scope ?(reserved = []) ctx =
+  let bindings = Hashtbl.create 16 in
+  List.iter (fun (name, src) -> Hashtbl.replace bindings name src) reserved;
+  { ctx with indent = ctx.indent + 1; bindings }
+
+(* Record that [name] is declared in the current scope; fail closed if another
+   source already declared it. [js_ident] is lossy (every character outside
+   [A-Za-z0-9_] becomes '_'), so two distinct CWR ids can collapse to the same
+   JS name — emitting both would be a duplicate declaration that does not parse. *)
+let bind_var ctx ~src name =
+  match Hashtbl.find_opt ctx.bindings name with
+  | Some prev ->
+      raise (Compile_error (Printf.sprintf
+        "%s and %s both compile to the JS variable %S in the same scope; rename \
+         one so they stay distinct after non-identifier characters are mapped to \
+         '_'." prev src name))
+  | None -> Hashtbl.add ctx.bindings name src
 
 let read_file_default path =
   try Some (In_channel.with_open_text path In_channel.input_all)
@@ -228,6 +265,7 @@ and compile_step ctx step =
           (js_escape_string effective_prompt) (js_escape_string id)
           schema_opt agent_type_opt
       in
+      bind_var ctx ~src:(Printf.sprintf "step id %S" id) var;
       (match on_failure with
       | Types.Abort ->
           emit ctx (Printf.sprintf "const %s = %s" var agent_call)
@@ -250,21 +288,25 @@ and compile_step ctx step =
           "commit %S token approval not preserved in JS output" id)
   | Types.Branch { when_; then_; else_ } ->
       emit ctx (Printf.sprintf "if (%s) {" (expr_to_js when_));
-      compile_steps (indent ctx) then_;
+      compile_steps (enter_scope ctx) then_;
       emit ctx "} else {";
-      compile_steps (indent ctx) else_;
+      compile_steps (enter_scope ctx) else_;
       emit ctx "}"
   | Types.Loop { body; until; governors } ->
       let k = !(ctx.loop_counter) in
       incr ctx.loop_counter;
       List.iter (fun gov -> match gov with
         | Types.Max_iters _ ->
-            emit ctx (Printf.sprintf "let _maxiters_%d = 0;" k)
+            let v = Printf.sprintf "_maxiters_%d" k in
+            bind_var ctx ~src:(Printf.sprintf "loop #%d max_iters governor" k) v;
+            emit ctx (Printf.sprintf "let %s = 0;" v)
         | Types.Fixpoint _ ->
-            emit ctx (Printf.sprintf "let _fixcount_%d = 0;" k)
+            let v = Printf.sprintf "_fixcount_%d" k in
+            bind_var ctx ~src:(Printf.sprintf "loop #%d fixpoint governor" k) v;
+            emit ctx (Printf.sprintf "let %s = 0;" v)
         | Types.Budget -> ()) governors;
       emit ctx "while (true) {";
-      let bctx = indent ctx in
+      let bctx = enter_scope ctx in
       compile_steps bctx body;
       (match until with
       | None -> ()
@@ -301,7 +343,7 @@ and compile_step ctx step =
       List.iteri (fun i branch ->
         let sep = if i < n - 1 then "," else "" in
         emit ctx "  async () => {";
-        compile_steps { ctx with indent = ctx.indent + 2 } branch;
+        compile_steps (enter_scope (indent ctx)) branch;
         emit ctx (Printf.sprintf "  }%s" sep)
       ) branches;
       emit ctx "]);"
@@ -312,7 +354,8 @@ and compile_step ctx step =
          [const <js_ident id>]; sanitize it the same way so the emitted JS is both
          valid and consistent with the variable naming, never raw user text. *)
       emit ctx (Printf.sprintf "await pipeline(%s, async (item) => {" (js_ident over));
-      compile_steps (indent ctx) body;
+      compile_steps
+        (enter_scope ~reserved:[ ("item", "the foreach `item` binding") ] ctx) body;
       emit ctx "});";
       add_note ctx ~kind:"foreach"
         ~description:(Printf.sprintf
@@ -356,6 +399,13 @@ let compile_workflow (wf : Types.workflow) : string * note list =
   Buffer.add_string buf
     (Printf.sprintf "export const meta = { name: '%s', description: '' };\n\n"
        (js_escape_single_quoted wf.name));
-  let ctx = { buf; notes; indent = 0; loop_counter = ref 0; read_file = read_file_default } in
+  let bindings = Hashtbl.create 16 in
+  (* The module scope already declares `export const meta`, so a top-level step
+     id sanitizing to "meta" would be a duplicate declaration; reserve it. *)
+  Hashtbl.replace bindings "meta" "the exported `meta` object";
+  let ctx =
+    { buf; notes; indent = 0; loop_counter = ref 0;
+      read_file = read_file_default; bindings }
+  in
   compile_steps ctx wf.steps;
   (Buffer.contents buf, List.rev !notes)

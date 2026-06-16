@@ -3255,6 +3255,35 @@ let test_compiler_comment_lineterm_hardening () =
   Alcotest.(check bool) "foreach over: no raw newline in live call" true
     (not (contains_substring js_fe "await pipeline(items\nconst z = ;,"))
 
+let test_compiler_id_collision () =
+  (* js_ident is lossy, so distinct CWR ids can collapse to the same JS variable.
+     Emitting both would be a duplicate declaration that node --check rejects, so
+     the compiler must fail closed (Compile_error) rather than emit broken JS. *)
+  let raises_compile_error wf =
+    try ignore (Compiler.compile_workflow wf); false
+    with Compiler.Compile_error _ -> true
+  in
+  (* Two ids sanitizing to the same identifier in one scope -> fail closed. *)
+  Alcotest.(check bool) "colliding ids in same scope: Compile_error" true
+    (raises_compile_error
+       { name = "n"; version = None;
+         steps = [ make_agent "a-b"; make_agent "a.b" ] });
+  (* A top-level id colliding with the exported `meta` const -> fail closed. *)
+  Alcotest.(check bool) "id 'meta' collides with exported meta: Compile_error" true
+    (raises_compile_error
+       { name = "n"; version = None; steps = [ make_agent "meta" ] });
+  (* An id colliding with the foreach `item` parameter -> fail closed. *)
+  Alcotest.(check bool) "id 'item' collides with foreach item: Compile_error" true
+    (raises_compile_error
+       { name = "n"; version = None;
+         steps = [ Foreach { over = "xs"; steps = [ make_agent "item" ] } ] });
+  (* The SAME id in DIFFERENT (sibling) scopes is legal JS and must compile. *)
+  Alcotest.(check bool) "same id in sibling scopes: no error" false
+    (raises_compile_error
+       { name = "n"; version = None;
+         steps = [ make_agent "x";
+                   Foreach { over = "xs"; steps = [ make_agent "x" ] } ] })
+
 let test_compiler_hyphenated_ids () =
   (* Step IDs with hyphens are valid CWR but invalid JS identifiers.
      The compiler must replace '-' with '_' in variable names and path references. *)
@@ -3959,6 +3988,9 @@ let () =
           Alcotest.test_case
             "comment hardening: shell/evidence/foreach line terminators neutralized" `Quick
             test_compiler_comment_lineterm_hardening;
+          Alcotest.test_case
+            "id collision: distinct ids -> same JS var fails closed (per scope)" `Quick
+            test_compiler_id_collision;
           Alcotest.test_case
             "expr comparison ops: Ne !== , Lt < , Le <= , Gt > , Ge >=" `Quick
             test_compiler_expr_comparison_ops;
