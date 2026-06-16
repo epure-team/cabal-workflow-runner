@@ -54,6 +54,9 @@ type step =
       read_only : bool;
       output_schema : Schema.t option;
       on_failure : on_failure;
+      protocol : string option;
+      brief : string option;
+      agent_type : string option;
     }
   | Gate of { id : string; when_ : Expr.t }
   | Branch of { when_ : Expr.t; then_ : step list; else_ : step list }
@@ -72,6 +75,19 @@ type step =
   | Commit of { id : string }
   | Parallel of { branches : step list list }
   | Foreach of { over : string; steps : step list }
+  | Shell of {
+      id : string;
+      commands : string list;
+      on_failure : on_failure;
+    }
+  | Evidence of {
+      id : string;
+      build : string;
+      check : string;
+      zero_admits : string;
+      tier : string;
+      output : string;
+    }
 
 and governor =
   | Max_iters of int
@@ -177,6 +193,13 @@ type trace_entry =
           [replay --ledger file] can reconstruct the same initial context.
           NOT emitted by the engine and NOT fed to [Engine.replay] as a trace
           entry — it is stripped by [cmd_replay] before parsing the trace. *)
+  | Shell_executed of { id : string; results : (string * int) list }
+      (** A [Shell] step's commands ran; [(command_string, exit_code)] pairs in
+          execution order (stops at first failure). Replay re-binds without
+          re-running. *)
+  | Evidence_evaluated of { id : string; tier : string; passed : bool }
+      (** A [Evidence] step evaluated; [passed] iff build + check succeeded and
+          the zero_admits pattern was absent from the output file. *)
 
 type trace = trace_entry list
 

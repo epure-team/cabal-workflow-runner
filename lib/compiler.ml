@@ -22,6 +22,10 @@ type ctx = {
   notes : note list ref;
   indent : int;
   loop_counter : int ref;
+  read_file : string -> string option;
+      (** Read a file by path; returns [None] if the file can't be opened. Used
+          to inline [protocol]/[brief] file contents into agent() calls. The
+          default (set by [compile_workflow]) reads from the filesystem. *)
 }
 
 let emit ctx s =
@@ -29,16 +33,46 @@ let emit ctx s =
   Buffer.add_string ctx.buf s;
   Buffer.add_char ctx.buf '\n'
 
+(* Make a string safe to embed in a single-line JS [//] comment: replace every
+   character that terminates a line comment with a visible literal placeholder,
+   so the comment can never be split and have its tail become executable code.
+   A JS LineTerminator is LF, CR, and the Unicode separators U+2028 / U+2029
+   (UTF-8 [E2 80 A8] / [E2 80 A9]). Escapes are NOT interpreted inside a comment,
+   so we emit the placeholder text (e.g. backslash-n), not a real escape. *)
+let js_comment_safe s =
+  let buf = Buffer.create (String.length s + 4) in
+  let n = String.length s in
+  let i = ref 0 in
+  while !i < n do
+    let c = s.[!i] in
+    if c = '\n' then (Buffer.add_string buf "\\n"; incr i)
+    else if c = '\r' then (Buffer.add_string buf "\\r"; incr i)
+    else if !i + 2 < n && c = '\xE2' && s.[!i + 1] = '\x80'
+            && (s.[!i + 2] = '\xA8' || s.[!i + 2] = '\xA9') then begin
+      Buffer.add_string buf (if s.[!i + 2] = '\xA8' then "\\u2028" else "\\u2029");
+      i := !i + 3
+    end
+    else (Buffer.add_char buf c; incr i)
+  done;
+  Buffer.contents buf
+
+(* All comment emission routes through here, so [js_comment_safe] is applied
+   centrally: no parser-accepted workflow string interpolated into a comment can
+   split it and leak its tail as executable JS (the silent-invalid-output class). *)
 let emit_comment ctx s =
   Buffer.add_string ctx.buf (indent_str ctx.indent);
   Buffer.add_string ctx.buf "// ";
-  Buffer.add_string ctx.buf s;
+  Buffer.add_string ctx.buf (js_comment_safe s);
   Buffer.add_char ctx.buf '\n'
 
 let add_note ctx ~kind ~description =
   ctx.notes := { kind; description } :: !(ctx.notes)
 
 let indent ctx = { ctx with indent = ctx.indent + 1 }
+
+let read_file_default path =
+  try Some (In_channel.with_open_text path In_channel.input_all)
+  with Sys_error _ -> None
 
 let cmd_to_string cmd =
   String.concat " " (List.map (fun s ->
@@ -157,16 +191,42 @@ let rec compile_steps ctx steps =
 
 and compile_step ctx step =
   match step with
-  | Types.Agent { id; prompt; read_only; output_schema; on_failure } ->
+  | Types.Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type } ->
       if read_only then emit_comment ctx "[read-only]";
       let var = js_ident id in
       let schema_opt = match output_schema with
         | None -> ""
         | Some s -> Printf.sprintf ", schema: %s" (schema_to_js s)
       in
+      let agent_type_opt = match agent_type with
+        | None -> ""
+        | Some at -> Printf.sprintf ", agentType: \"%s\"" (js_escape_string at)
+      in
+      let inline_file label path_opt =
+        match path_opt with
+        | None -> None
+        | Some p ->
+            match ctx.read_file p with
+            | Some content -> Some content
+            | None ->
+                add_note ctx ~kind:"agent"
+                  ~description:(Printf.sprintf
+                    "agent %S: %s file %S could not be read at compile time; \
+                     content omitted from JS output" id label p);
+                None
+      in
+      let effective_prompt =
+        let parts = List.filter_map (fun x -> x)
+          [ inline_file "protocol" protocol;
+            inline_file "brief" brief;
+            Some prompt ]
+        in
+        String.concat "\n\n" parts
+      in
       let agent_call =
-        Printf.sprintf "await agent(\"%s\", {label: \"%s\"%s});"
-          (js_escape_string prompt) (js_escape_string id) schema_opt
+        Printf.sprintf "await agent(\"%s\", {label: \"%s\"%s%s});"
+          (js_escape_string effective_prompt) (js_escape_string id)
+          schema_opt agent_type_opt
       in
       (match on_failure with
       | Types.Abort ->
@@ -248,12 +308,36 @@ and compile_step ctx step =
   | Types.Foreach { over; steps = body } ->
       emit_comment ctx (Printf.sprintf
         "[CWR foreach: over=%S — static ctx reference]" over);
-      emit ctx (Printf.sprintf "await pipeline(%s, async (item) => {" over);
+      (* [over] is a ctx key referencing a prior step's output, which is bound as
+         [const <js_ident id>]; sanitize it the same way so the emitted JS is both
+         valid and consistent with the variable naming, never raw user text. *)
+      emit ctx (Printf.sprintf "await pipeline(%s, async (item) => {" (js_ident over));
       compile_steps (indent ctx) body;
       emit ctx "});";
       add_note ctx ~kind:"foreach"
         ~description:(Printf.sprintf
           "foreach over ctx key %S compiled to pipeline(); static ctx reference" over)
+  | Types.Shell { id; commands; on_failure = _ } ->
+      emit_comment ctx (Printf.sprintf
+        "[CWR shell: id=%S (%d command(s)) — not representable in Claude Workflow JS]" id
+        (List.length commands));
+      List.iter (fun cmd ->
+        emit_comment ctx (Printf.sprintf "  %s" cmd)) commands;
+      add_note ctx ~kind:"shell"
+        ~description:(Printf.sprintf
+          "shell step %S (%d command(s)) omitted from JS output; \
+           not representable in Claude Workflow JS" id (List.length commands))
+  | Types.Evidence { id; tier; build; check; zero_admits; output } ->
+      emit_comment ctx (Printf.sprintf
+        "[CWR evidence: id=%S tier=%s — formal verification, not representable in Claude Workflow JS]"
+        id tier);
+      emit_comment ctx (Printf.sprintf "  build: %s" build);
+      emit_comment ctx (Printf.sprintf "  check: %s" check);
+      emit_comment ctx (Printf.sprintf "  zero_admits: %s in %s" zero_admits output);
+      add_note ctx ~kind:"evidence"
+        ~description:(Printf.sprintf
+          "evidence step %S (tier %s) omitted from JS output; \
+           formal verification not representable in Claude Workflow JS" id tier)
 
 (* Compile a validated CWR workflow to Claude Workflow JS text.
    Returns (js_text, notes) where notes is a list of compilation notes
@@ -265,15 +349,12 @@ let compile_workflow (wf : Types.workflow) : string * note list =
     | Some v -> Printf.sprintf "v%s" v
     | None -> "(unversioned)"
   in
-  let name_safe =
-    String.concat "\\n" (String.split_on_char '\n'
-      (String.concat "\\r" (String.split_on_char '\r' wf.name)))
-  in
+  let name_safe = js_comment_safe wf.name in
   Buffer.add_string buf (Printf.sprintf "// Compiled from CWR %s\n" version_str);
   Buffer.add_string buf (Printf.sprintf "// Workflow: %s\n\n" name_safe);
   Buffer.add_string buf
     (Printf.sprintf "export const meta = { name: '%s', description: '' };\n\n"
        (js_escape_single_quoted wf.name));
-  let ctx = { buf; notes; indent = 0; loop_counter = ref 0 } in
+  let ctx = { buf; notes; indent = 0; loop_counter = ref 0; read_file = read_file_default } in
   compile_steps ctx wf.steps;
   (Buffer.contents buf, List.rev !notes)

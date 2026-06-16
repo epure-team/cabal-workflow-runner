@@ -81,8 +81,8 @@ let path_bearing_head = function
 let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initial_ctx = [])
     ~sw:(_sw : Eio.Switch.t) ~backend ~token validated =
   let wf = Validate.Validated.workflow validated in
-  let agent ~id ~prompt ~read_only =
-    backend.Backend.run_agent ~id ~prompt ~read_only
+  let agent ~id ~prompt ~read_only ~agent_type =
+    backend.Backend.run_agent ~id ~prompt ~read_only ~agent_type
   in
   let eval st e = Expr.eval ~ctx:(ctx_for st) e in
   let rec go st steps =
@@ -93,8 +93,24 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initi
         go st rest
   and go_step st step =
     match step with
-    | Agent { id; prompt; read_only; output_schema; on_failure } -> (
-        let success, output = agent ~id ~prompt ~read_only in
+    | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type } ->
+        let read_opt label = function
+          | None -> `Ok ""
+          | Some p ->
+              (try `Ok (In_channel.with_open_text p In_channel.input_all)
+               with Sys_error msg ->
+                 `Err (Printf.sprintf "agent %S: cannot read %s %S: %s" id label p msg))
+        in
+        (match (read_opt "protocol" protocol, read_opt "brief" brief) with
+        | `Err reason, _ | _, `Err reason ->
+            let st = { st with terminal = Some (Aborted reason) } in
+            emit st (Blocked_at { id; reason })
+        | `Ok pc, `Ok bc ->
+        let effective_prompt =
+          let parts = List.filter (fun s -> s <> "") [ pc; bc; prompt ] in
+          String.concat "\n\n" parts
+        in
+        let success, output = agent ~id ~prompt:effective_prompt ~read_only ~agent_type in
         let st = emit st (Agent_ran { id; success; output }) in
         let st = bind_output st id output in
         (* An UNSUCCESSFUL agent run is fail-closed by default ([Abort]): it aborts
@@ -319,6 +335,60 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initi
           | _ -> st
         in
         emit st (Parallel_completed { outcome = worst })
+    | Shell { id; commands; on_failure } ->
+        let results = ref [] in
+        let failed_cmd = ref None in
+        let rec run_cmds = function
+          | [] -> ()
+          | cmd :: rest ->
+              let exit_code = backend.Backend.run_shell_command cmd in
+              results := (cmd, exit_code) :: !results;
+              if exit_code <> 0 then failed_cmd := Some (cmd, exit_code)
+              else run_cmds rest
+        in
+        run_cmds commands;
+        let results_list = List.rev !results in
+        let st = emit st (Shell_executed { id; results = results_list }) in
+        (match !failed_cmd with
+        | None -> st
+        | Some (cmd, code) ->
+            match on_failure with
+            | Types.Continue -> st
+            | Types.Abort ->
+                let reason =
+                  Printf.sprintf "shell step %S: command %S exited with code %d"
+                    id cmd code
+                in
+                let st = { st with terminal = Some (Aborted reason) } in
+                emit st (Blocked_at { id; reason }))
+    | Evidence { id; build; check; zero_admits; tier; output } ->
+        let run_cmd cmd = backend.Backend.run_shell_command cmd in
+        let file_contains content pattern =
+          let nc = String.length content and np = String.length pattern in
+          let rec at i = i + np <= nc && (String.sub content i np = pattern || at (i + 1)) in
+          np > 0 && at 0
+        in
+        let build_exit = run_cmd build in
+        let check_exit = run_cmd check in
+        let output_content =
+          try In_channel.with_open_text output In_channel.input_all
+          with Sys_error _ -> ""
+        in
+        let has_admits = file_contains output_content zero_admits in
+        let passed = build_exit = 0 && check_exit = 0 && not has_admits in
+        let st = emit st (Evidence_evaluated { id; tier; passed }) in
+        if not passed then begin
+          let reason =
+            if build_exit <> 0 then
+              Printf.sprintf "evidence %S: build exited with code %d" id build_exit
+            else if check_exit <> 0 then
+              Printf.sprintf "evidence %S: check exited with code %d" id check_exit
+            else
+              Printf.sprintf "evidence %S: zero_admits pattern %S found in %S" id zero_admits output
+          in
+          let st = { st with terminal = Some (Aborted reason) } in
+          emit st (Blocked_at { id; reason })
+        end else st
   (* Governed loop. Per iteration: bind loop.iter, run body, then stop if
      [until] holds OR any governor fires. The bound is a pure function of
      recorded inputs (agent outputs, budget readings, fixpoint verdicts), so the
@@ -410,7 +480,8 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = []) ~sw:(_
         go st rest
   and go_step st step =
     match step with
-    | Agent { id; prompt = _; read_only = _; output_schema; on_failure } -> (
+    | Agent { id; prompt = _; read_only = _; output_schema; on_failure;
+              protocol = _; brief = _; agent_type = _ } -> (
         match next () with
         | Agent_ran { success; output; id = rid } when rid = id -> (
             let st = emit st (Agent_ran { id; success; output }) in
@@ -603,6 +674,39 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = []) ~sw:(_
                  emit st (Parallel_completed { outcome = worst })
              | _ -> raise (Replay_mismatch "parallel_completed entry mismatch"))
         | _ -> raise (Replay_mismatch "parallel_started entry mismatch"))
+    | Shell { id; commands = _; on_failure } -> (
+        match next () with
+        | Shell_executed { id = rid; results } when rid = id ->
+            let st = emit st (Shell_executed { id; results }) in
+            let failed = List.find_opt (fun (_, code) -> code <> 0) results in
+            (match failed with
+            | None -> st
+            | Some (cmd, code) ->
+                match on_failure with
+                | Types.Continue -> st
+                | Types.Abort ->
+                    let reason =
+                      Printf.sprintf "shell step %S: command %S exited with code %d"
+                        id cmd code
+                    in
+                    (match next () with
+                    | Blocked_at { id = bid; reason = _ } when bid = id ->
+                        let st = { st with terminal = Some (Aborted reason) } in
+                        emit st (Blocked_at { id; reason })
+                    | _ -> raise (Replay_mismatch "shell block entry mismatch")))
+        | _ -> raise (Replay_mismatch "shell_executed entry mismatch"))
+    | Evidence { id; build = _; check = _; zero_admits = _; tier = _; output = _ } -> (
+        match next () with
+        | Evidence_evaluated { id = rid; tier; passed } when rid = id ->
+            let st = emit st (Evidence_evaluated { id; tier; passed }) in
+            if not passed then begin
+              match next () with
+              | Blocked_at { id = bid; reason } when bid = id ->
+                  let st = { st with terminal = Some (Aborted reason) } in
+                  emit st (Blocked_at { id; reason })
+              | _ -> raise (Replay_mismatch "evidence block entry mismatch")
+            end else st
+        | _ -> raise (Replay_mismatch "evidence_evaluated entry mismatch"))
   and replay_loop st body until governors =
     let fixpoint_counts = Array.make (List.length governors) 0 in
     let rec iter st index =

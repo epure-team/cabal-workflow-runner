@@ -216,6 +216,9 @@ let step_def : Yojson.Safe.t =
           ("read_only", typ "boolean");
           ("output_schema", ref_ "output_schema");
           ("on_failure", obj [ ("enum", arr [ s "abort"; s "continue" ]) ]);
+          ("protocol", typ "string");
+          ("brief", typ "string");
+          ("agent_type", typ "string");
         ]
   in
   let gate =
@@ -313,11 +316,43 @@ let step_def : Yojson.Safe.t =
           ("steps", step_list);
         ]
   in
+  let shell =
+    closed_object_with
+      ~required:[ "kind"; "id"; "commands" ]
+      ~props:
+        [
+          ("kind", kind_const "shell");
+          ("id", typ "string");
+          ( "commands",
+            obj
+              [
+                ("type", s "array");
+                ("items", typ "string");
+                ("minItems", `Int 1);
+              ] );
+          ("on_failure", obj [ ("enum", arr [ s "abort"; s "continue" ]) ]);
+        ]
+  in
+  let evidence =
+    closed_object_with
+      ~required:[ "kind"; "id"; "build"; "check"; "zero_admits"; "tier"; "output" ]
+      ~props:
+        [
+          ("kind", kind_const "evidence");
+          ("id", typ "string");
+          ("build", typ "string");
+          ("check", typ "string");
+          ("zero_admits", typ "string");
+          ("tier", typ "string");
+          ("output", typ "string");
+        ]
+  in
   obj
     [
       ( "description",
         s "A workflow step, discriminated by the \"kind\" key." );
-      ("oneOf", arr [ agent; gate; branch; loop; run; commit; parallel; foreach ]);
+      ( "oneOf",
+        arr [ agent; gate; branch; loop; run; commit; parallel; foreach; shell; evidence ] );
     ]
 
 (* ---- top level ---------------------------------------------------------- *)

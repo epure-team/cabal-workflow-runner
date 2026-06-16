@@ -243,6 +243,11 @@ let rec step_of_json json =
   let kind = req_string "kind" json in
   match kind with
   | "agent" ->
+      let opt_string key json =
+        match member_opt key json with
+        | Some (`String s) -> Some s
+        | _ -> None
+      in
       let s =
         Agent
           {
@@ -251,11 +256,15 @@ let rec step_of_json json =
             read_only = opt_bool "read_only" false json;
             output_schema = opt_schema "output_schema" json;
             on_failure = opt_on_failure "on_failure" json;
+            protocol = opt_string "protocol" json;
+            brief = opt_string "brief" json;
+            agent_type = opt_string "agent_type" json;
           }
       in
       reject_unknown_keys ~what:"agent step"
         ~known:
-          [ "kind"; "id"; "prompt"; "read_only"; "output_schema"; "on_failure" ]
+          [ "kind"; "id"; "prompt"; "read_only"; "output_schema"; "on_failure";
+            "protocol"; "brief"; "agent_type" ]
         json;
       s
   | "gate" ->
@@ -331,6 +340,34 @@ let rec step_of_json json =
       reject_unknown_keys ~what:"foreach step"
         ~known:[ "kind"; "over"; "steps" ] json;
       s
+  | "shell" ->
+      let s =
+        Shell
+          {
+            id = req_string "id" json;
+            commands = req_string_nonempty_list "commands" json;
+            on_failure = opt_on_failure "on_failure" json;
+          }
+      in
+      reject_unknown_keys ~what:"shell step"
+        ~known:[ "kind"; "id"; "commands"; "on_failure" ] json;
+      s
+  | "evidence" ->
+      let s =
+        Evidence
+          {
+            id = req_string "id" json;
+            build = req_string "build" json;
+            check = req_string "check" json;
+            zero_admits = req_string "zero_admits" json;
+            tier = req_string "tier" json;
+            output = req_string "output" json;
+          }
+      in
+      reject_unknown_keys ~what:"evidence step"
+        ~known:[ "kind"; "id"; "build"; "check"; "zero_admits"; "tier"; "output" ]
+        json;
+      s
   | other -> err "unknown step kind %S" other
 
 let of_json json =
@@ -403,7 +440,7 @@ let governor_to_json = function
         ]
 
 let rec step_to_json = function
-  | Agent { id; prompt; read_only; output_schema; on_failure } ->
+  | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type } ->
       `Assoc
         ([
            ("kind", `String "agent");
@@ -416,6 +453,9 @@ let rec step_to_json = function
         @ (match on_failure with
           | Types.Abort -> []
           | Types.Continue -> [ ("on_failure", `String "continue") ])
+        @ (match protocol with None -> [] | Some p -> [ ("protocol", `String p) ])
+        @ (match brief with None -> [] | Some b -> [ ("brief", `String b) ])
+        @ (match agent_type with None -> [] | Some t -> [ ("agent_type", `String t) ])
         @
         match output_schema with
         | None -> []
@@ -469,6 +509,27 @@ let rec step_to_json = function
           ("kind", `String "foreach");
           ("over", `String over);
           ("steps", `List (List.map step_to_json steps));
+        ]
+  | Shell { id; commands; on_failure } ->
+      `Assoc
+        ([
+           ("kind", `String "shell");
+           ("id", `String id);
+           ("commands", `List (List.map (fun s -> `String s) commands));
+         ]
+        @ match on_failure with
+          | Types.Abort -> []
+          | Types.Continue -> [ ("on_failure", `String "continue") ])
+  | Evidence { id; build; check; zero_admits; tier; output } ->
+      `Assoc
+        [
+          ("kind", `String "evidence");
+          ("id", `String id);
+          ("build", `String build);
+          ("check", `String check);
+          ("zero_admits", `String zero_admits);
+          ("tier", `String tier);
+          ("output", `String output);
         ]
 
 let to_json { name; steps; version } =

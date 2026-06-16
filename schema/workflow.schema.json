@@ -25,7 +25,10 @@
             "prompt": { "type": "string" },
             "read_only": { "type": "boolean" },
             "output_schema": { "$ref": "#/$defs/output_schema" },
-            "on_failure": { "enum": [ "abort", "continue" ] }
+            "on_failure": { "enum": [ "abort", "continue" ] },
+            "protocol": { "type": "string" },
+            "brief": { "type": "string" },
+            "agent_type": { "type": "string" }
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false
@@ -128,6 +131,39 @@
             "kind": { "const": "foreach" },
             "over": { "type": "string" },
             "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "id", "commands" ],
+          "properties": {
+            "kind": { "const": "shell" },
+            "id": { "type": "string" },
+            "commands": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "on_failure": { "enum": [ "abort", "continue" ] }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind", "id", "build", "check", "zero_admits", "tier", "output"
+          ],
+          "properties": {
+            "kind": { "const": "evidence" },
+            "id": { "type": "string" },
+            "build": { "type": "string" },
+            "check": { "type": "string" },
+            "zero_admits": { "type": "string" },
+            "tier": { "type": "string" },
+            "output": { "type": "string" }
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false

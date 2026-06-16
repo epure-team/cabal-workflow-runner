@@ -61,6 +61,17 @@ type step =
       on_failure : on_failure;
           (** Behaviour on an unsuccessful run; defaults to [Abort] when the
               workflow omits ["on_failure"]. *)
+      protocol : string option;
+          (** Optional path to a protocol/skill file whose contents are prepended
+              to the effective prompt before dispatch (engine resolves at run time;
+              compiler inlines at compile time). *)
+      brief : string option;
+          (** Optional path to a brief/context file, prepended after [protocol]
+              and before [prompt]. *)
+      agent_type : string option;
+          (** Optional agent-type identifier forwarded to the backend for routing
+              (e.g. ["code-reviewer"]) and emitted as [{agentType: "..."}] in the
+              compiled Claude Workflow JS. *)
     }
       (** Dispatch agent work; records [(success, structured_json)] and binds the
           output into the run context under ["outputs.<id>"]. *)
@@ -109,6 +120,26 @@ type step =
   | Foreach of { over : string; steps : step list }
       (** Iterate over the JSON array at [ctx[over]], running [steps] once per
           element (bound as [ctx["item"]]). Sequential, not concurrent. *)
+  | Shell of {
+      id : string;
+      commands : string list;  (** non-empty; each run via [sh -c cmd]. *)
+      on_failure : on_failure;
+    }
+      (** Run shell commands in sequence, stopping at first non-zero exit.
+          Records [(command_string, exit_code)] pairs in the trace for replay.
+          No filesystem snapshot (unlike [Run]); exit codes are the sole output.
+          Dispatched via [Backend.run_shell_command] (injected; never in lib). *)
+  | Evidence of {
+      id : string;
+      build : string;    (** build command, run first *)
+      check : string;    (** check command, run second *)
+      zero_admits : string;  (** pattern that must NOT appear in [output] *)
+      tier : string;         (** "A" | "B" | "C" *)
+      output : string;       (** output file to search for [zero_admits] *)
+    }
+      (** Formal-verification quality gate: build + check + zero-admits search.
+          Passes iff build exits 0, check exits 0, and [zero_admits] is absent
+          from [output]. Fail-closed: a failed [Evidence] aborts the run. *)
 
 (** A loop governor — each can independently fire to stop the loop. *)
 and governor =
@@ -221,6 +252,12 @@ type trace_entry =
           [replay --ledger file] can reconstruct the same initial context.
           NOT emitted by the engine and NOT fed to {!Engine.replay} as a trace
           entry — it is stripped by [cmd_replay] before parsing the trace. *)
+  | Shell_executed of { id : string; results : (string * int) list }
+      (** [(command_string, exit_code)] pairs from a {!Shell} step, in execution
+          order (stops at first failure). Replay re-binds without re-running. *)
+  | Evidence_evaluated of { id : string; tier : string; passed : bool }
+      (** Outcome of an {!Evidence} step: [passed] iff build + check succeeded
+          and the zero_admits pattern was absent from the output file. *)
 
 type trace = trace_entry list
 (** Trace entries in execution order (first executed step first). *)

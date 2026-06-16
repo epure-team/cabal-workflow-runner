@@ -53,6 +53,10 @@ let print_trace trace =
             (Types.string_of_outcome outcome)
       | Types.Foreach_completed { iterations } ->
           Printf.printf "  foreach  completed %d iter(s)\n" iterations
+      | Types.Shell_executed { id; results } ->
+          Printf.printf "  shell    %-16s %d command(s)\n" id (List.length results)
+      | Types.Evidence_evaluated { id; tier; passed } ->
+          Printf.printf "  evidence %-16s tier=%s passed=%b\n" id tier passed
       | Types.Ctx_snapshot _ ->
           (* ledger-layer header, never appears in an engine trace *) ())
     trace

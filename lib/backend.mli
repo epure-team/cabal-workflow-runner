@@ -10,8 +10,14 @@
 
 type t = {
   run_agent :
-    id:string -> prompt:string -> read_only:bool -> bool * Yojson.Safe.t;
-      (** Run agent work; returns [(success, structured_json)]. *)
+    id:string ->
+    prompt:string ->
+    read_only:bool ->
+    agent_type:string option ->
+    bool * Yojson.Safe.t;
+      (** Run agent work; returns [(success, structured_json)]. [agent_type]
+          is an optional routing hint (e.g. ["code-reviewer"]) forwarded to the
+          backend so it can select a specialised adapter. *)
   budget : unit -> int;
       (** Remaining budget. A [Budget] governor stops the loop once this is
           [<= 0]. Embedder-supplied; a decrementing stub lets tests force loop
@@ -30,10 +36,19 @@ type t = {
           directory snapshot. The engine calls it at most ONCE per run step (on a
           live run, and only after the allowlist check passes); {!Engine.replay}
           NEVER calls it (it re-feeds the recorded result). *)
+  run_shell_command : string -> int;
+      (** Execute a shell command string via [sh -c] and return its exit code.
+          Used by [Shell] and [Evidence] steps. The lib never spawns a process;
+          only [bin/] provides a real implementation. {!Engine.replay} NEVER calls
+          it (it re-feeds the recorded exit codes). *)
 }
 
 val stub :
-  ?agent:(id:string -> prompt:string -> read_only:bool -> bool * Yojson.Safe.t) ->
+  ?agent:(id:string ->
+          prompt:string ->
+          read_only:bool ->
+          agent_type:string option ->
+          bool * Yojson.Safe.t) ->
   ?budget:(unit -> int) ->
   ?run_command:
     (id:string ->
@@ -42,6 +57,7 @@ val stub :
      timeout_ms:int option ->
      observe:string list option ->
      Types.run_result) ->
+  ?run_shell_command:(string -> int) ->
   unit ->
   t
 (** A deterministic stub backend used by tests and as a default. By default all
