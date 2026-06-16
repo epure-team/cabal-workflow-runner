@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.14
+
+**Faithful CWR→JS compiler.** `to-claude-workflow` now emits runnable Claude Workflow
+JavaScript instead of stubs: an `Expr.t → JS` translator so `gate`/`branch` emit real
+conditions, loop-governor → JS termination (counter, budget, fixpoint), the mandatory
+`export const meta = {...}` header, agent-option forwarding (`output_schema`, `read_only`,
+`on_failure`), and compilation of `shell`/`evidence` steps plus `protocol`/`brief`/
+`agent_type` agent fields. (`commit` and `run` keep their documented approximations + notes;
+direction is CWR→JS only, no reverse parser.)
+
+**Compiler safety — "silent-invalid-output" class closed.** Every parser-accepted workflow
+now either compiles to JS that `node --check` accepts, or fails closed with a clear
+`Compile_error` (CLI exits non-zero) — never exit-0 JS that node rejects. Three fixes:
+`js_comment_safe` neutralizes all four JS line terminators (LF, CR, U+2028, U+2029),
+applied centrally in `emit_comment` so no workflow string (name, version, shell/evidence
+fields, run/parallel comments) can split a `//` comment and leak its tail as code; `foreach`'s
+`over` ctx key is emitted via `js_ident` instead of raw into the live `pipeline(...)` call;
+and a per-JS-scope variable-binding tracker fails closed when two step ids collide on the
+same JS variable name in one scope (since `js_ident` is lossy), including collisions with the
+implicit `export const meta` and the `item` foreach parameter. Sibling scopes may legally
+reuse a name.
+
+**Per-step agent `model` override.** An `Agent` step gains an optional `model` field (e.g.
+`"claude-fable-5"`) that overrides the backend's global `CWR_MODEL` for that step only; a
+blank value or an absent field falls back to the backend default. Threaded through the
+parser/serializer (added to the agent closed known-key set), the JSON schema (schema↔parser
+parity + no-drift hold), the backend `run_agent` interface, the cabal backend, the engine
+(live + replay; `model` does not enter the trace, so replay stays byte-identical), and the
+CWR→JS compiler (emitted as a `model: "..."` `agent()` option). CLI `--version` → `0.14.0`.
+
+> Note: the v0.12 and v0.13 releases were tagged but never given CHANGELOG sections; this
+> entry does not attempt to reconstruct them.
+
 ## v0.11
 
 **Soft-fail agent steps (`on_failure`).** An `Agent` step gains an optional `on_failure`
