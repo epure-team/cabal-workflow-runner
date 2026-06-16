@@ -219,6 +219,7 @@ let step_def : Yojson.Safe.t =
           ("protocol", typ "string");
           ("brief", typ "string");
           ("agent_type", typ "string");
+          ("model", typ "string");
         ]
   in
   let gate =

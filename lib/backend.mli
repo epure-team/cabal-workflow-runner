@@ -14,10 +14,13 @@ type t = {
     prompt:string ->
     read_only:bool ->
     agent_type:string option ->
+    model:string option ->
     bool * Yojson.Safe.t;
       (** Run agent work; returns [(success, structured_json)]. [agent_type]
           is an optional routing hint (e.g. ["code-reviewer"]) forwarded to the
-          backend so it can select a specialised adapter. *)
+          backend so it can select a specialised adapter. [model] is an optional
+          per-step model override (e.g. ["claude-fable-5"]); when [None] the
+          backend's default applies (e.g. its global [CWR_MODEL]). *)
   budget : unit -> int;
       (** Remaining budget. A [Budget] governor stops the loop once this is
           [<= 0]. Embedder-supplied; a decrementing stub lets tests force loop
@@ -48,6 +51,7 @@ val stub :
           prompt:string ->
           read_only:bool ->
           agent_type:string option ->
+          model:string option ->
           bool * Yojson.Safe.t) ->
   ?budget:(unit -> int) ->
   ?run_command:

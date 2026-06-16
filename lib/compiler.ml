@@ -228,7 +228,7 @@ let rec compile_steps ctx steps =
 
 and compile_step ctx step =
   match step with
-  | Types.Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type } ->
+  | Types.Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model } ->
       if read_only then emit_comment ctx "[read-only]";
       let var = js_ident id in
       let schema_opt = match output_schema with
@@ -238,6 +238,10 @@ and compile_step ctx step =
       let agent_type_opt = match agent_type with
         | None -> ""
         | Some at -> Printf.sprintf ", agentType: \"%s\"" (js_escape_string at)
+      in
+      let model_opt = match model with
+        | None -> ""
+        | Some m -> Printf.sprintf ", model: \"%s\"" (js_escape_string m)
       in
       let inline_file label path_opt =
         match path_opt with
@@ -261,9 +265,9 @@ and compile_step ctx step =
         String.concat "\n\n" parts
       in
       let agent_call =
-        Printf.sprintf "await agent(\"%s\", {label: \"%s\"%s%s});"
+        Printf.sprintf "await agent(\"%s\", {label: \"%s\"%s%s%s});"
           (js_escape_string effective_prompt) (js_escape_string id)
-          schema_opt agent_type_opt
+          schema_opt agent_type_opt model_opt
       in
       bind_var ctx ~src:(Printf.sprintf "step id %S" id) var;
       (match on_failure with

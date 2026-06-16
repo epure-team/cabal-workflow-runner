@@ -26,7 +26,7 @@ commit). A `workflow` is a name plus a `step list`:
 
 | Step | Meaning | Determinism |
 |------|---------|-------------|
-| `Agent { id; prompt; read_only; output_schema; on_failure }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. A **`success = false` run fails closed** → `Aborted` **by default** (`on_failure = "abort"`); with **`on_failure = "continue"`** the failure is **soft** — the failed `Agent_ran` is recorded and the walk continues (for continuous loops where one iteration's failure must not kill the run). On success, if `output_schema` is present the JSON is validated **fail-closed**. | Effect isolated to the backend; structured result recorded. |
+| `Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. A **`success = false` run fails closed** → `Aborted` **by default** (`on_failure = "abort"`); with **`on_failure = "continue"`** the failure is **soft** — the failed `Agent_ran` is recorded and the walk continues (for continuous loops where one iteration's failure must not kill the run). On success, if `output_schema` is present the JSON is validated **fail-closed**. Optional routing/inlining hints: `protocol`/`brief` (file paths whose contents prepend the prompt), `agent_type` (backend adapter selector), and **`model`** (per-step model override, e.g. `"claude-fable-5"`, that takes precedence over the backend's global `CWR_MODEL` for this step only; absent ⇒ backend default). | Effect isolated to the backend; structured result recorded. |
 | `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). A `Pass` records the verdict and continues; a **`Fail` BLOCKS** the run (`Blocked`, naming the gate id). | Verdict recorded; a false gate is a terminal block. |
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
 | `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
@@ -352,7 +352,8 @@ DSL:
 
 ```ocaml
 type t = {
-  run_agent   : id:string -> prompt:string -> read_only:bool -> bool * Yojson.Safe.t;
+  run_agent   : id:string -> prompt:string -> read_only:bool ->
+                agent_type:string option -> model:string option -> bool * Yojson.Safe.t;
   budget      : unit -> int;   (* a Budget governor stops the loop once this is <= 0 *)
   run_command : id:string -> argv:string list -> working_dir:string ->
                 timeout_ms:int option -> observe:string list option -> run_result;
