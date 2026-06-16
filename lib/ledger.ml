@@ -81,6 +81,16 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
         [ ("index", `Int index); ("outcome", outcome_to_json outcome) ]
   | Foreach_completed { iterations } ->
       tagged "foreach_completed" [ ("iterations", `Int iterations) ]
+  | Shell_executed { id; results } ->
+      tagged "shell_executed"
+        [ ("id", `String id);
+          ("results",
+           `List (List.map (fun (cmd, code) ->
+             `Assoc [ ("command", `String cmd); ("exit_code", `Int code) ])
+             results)) ]
+  | Evidence_evaluated { id; tier; passed } ->
+      tagged "evidence_evaluated"
+        [ ("id", `String id); ("tier", `String tier); ("passed", `Bool passed) ]
   | Ctx_snapshot { ctx } ->
       tagged "ctx_snapshot" [ ("ctx", `Assoc ctx) ]
 
@@ -231,6 +241,21 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
       Foreach_iter_completed { index = dec_int "index" json; outcome }
   | "foreach_completed" ->
       Foreach_completed { iterations = dec_int "iterations" json }
+  | "shell_executed" ->
+      let id = dec_string "id" json in
+      let results =
+        match assoc_field "results" json with
+        | `List l ->
+            List.map (fun item ->
+              (dec_string "command" item, dec_int "exit_code" item)) l
+        | _ -> err "field \"results\" must be a list"
+      in
+      Shell_executed { id; results }
+  | "evidence_evaluated" ->
+      Evidence_evaluated
+        { id = dec_string "id" json;
+          tier = dec_string "tier" json;
+          passed = dec_bool "passed" json }
   | "ctx_snapshot" ->
       let ctx = match assoc_field "ctx" json with
         | `Assoc fields -> fields

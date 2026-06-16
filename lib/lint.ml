@@ -71,7 +71,7 @@ let rec any_commit steps =
       | Loop { body; _ } -> any_commit body
       | Parallel { branches } -> List.exists any_commit branches
       | Foreach { steps = body; _ } -> any_commit body
-      | Agent _ | Gate _ | Run _ -> false)
+      | Agent _ | Gate _ | Run _ | Shell _ | Evidence _ -> false)
     steps
 
 (* Check if a single step (at any depth) contains a Commit. Used for
@@ -88,7 +88,7 @@ and collect_agent_ids_step step : string list =
   | Loop { body; _ } -> collect_agent_ids body
   | Parallel { branches } -> List.concat_map collect_agent_ids branches
   | Foreach { steps = body; _ } -> collect_agent_ids body
-  | Gate _ | Run _ | Commit _ -> []
+  | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> []
 
 and collect_agent_ids steps =
   List.concat_map collect_agent_ids_step steps
@@ -108,6 +108,8 @@ and floor_step ~floor ~loc ~guaranteed acc step =
   match step with
   | Agent _ -> guaranteed
   | Run _ -> guaranteed
+  | Shell _ -> guaranteed
+  | Evidence _ -> guaranteed
   | Gate { id; when_ = _ } -> String_set.add id guaranteed
   | Commit { id } ->
       let missing =
@@ -347,6 +349,8 @@ let rec refs_steps ~loc_prefix ~(produced : produced) ~warned_missing acc steps
 
 and refs_step ~loc ~produced ~warned_missing acc step : produced =
   match step with
+  | Shell _ -> produced
+  | Evidence _ -> produced
   | Agent { id; output_schema; _ } ->
       let fields = Option.map schema_fields output_schema in
       (id, fields) :: List.remove_assoc id produced
@@ -467,7 +471,7 @@ let rec any_continue_agent steps =
       | Loop { body; _ } -> any_continue_agent body
       | Parallel { branches } -> List.exists any_continue_agent branches
       | Foreach { steps = body; _ } -> any_continue_agent body
-      | Agent _ | Gate _ | Run _ | Commit _ -> false)
+      | Agent _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> false)
     steps
 
 (* Flag steps that follow a Commit at the same level (a commit ends the run). *)

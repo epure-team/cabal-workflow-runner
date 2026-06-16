@@ -133,8 +133,16 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
     | Some m when String.trim m <> "" -> Some (String.trim m)
     | _ -> None
   in
-  let run_agent ~id ~prompt ~read_only =
-    match select () with
+  let run_agent ~id ~prompt ~read_only ~agent_type =
+    let backend_opt =
+      match agent_type with
+      | Some name when String.trim name <> "" ->
+          (match Registry.get (String.trim name) with
+          | Some _ as b -> b
+          | None -> select ())
+      | _ -> select ()
+    in
+    match backend_opt with
     | None ->
         ( false,
           `Assoc
@@ -155,4 +163,17 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
   (* The Run-step effect: process execution + a before/after directory snapshot,
      implemented in [Runner] (bin-side). The lib never spawns a process. *)
   let run_command = Runner.make ~sw ~env ~base:working_dir in
-  { Cabal_workflow_runner.Backend.run_agent; budget; run_command }
+  (* Shell-step effect: run a command string via [sh -c] and return the exit
+     code. Fail-safe: any spawn exception returns 127. *)
+  let run_shell_command cmd =
+    try
+      let pr =
+        Cabal.Backend_process.run_process ~sw ~env ~cmd:[ "sh"; "-c"; cmd ]
+          ~working_dir ~timeout_seconds:60.0 ()
+      in
+      match pr.Cabal.Backend_process.status with
+      | Cabal.Backend_types.Timeout -> 124
+      | _ -> pr.Cabal.Backend_process.exit_code
+    with _ -> 127
+  in
+  { Cabal_workflow_runner.Backend.run_agent; budget; run_command; run_shell_command }

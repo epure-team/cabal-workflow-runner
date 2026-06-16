@@ -53,6 +53,10 @@ let print_trace trace =
             (Types.string_of_outcome outcome)
       | Types.Foreach_completed { iterations } ->
           Printf.printf "  foreach  completed %d iter(s)\n" iterations
+      | Types.Shell_executed { id; results } ->
+          Printf.printf "  shell    %-16s %d command(s)\n" id (List.length results)
+      | Types.Evidence_evaluated { id; tier; passed } ->
+          Printf.printf "  evidence %-16s tier=%s passed=%b\n" id tier passed
       | Types.Ctx_snapshot _ ->
           (* ledger-layer header, never appears in an engine trace *) ())
     trace
@@ -222,15 +226,19 @@ let cmd_to_claude_workflow file =
       Printf.eprintf "parse error: %s\n" e;
       1
   | Ok wf ->
-      let js, notes = Compiler.compile_workflow wf in
-      print_string js;
-      if notes <> [] then begin
-        Printf.eprintf "\nCompilation notes (%d):\n" (List.length notes);
-        List.iter (fun (n : Compiler.note) ->
-          Printf.eprintf "  [%s] %s\n" n.kind n.description
-        ) notes
-      end;
-      0
+      match Compiler.compile_workflow wf with
+      | exception Compiler.Compile_error msg ->
+          Printf.eprintf "compile error: %s\n" msg;
+          1
+      | js, notes ->
+          print_string js;
+          if notes <> [] then begin
+            Printf.eprintf "\nCompilation notes (%d):\n" (List.length notes);
+            List.iter (fun (n : Compiler.note) ->
+              Printf.eprintf "  [%s] %s\n" n.kind n.description
+            ) notes
+          end;
+          0
 
 (* ---- cmdliner wiring ---- *)
 
