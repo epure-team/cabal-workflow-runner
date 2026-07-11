@@ -714,7 +714,7 @@ let test_replay_rejects_trailing_entries () =
 
 (* A stub run_command returning a fixed run_result regardless of args. *)
 let run_backend result =
-  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ = result in
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ = result in
   Backend.stub ~run_command ()
 
 let mk_file path change =
@@ -747,6 +747,8 @@ let test_run_step_outputs_and_gate () =
               working_dir = "scratch";
               timeout_ms = Some 30000;
               observe = Some [ "out" ];
+              input = None;
+              stdout_schema = None;
             };
           Gate
             {
@@ -767,7 +769,7 @@ let test_run_step_outputs_and_gate () =
   (* the recorded run_result is in the trace *)
   let recorded =
     List.find_map
-      (function Run_executed { id = "mk"; result } -> Some result | _ -> None)
+      (function Run_executed { id = "mk"; result; _ } -> Some result | _ -> None)
       trace
   in
   (match recorded with
@@ -801,7 +803,7 @@ let test_run_step_allowlist () =
               cmd = [ "rm"; "-rf"; "x" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None;
+              observe = None; input = None; stdout_schema = None;
             };
         ];
     }
@@ -810,7 +812,7 @@ let test_run_step_allowlist () =
   (* not in allowlist => Blocked, no execution *)
   let ran = ref 0 in
   let backend_count =
-    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
       incr ran;
       result
     in
@@ -837,7 +839,7 @@ let test_run_step_allowlist () =
   (* bare name in the allowlist => runs *)
   let ran2 = ref 0 in
   let backend2 =
-    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
       incr ran2;
       result
     in
@@ -852,7 +854,7 @@ let test_run_step_allowlist () =
   (* "*" => runs *)
   let ran3 = ref 0 in
   let backend3 =
-    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
       incr ran3;
       result
     in
@@ -871,7 +873,7 @@ let test_run_step_allowlist () =
    Trailing-entry rejection still holds. *)
 let test_run_step_replay_no_reexec () =
   let counter = ref 0 in
-  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
     incr counter;
     {
       exit = 0;
@@ -894,7 +896,7 @@ let test_run_step_replay_no_reexec () =
               cmd = [ "mkdir"; "out" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None;
+              observe = None; input = None; stdout_schema = None;
             };
           Gate
             {
@@ -929,7 +931,7 @@ let test_run_step_replay_no_reexec () =
    Deleted entry; both observed in their respective outputs.<id>.files. *)
 let test_run_step_file_diff () =
   let calls = ref 0 in
-  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
     incr calls;
     if !calls = 1 then
       {
@@ -956,7 +958,7 @@ let test_run_step_file_diff () =
         cmd = [ "touch"; "f" ];
         working_dir = "scratch";
         timeout_ms = None;
-        observe = None;
+        observe = None; input = None; stdout_schema = None;
       }
   in
   let wf =
@@ -969,7 +971,7 @@ let test_run_step_file_diff () =
   let files_of id =
     List.find_map
       (function
-        | Run_executed { id = rid; result } when rid = id -> Some result.files
+        | Run_executed { id = rid; result; _ } when rid = id -> Some result.files
         | _ -> None)
       trace
   in
@@ -1047,7 +1049,7 @@ let test_run_step_destructive_warning () =
               cmd = [ "rm"; "-rf"; "out" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None;
+              observe = None; input = None; stdout_schema = None;
             };
         ];
     }
@@ -1104,7 +1106,7 @@ let test_run_step_digest_known_answer () =
               cmd = [ "touch"; "out/x" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None;
+              observe = None; input = None; stdout_schema = None;
             };
         ];
     }
@@ -1113,7 +1115,7 @@ let test_run_step_digest_known_answer () =
   let _, trace = engine_run ~run_allowlist:[ "touch" ] ~backend ~token:None v in
   let recorded =
     List.find_map
-      (function Run_executed { id = "mk"; result } -> Some result | _ -> None)
+      (function Run_executed { id = "mk"; result; _ } -> Some result | _ -> None)
       trace
   in
   match recorded with
@@ -1143,7 +1145,7 @@ let test_run_step_rejects_path_argv0 () =
               cmd = [ cmd0; "out" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None;
+              observe = None; input = None; stdout_schema = None;
             };
         ];
     }
@@ -1152,7 +1154,7 @@ let test_run_step_rejects_path_argv0 () =
   let run_blocked cmd0 =
     let ran = ref 0 in
     let backend =
-      let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+      let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
         incr ran;
         result
       in
@@ -1194,7 +1196,7 @@ let test_run_step_rejects_path_argv0 () =
   (* bare name + allowlist => runs *)
   let ran_ok = ref 0 in
   let backend_ok =
-    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
       incr ran_ok;
       result
     in
@@ -1220,7 +1222,7 @@ let test_run_step_rejects_path_argv0 () =
 let test_run_step_effect_failure_recorded () =
   (* a run_command that simulates the bin runner's spawn-failure return: a
      well-formed non-zero result, NOT a raised exception. *)
-  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
     {
       exit = 127;
       stdout = "";
@@ -1242,7 +1244,7 @@ let test_run_step_effect_failure_recorded () =
               cmd = [ "definitely-not-a-real-binary-xyz" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None;
+              observe = None; input = None; stdout_schema = None;
             };
           Gate
             {
@@ -1262,7 +1264,7 @@ let test_run_step_effect_failure_recorded () =
   (* the failure was RECORDED (exit 127), the gate read it, the run completed *)
   let recorded =
     List.find_map
-      (function Run_executed { id = "boom"; result } -> Some result | _ -> None)
+      (function Run_executed { id = "boom"; result; _ } -> Some result | _ -> None)
       trace
   in
   (match recorded with
@@ -1273,6 +1275,136 @@ let test_run_step_effect_failure_recorded () =
   (* and it replays byte-identically *)
   let replayed = engine_replay ~trace v in
   Alcotest.(check outcome_testable) "replay identical" outcome replayed
+
+let test_run_step_structured_io_and_replay () =
+  let calls = ref 0 and seen_stdin = ref None in
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_
+      ~stdin_content =
+    incr calls; seen_stdin := stdin_content;
+    { exit = 0; stdout = {|{"ok":true}|}; stderr = ""; truncated = false; files = [] }
+  in
+  let wf =
+    { name = "structured-run"; version = None;
+      steps = [
+        Run { id = "tool"; cmd = [ "tool" ]; working_dir = "scratch";
+              timeout_ms = None; observe = None;
+              input = Some [ "seed.z"; "seed.a" ];
+              stdout_schema = Some [ ("ok", Schema.Bool) ] };
+        Gate { id = "parsed";
+               when_ = Expr.Eq (Expr.Path [ "outputs"; "tool"; "parsed"; "ok" ],
+                                Expr.Lit (Expr.Bool true)) } ] }
+  in
+  let v = validate_ok ~floor:[] wf in
+  let initial_ctx = [ ("seed", `Assoc [ ("z", `String "x"); ("a", `Int 1) ]) ] in
+  let outcome, trace = engine_run ~backend:(Backend.stub ~run_command ())
+      ~run_allowlist:[ "tool" ] ~initial_ctx ~token:None v in
+  Alcotest.(check outcome_testable) "structured run succeeds" Completed_no_commit outcome;
+  let canonical = {|{"seed.a":1,"seed.z":"x"}|} in
+  Alcotest.(check (option string)) "canonical selected stdin" (Some canonical) !seen_stdin;
+  let expected_digest = "sha256:" ^ Digestif.SHA256.(to_hex (digest_string canonical)) in
+  (match List.find_map (function
+     | Run_executed { id = "tool"; input_digest; parsed; _ } -> Some (input_digest, parsed)
+     | _ -> None) trace with
+  | Some (digest, parsed) ->
+      Alcotest.(check (option string)) "input digest recorded" (Some expected_digest) digest;
+      Alcotest.(check bool) "parsed stdout recorded" true
+        (parsed = Some (`Assoc [ ("ok", `Bool true) ]))
+  | None -> Alcotest.fail "missing structured Run_executed");
+  let replayed = engine_replay ~initial_ctx ~trace v in
+  Alcotest.(check outcome_testable) "structured replay identical" outcome replayed;
+  Alcotest.(check int) "replay never executes" 1 !calls;
+  let diverged = try
+      ignore (engine_replay
+        ~initial_ctx:[ ("seed", `Assoc [ ("z", `String "y"); ("a", `Int 1) ]) ]
+        ~trace v); false
+    with Engine.Replay_mismatch _ -> true in
+  Alcotest.(check bool) "replay rejects changed selected input" true diverged;
+  let missing_outcome, missing_trace =
+    engine_run ~backend:(Backend.stub ~run_command ()) ~run_allowlist:[ "tool" ]
+      ~initial_ctx:[] ~token:None v
+  in
+  (match missing_outcome with
+  | Aborted _ -> ()
+  | _ -> Alcotest.fail "missing structured input must abort");
+  Alcotest.(check int) "missing input never executes" 1 !calls;
+  Alcotest.(check outcome_testable) "missing-input abort replays identically"
+    missing_outcome (engine_replay ~initial_ctx:[] ~trace:missing_trace v)
+
+let test_run_step_structured_stdout_fail_closed () =
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_
+      ~stdin_content:_ =
+    { exit = 0; stdout = {|{"ok":"yes"}|}; stderr = ""; truncated = false; files = [] }
+  in
+  let wf =
+    { name = "bad-stdout"; version = None;
+      steps = [ Run { id = "tool"; cmd = [ "tool" ]; working_dir = "scratch";
+                      timeout_ms = None; observe = None; input = None;
+                      stdout_schema = Some [ ("ok", Schema.Bool) ] } ] }
+  in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend:(Backend.stub ~run_command ())
+      ~run_allowlist:[ "tool" ] ~token:None v in
+  (match outcome with Aborted reason ->
+     Alcotest.(check bool) "schema reason" true (contains_substring reason "schema mismatch")
+   | _ -> Alcotest.fail "structured stdout mismatch must abort");
+  let replayed = engine_replay ~trace v in
+  Alcotest.(check outcome_testable) "failed structured run replays" outcome replayed;
+  let float_backend = Backend.stub ~run_command:(fun ~id:_ ~argv:_ ~working_dir:_
+      ~timeout_ms:_ ~observe:_ ~stdin_content:_ ->
+        { exit = 0; stdout = {|{"x":1.5}|}; stderr = "";
+          truncated = false; files = [] }) () in
+  let float_wf =
+    { name = "float-stdout"; version = None;
+      steps = [ Run { id = "tool"; cmd = [ "tool" ]; working_dir = "scratch";
+                      timeout_ms = None; observe = None; input = None;
+                      stdout_schema = Some [ ("x", Schema.Any) ] } ] }
+  in
+  let float_outcome, _ = engine_run ~backend:float_backend
+      ~run_allowlist:[ "tool" ] ~token:None (validate_ok ~floor:[] float_wf) in
+  (match float_outcome with
+  | Aborted reason ->
+      Alcotest.(check bool) "restricted canonical profile enforced" true
+        (contains_substring reason "floats are not canonical")
+  | _ -> Alcotest.fail "float stdout must be rejected by canonical profile")
+
+let test_run_step_structured_stdout_rejects_truncation () =
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_
+      ~stdin_content:_ =
+    { exit = 0; stdout = {|{"ok":true}|}; stderr = ""; truncated = true; files = [] }
+  in
+  let wf =
+    { name = "truncated-stdout"; version = None;
+      steps = [ Run { id = "tool"; cmd = [ "tool" ]; working_dir = "scratch";
+                      timeout_ms = None; observe = None; input = None;
+                      stdout_schema = Some [ ("ok", Schema.Bool) ] } ] }
+  in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend:(Backend.stub ~run_command ())
+      ~run_allowlist:[ "tool" ] ~token:None v in
+  (match outcome with
+  | Aborted reason ->
+      Alcotest.(check bool) "truncation reason" true
+        (contains_substring reason "truncated")
+  | _ -> Alcotest.fail "truncated structured stdout must abort");
+  Alcotest.(check outcome_testable) "truncated rejection replays" outcome
+    (engine_replay ~trace v)
+
+let test_run_step_structured_parser_lint_compiler () =
+  let raw = {|{"name":"s","steps":[{"kind":"run","id":"r","cmd":["tool"],"working_dir":".","input":["outputs.missing.x"],"stdout_schema":{"ok":"bool"}}]}|} in
+  let wf = match Workflow_json.of_string raw with Ok wf -> wf | Error e -> Alcotest.fail e in
+  let roundtrip = Workflow_json.to_json wf |> Yojson.Safe.to_string in
+  Alcotest.(check bool) "structured fields roundtrip" true
+    (contains_substring roundtrip "stdout_schema");
+  let ds = Lint.check ~floor_gates:[] wf in
+  Alcotest.(check bool) "missing selected output linted" true
+    (List.exists (fun (d : Lint.diagnostic) -> d.code = "dangling-output-ref") ds);
+  let refused = try ignore (Compiler.compile_workflow wf); false
+    with Compiler.Compile_error msg -> contains_substring msg "structured Run" in
+  Alcotest.(check bool) "compiler refuses lossy structured run" true refused;
+  List.iter (fun bad -> match Workflow_json.of_string bad with
+    | Error _ -> () | Ok _ -> Alcotest.fail "invalid input paths must be rejected")
+    [ {|{"name":"s","steps":[{"kind":"run","id":"r","cmd":["x"],"working_dir":".","input":[]}]}|};
+      {|{"name":"s","steps":[{"kind":"run","id":"r","cmd":["x"],"working_dir":".","input":["a","a"]}]}|} ]
 
 (* ---- KEEP: fail-closed validation ---- *)
 
@@ -2047,7 +2179,8 @@ let parser_known_keys =
     ("gate", [ "kind"; "id"; "when" ]);
     ("branch", [ "kind"; "when"; "then"; "else" ]);
     ("loop", [ "kind"; "until"; "governors"; "body" ]);
-    ("run", [ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe" ]);
+    ("run", [ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe";
+              "input"; "stdout_schema" ]);
     ("commit", [ "kind"; "id" ]);
     ("parallel", [ "kind"; "branches" ]);
     ("foreach", [ "kind"; "over"; "steps" ]);
@@ -2385,6 +2518,8 @@ let test_ledger_roundtrip_all_variants () =
       Run_executed
         {
           id = "mk";
+          input_digest = Some "sha256:feedface";
+          parsed = Some (`Assoc [ ("ok", `Bool true) ]);
           result =
             {
               exit = 0;
@@ -2442,7 +2577,7 @@ let test_ledger_persist_then_replay_from_file () =
     | "assess" -> (true, `Assoc [ ("severity", `String "high") ])
     | _ -> (true, `Assoc [])
   in
-  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ =
+  let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ =
     incr cmd_calls;
     {
       exit = 0;
@@ -2467,7 +2602,7 @@ let test_ledger_persist_then_replay_from_file () =
               cmd = [ "mkdir"; "out" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None;
+              observe = None; input = None; stdout_schema = None;
             };
           Gate
             {
@@ -2957,7 +3092,7 @@ let test_compiler_run_step () =
       steps =
         [ Run
             { id = "mk"; cmd = [ "mkdir"; "-p"; "out" ];
-              working_dir = "scratch"; timeout_ms = None; observe = None } ] }
+              working_dir = "scratch"; timeout_ms = None; observe = None; input = None; stdout_schema = None } ] }
   in
   let js, notes = Compiler.compile_workflow wf in
   (* Run step must produce the [CWR run: cmd=... comment *)
@@ -3626,6 +3761,33 @@ let test_lint_parallel_output_collision () =
   Alcotest.(check bool) "parallel-output-collision diagnostic present" true
     has_collision
 
+let test_lint_structured_run_in_parallel () =
+  let structured =
+    Run { id = "structured"; cmd = [ "tool" ]; working_dir = ".";
+          timeout_ms = None; observe = None; input = Some [ "seed" ];
+          stdout_schema = None }
+  in
+  let wf =
+    { name = "structured-parallel"; version = None;
+      steps = [ Parallel { branches = [
+        [ Branch { when_ = Expr.Lit (Expr.Bool true);
+                   then_ = [ Loop { body = [ structured ]; until = None;
+                                    governors = [ Max_iters 1 ] } ];
+                   else_ = [] } ];
+        [ Run { id = "plain"; cmd = [ "tool" ]; working_dir = ".";
+                timeout_ms = None; observe = None; input = None;
+                stdout_schema = None } ] ] } ] }
+  in
+  let diags = Lint.check wf in
+  Alcotest.(check bool) "nested structured Run rejected under Parallel" true
+    (List.exists (fun (d : Lint.diagnostic) ->
+       d.code = "structured-run-in-parallel") diags);
+  match Validate.workflow ~floor_gates:[] wf with
+  | Error msg ->
+      Alcotest.(check bool) "validation reports structured parallel Run" true
+        (contains_substring msg "structured Run")
+  | Ok _ -> Alcotest.fail "structured Run beneath Parallel must not validate"
+
 let test_lint_floor_gate_parallel_intersection () =
   (* Gate "g" guaranteed in ALL branches => commit after parallel is valid. *)
   let wf_all_branches =
@@ -3851,6 +4013,18 @@ let () =
           Alcotest.test_case
             "Fix3: a failed run effect is recorded (no engine crash)" `Quick
             test_run_step_effect_failure_recorded;
+          Alcotest.test_case
+            "structured stdin/stdout bindings replay without execution" `Quick
+            test_run_step_structured_io_and_replay;
+          Alcotest.test_case
+            "structured stdout mismatch aborts and replays" `Quick
+            test_run_step_structured_stdout_fail_closed;
+          Alcotest.test_case
+            "structured stdout rejects truncation live and replay" `Quick
+            test_run_step_structured_stdout_rejects_truncation;
+          Alcotest.test_case
+            "structured parser/lint/compiler contracts" `Quick
+            test_run_step_structured_parser_lint_compiler;
         ] );
       ( "happy-path",
         [
@@ -3958,6 +4132,8 @@ let () =
             test_lint_commit_in_parallel;
           Alcotest.test_case "parallel-output-collision => error diagnostic" `Quick
             test_lint_parallel_output_collision;
+          Alcotest.test_case "structured Run beneath Parallel => error" `Quick
+            test_lint_structured_run_in_parallel;
           Alcotest.test_case "floor-gate intersection: all-branches => ok, one-branch => error" `Quick
             test_lint_floor_gate_parallel_intersection;
         ] );

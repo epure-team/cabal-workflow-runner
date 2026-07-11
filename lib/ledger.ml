@@ -56,9 +56,13 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
   | Loop_stopped { iterations; reason } ->
       tagged "loop_stopped"
         [ ("iterations", `Int iterations); ("reason", `String reason) ]
-  | Run_executed { id; result } ->
+  | Run_executed { id; input_digest; parsed; result } ->
       tagged "run_executed"
-        [ ("id", `String id); ("result", run_result_to_json result) ]
+        ([ ("id", `String id); ("result", run_result_to_json result) ]
+        @ (match input_digest with
+          | None -> []
+          | Some digest -> [ ("input_digest", `String digest) ])
+        @ match parsed with None -> [] | Some json -> [ ("parsed", json) ])
   | Committed_step { id; token_digest } ->
       tagged "committed_step"
         [ ("id", `String id); ("token_digest", `String token_digest) ]
@@ -138,6 +142,20 @@ let dec_bool key json =
   | `Bool b -> b
   | _ -> err "field %S must be a bool" key
 
+let dec_opt_string key json =
+  match json with
+  | `Assoc fields -> (
+      match List.assoc_opt key fields with
+      | None -> None
+      | Some (`String value) -> Some value
+      | Some _ -> err "field %S must be a string" key)
+  | _ -> err "entry must be a JSON object"
+
+let dec_opt_json key json =
+  match json with
+  | `Assoc fields -> List.assoc_opt key fields
+  | _ -> err "entry must be a JSON object"
+
 let dec_verdict key json =
   match assoc_field key json with
   | `String "pass" -> Pass
@@ -212,7 +230,12 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
           reason = dec_string "reason" json;
         }
   | "run_executed" ->
-      Run_executed { id = dec_string "id" json; result = dec_run_result json }
+      Run_executed {
+        id = dec_string "id" json;
+        input_digest = dec_opt_string "input_digest" json;
+        parsed = dec_opt_json "parsed" json;
+        result = dec_run_result json;
+      }
   | "committed_step" ->
       Committed_step
         {

@@ -551,6 +551,21 @@ let test_repeatable_attest_requires_occurrence_template () =
     (List.exists (fun (d : Lint.diagnostic) ->
       d.severity = Lint.Error && d.code = "attest-occurrence-template-required") ds)
 
+let test_attest_rejects_mutable_agent_producer () =
+  let mutable_agent = Agent { id = "produce"; prompt = "p"; read_only = false;
+    output_schema = None; on_failure = Abort; protocol = None; brief = None;
+    agent_type = None; model = None } in
+  let attest = Attest { id = "export"; select = [ "outputs.produce" ];
+    replay_domain = "d"; output = "proof.json" } in
+  let wf = { name = "mutable-producer"; version = Some "1";
+    steps = [ mutable_agent; attest ] } in
+  let ds = Lint.check ~floor_gates:[] wf in
+  Alcotest.(check bool) "lint rejects mutable producer" true
+    (List.exists (fun (d : Lint.diagnostic) -> d.severity = Lint.Error &&
+      d.code = "attest-selects-mutable-agent") ds);
+  Alcotest.(check bool) "validation rejects mutable producer" true
+    (Result.is_error (Validate.workflow ~floor_gates:[] wf))
+
 let test_restricted_safe_integer_and_utf8_order_vectors () =
   let bound = 9007199254740991 in
   Alcotest.(check bool) "positive JS-safe bound" true
@@ -650,6 +665,8 @@ let () =
             test_loop_occurrences_are_distinct_and_replayable;
           Alcotest.test_case "repeatable output requires occurrence template" `Quick
             test_repeatable_attest_requires_occurrence_template;
+          Alcotest.test_case "attest rejects mutable agent producer" `Quick
+            test_attest_rejects_mutable_agent_producer;
           Alcotest.test_case "safe integers and UTF-8 ordering vectors" `Quick
             test_restricted_safe_integer_and_utf8_order_vectors;
           Alcotest.test_case "unsafe selected values are controlled outcomes" `Quick

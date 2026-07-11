@@ -99,6 +99,51 @@ let structured_output (result : Backend_types.task_result) :
   | false, _ ->
       (false, `Assoc [ ("error", `String "agent run did not succeed") ])
 
+type read_only_backend = Claude_code | Codex_cli
+
+let read_only_backend_name = function
+  | Claude_code -> "claude-code"
+  | Codex_cli -> "codex"
+
+let read_only_backend_available ~sw ~env = function
+  | Claude_code -> Claude_code.available ~sw ~env
+  | Codex_cli -> Codex_cli.available ~sw ~env
+
+let read_only_backend_named ~sw ~env name =
+  let candidate =
+    match name with
+    | "claude-code" -> Some Claude_code
+    | "codex" -> Some Codex_cli
+    | _ -> None
+  in
+  match candidate with
+  | Some backend when read_only_backend_available ~sw ~env backend -> Some backend
+  | Some _ | None -> None
+
+let default_read_only_backend ~sw ~env =
+  [ Claude_code; Codex_cli ]
+  |> List.find_opt (read_only_backend_available ~sw ~env)
+
+(* Read-only dispatch deliberately bypasses the registry. Registry descriptors
+   (including project/global YAML) are metadata and cannot confer execution
+   trust. These two handwritten command builders are the capability boundary:
+   Claude blocks Bash/Edit/Write and Codex selects its read-only sandbox. Calling
+   [Backend_process.run_task_with] directly also avoids backend project-config
+   setup writes in the audited target directory. *)
+let run_read_only_backend ~sw ~env backend spec =
+  match backend with
+  | Claude_code ->
+      let build_command ~mcp_config_path spec =
+        Claude_code.build_command ~project_config_path:None ~mcp_config_path spec
+      in
+      Backend_process.run_task_with ~sw ~env ~spec ~build_command
+        ~parse_stdout:Claude_code.parse_stdout_text
+        ~parse_session_id:Claude_code.parse_session_id_from_stdout ()
+  | Codex_cli ->
+      Backend_process.run_task_with ~sw ~env ~spec
+        ~build_command:Codex_cli.build_command
+        ~parse_stdout:Codex_cli.parse_stdout_text ()
+
 (* Build a backend record bound to a live eio environment + switch. Dispatches
    agent work to the first available cabal backend; fails closed if none. *)
 let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
@@ -123,10 +168,20 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
       decr budget_counter;
       !budget_counter)
   in
-  let select () =
+  let select_mutable () =
     match Sys.getenv_opt "CWR_BACKEND" with
-    | Some name when String.trim name <> "" -> Registry.get (String.trim name)
+    | Some name when String.trim name <> "" ->
+        Registry.get (String.trim name)
     | _ -> Registry.first_available ~sw ~env
+  in
+  let select_read_only requested =
+    match requested with
+    | Some name -> read_only_backend_named ~sw ~env name
+    | None -> (
+        match Sys.getenv_opt "CWR_BACKEND" with
+        | Some name when String.trim name <> "" ->
+            read_only_backend_named ~sw ~env (String.trim name)
+        | _ -> default_read_only_backend ~sw ~env)
   in
   (* Global default model from the environment; a per-step [model] overrides it. *)
   let default_model =
@@ -142,31 +197,44 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
       | Some m when String.trim m <> "" -> Some (String.trim m)
       | _ -> default_model
     in
-    let backend_opt =
+    let requested =
       match agent_type with
-      | Some name when String.trim name <> "" ->
-          (match Registry.get (String.trim name) with
-          | Some _ as b -> b
-          | None -> select ())
-      | _ -> select ()
+      | Some name when String.trim name <> "" -> Some (String.trim name)
+      | Some _ -> None
+      | None -> None
     in
-    match backend_opt with
+    let spec =
+      Backend_types.make_task_spec ~prompt ~working_dir ~read_only ?model
+        ~expected_outputs:
+          [ Backend_types.Files_changed; Backend_types.Structured_report ]
+        ()
+    in
+    let response_opt =
+      if read_only then
+        Option.map
+          (fun backend -> run_read_only_backend ~sw ~env backend spec)
+          (select_read_only requested)
+      else
+        let backend_opt =
+          match requested with
+          | Some name -> Registry.get name
+          | None -> select_mutable ()
+        in
+        Option.map
+          (fun backend ->
+            let request = { Backend_types.spec; ctxt = id } in
+            Agentic_backend.run_task_with_ctxt ~sw ~env backend request
+            |> fun response -> response.Backend_types.result)
+          backend_opt
+    in
+    match response_opt with
     | None ->
         ( false,
           `Assoc
-            [ ("error", `String (Printf.sprintf "no cabal backend available (step %s)" id)) ] )
-    | Some backend ->
-        let spec =
-          Backend_types.make_task_spec ~prompt ~working_dir ~read_only ?model
-            ~expected_outputs:
-              [ Backend_types.Files_changed; Backend_types.Structured_report ]
-            ()
-        in
-        let request = { Backend_types.spec; ctxt = id } in
-        let response =
-          Agentic_backend.run_task_with_ctxt ~sw ~env backend request
-        in
-        structured_output response.Backend_types.result
+            [ ("error", `String (Printf.sprintf
+                (if read_only then "no declared read-only cabal backend available (step %s)"
+                 else "no cabal backend available (step %s)") id)) ] )
+    | Some result -> structured_output result
   in
   (* The Run-step effect: process execution + a before/after directory snapshot,
      implemented in [Runner] (bin-side). The lib never spawns a process. *)

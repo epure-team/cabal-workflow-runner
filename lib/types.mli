@@ -108,6 +108,12 @@ type step =
       timeout_ms : int option;  (** optional bounded wall-clock cap. *)
       observe : string list option;
           (** relative paths to snapshot; default = the whole [working_dir]. *)
+      input : string list option;
+          (** Dotted context paths selected into a restricted-canonical JSON
+              object and supplied to the child on stdin. *)
+      stdout_schema : Schema.t option;
+          (** If present, stdout must be a restricted-canonical JSON object
+              satisfying this schema; the parsed object is recorded and bound. *)
     }
       (** Run an observable shell command via an INJECTED effect
           ([Backend.run_command]); records the full {!run_result} into the trace
@@ -233,10 +239,16 @@ type trace_entry =
   | Budget_read of { value : int }
   | Fixpoint_progress of { progress : bool }
   | Loop_stopped of { iterations : int; reason : string }
-  | Run_executed of { id : string; result : run_result }
+  | Run_executed of {
+      id : string;
+      input_digest : string option;
+      parsed : Yojson.Safe.t option;
+      result : run_result;
+    }
       (** A {!Run} step's command executed once; the full result is recorded so
-          {!Engine.replay} re-binds it WITHOUT re-executing (the command runs
-          exactly once, on the live run, never on replay). *)
+          {!Engine.replay} re-binds it WITHOUT re-executing. [input_digest]
+          binds the selected canonical stdin and [parsed] binds validated
+          structured stdout; both are absent for a legacy unstructured Run. *)
   | Committed_step of { id : string; token_digest : string }
   | Blocked_at of { id : string; reason : string }
   | Parallel_started

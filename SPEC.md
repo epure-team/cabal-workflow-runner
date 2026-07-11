@@ -30,7 +30,7 @@ commit). A `workflow` is a name plus a `step list`:
 | `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). A `Pass` records the verdict and continues; a **`Fail` BLOCKS** the run (`Blocked`, naming the gate id). | Verdict recorded; a false gate is a terminal block. |
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
 | `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
-| `Run { id; cmd; working_dir; timeout_ms; observe }` | Execute an observable shell command (no shell) via the **injected** `Backend.run_command` effect, recording the `run_result` and binding it under `outputs.<id>`. Executes **only** if the binary is in the operator's runtime **allowlist** (`[]` = fail-closed/off, `"*"` = all), else `Blocked`. | Command runs **exactly once** on the live run (recorded as `Run_executed`); **replay re-feeds the recorded result and never re-executes** (side-effect-free, byte-identical). |
+| `Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema }` | Execute an observable command (no shell) via the injected `Backend.run_command`. Optional `input` selects dotted context paths into restricted-canonical JSON on stdin; optional `stdout_schema` requires a non-truncated canonical-profile object stdout and binds it as `outputs.<id>.parsed`. Structured Runs are invalid beneath Parallel. | Command runs **exactly once** live. `Run_executed` binds result, input digest, and parsed stdout; replay recomputes/revalidates them and **never executes**. |
 | `Attest { id; select; replay_domain; output }` | Select context paths and atomically export a canonical Ed25519 envelope beneath an operator artifact root. Requires an engine-held signer and non-empty operator session nonce. | No backend receives the private key. Replay and standalone verification recompute bindings and verify against a pin without writing. |
 | `Commit { id }` | The **only** step that can file/submit. | Requires a runtime token (below). |
 
@@ -154,7 +154,7 @@ A `Run` step executes an **observable shell command** (added in v0.9):
 **Keeping cabal out of the library.** The engine must *run* a command without depending
 on a process library from `lib/`, so the run is an **injected effect**: `Backend.t` gains
 `run_command : id:string -> argv:string list -> working_dir:string -> timeout_ms:int
-option -> observe:string list option -> run_result`, where
+option -> observe:string list option -> stdin_content:string option -> run_result`, where
 
 ```ocaml
 type file_change_kind = Created | Modified | Deleted
@@ -267,6 +267,10 @@ only some branches does NOT satisfy the floor for a subsequent commit.
 
 **Output-collision detection.** Two branches with the same agent id cause a `parallel-output-collision`
 error diagnostic: their outputs would overwrite each other nondeterministically.
+
+**Structured Run restriction.** `structured-run-in-parallel` rejects any Run beneath a
+Parallel branch when `input` or `stdout_schema` is present, including through nested
+Branch/Loop/Foreach/Parallel nodes. Plain Runs remain supported.
 
 **Replay determinism.** The live run records each branch's sub-trace inside
 `Parallel_branch_completed { branch_idx; trace; outcome; branch_outputs }`. Replay re-feeds

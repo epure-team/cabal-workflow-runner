@@ -72,6 +72,8 @@ type step =
       working_dir : string;
       timeout_ms : int option;
       observe : string list option;
+      input : string list option;
+      stdout_schema : Schema.t option;
     }
   | Commit of { id : string }
   | Parallel of { branches : step list list }
@@ -176,7 +178,12 @@ type trace_entry =
   | Budget_read of { value : int }  (** a [backend.budget ()] reading. *)
   | Fixpoint_progress of { progress : bool }  (** a Fixpoint progress verdict. *)
   | Loop_stopped of { iterations : int; reason : string }
-  | Run_executed of { id : string; result : run_result }
+  | Run_executed of {
+      id : string;
+      input_digest : string option;
+      parsed : Yojson.Safe.t option;
+      result : run_result;
+    }
       (** A [Run] step's command executed once; the full result is recorded so
           replay re-binds it WITHOUT re-executing the command. *)
   | Committed_step of { id : string; token_digest : string }

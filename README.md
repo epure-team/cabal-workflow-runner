@@ -145,6 +145,15 @@ zero-based occurrence index. Distinct attest steps must have globally unique IDs
 output paths; Attest is forbidden beneath Parallel. CWR→JS compilation refuses any
 workflow containing Attest rather than silently dropping signing authority.
 
+An Attest selection of `outputs.<agent-id>` is valid only when every Agent producer with
+that ID is declared `read_only`. Lint and validation enforce this statically. Runtime
+read-only dispatch does not trust registry capability metadata or YAML adapters: only
+cabal's available handwritten `claude-code` and `codex` implementations are eligible.
+Claude receives `--disallowedTools Bash,Edit,Write,NotebookEdit`; Codex receives
+`-s read-only`. Unsafe or unknown explicit `agent_type` values fail closed without
+fallback or dispatch. `scripts/read-only-selftest.sh` exercises exact argv, YAML-ID
+spoof resistance, and zero target mutation with fake CLIs.
+
 ```sh
 # Print the canonical JSON Schema (draft 2020-12) of the workflow format. Point a
 # workflow generator at this so it emits conformant workflows by construction.
@@ -191,7 +200,9 @@ context:
 
 ```json
 { "kind": "run", "id": "mk", "cmd": ["mkdir", "-p", "out"],
-  "working_dir": "scratch", "timeout_ms": 30000, "observe": ["out"] }
+  "working_dir": "scratch", "timeout_ms": 30000, "observe": ["out"],
+  "input": ["outputs.plan.commands"],
+  "stdout_schema": { "ok": "bool", "summary": "string" } }
 ```
 
 - **`cmd`** — a non-empty argv array, executed **without a shell** (no implicit
@@ -200,6 +211,13 @@ context:
   containing `..`**. It is the command's cwd, the effect scope, and the snapshot root.
 - **`timeout_ms`** — optional bounded wall-clock cap.
 - **`observe`** — optional relative paths to snapshot; default = the whole `working_dir`.
+- **`input`** — optional non-empty, duplicate-free dotted context paths. CWR resolves
+  them exactly and writes a restricted-canonical JSON object, keyed by the original
+  paths, to the child process's stdin.
+- **`stdout_schema`** — optional required-field schema using the same vocabulary as
+  agent `output_schema`. When present, stdout must be a restricted-canonical JSON
+  object satisfying the schema or the run aborts fail-closed. A `truncated=true`
+  result is always rejected before parsing, even when its captured prefix is valid JSON.
 
 The result is bound under `outputs.<id>` as
 `{ "exit", "stdout", "stderr", "truncated", "files":[{ "path","change","size","digest" }] }`,
@@ -207,6 +225,13 @@ so the DSL can read `outputs.mk.exit`, `exists(outputs.mk.files)`, etc. `stdout`
 are size-capped (64 KiB) with a `truncated` flag. `digest` is an **MD5 content digest**
 (`Digest`) for **change-detection / observability** — **NOT** a cryptographic integrity
 guarantee.
+
+When structured I/O is requested, that object additionally contains
+`input_digest` (`sha256:<hex>`) and/or `parsed` (the validated stdout object).
+Both are recorded in `Run_executed`; replay recomputes the selected-input digest,
+revalidates the parsed stdout binding, and never starts the child process.
+Structured Runs are rejected anywhere beneath `Parallel`; embedded branch traces do
+not yet support these bindings. Plain unstructured Runs remain valid in Parallel.
 
 **The allowlist is the trust control — it is operator-supplied at RUNTIME and never read
 from the workflow file.** `cmd[0]` **must be a bare command name resolved via `PATH`**: a
@@ -250,7 +275,7 @@ let backend : Backend.t =
   { run_agent = (fun ~id:_ ~prompt:_ ~read_only:_ -> (true, `Assoc [ ("severity", `String "high") ]));
     budget = (fun () -> 1_000_000);
     (* the run-step effect; in bin/ this snapshots the dir + spawns a process. *)
-    run_command = (fun ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ->
+    run_command = (fun ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ ->
       { Types.exit = 0; stdout = ""; stderr = ""; truncated = false; files = [] }) }
 
 let () =

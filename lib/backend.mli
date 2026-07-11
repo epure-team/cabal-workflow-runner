@@ -31,12 +31,15 @@ type t = {
     working_dir:string ->
     timeout_ms:int option ->
     observe:string list option ->
+    stdin_content:string option ->
     Types.run_result;
       (** Execute a {!Types.Run} step's command and return its observed
           {!Types.run_result}. This is the INJECTED effect that keeps process
           execution out of the lib: the lib defines the types and calls this
           function; only [bin/] implements it via cabal/[Unix] + a before/after
-          directory snapshot. The engine calls it at most ONCE per run step (on a
+          directory snapshot. [stdin_content] carries the engine-produced
+          restricted-canonical context projection when structured input is
+          configured. The engine calls it at most ONCE per run step (on a
           live run, and only after the allowlist check passes); {!Engine.replay}
           NEVER calls it (it re-feeds the recorded result). *)
   run_shell_command : string -> int;
@@ -60,6 +63,7 @@ val stub :
      working_dir:string ->
      timeout_ms:int option ->
      observe:string list option ->
+     stdin_content:string option ->
      Types.run_result) ->
   ?run_shell_command:(string -> int) ->
   unit ->

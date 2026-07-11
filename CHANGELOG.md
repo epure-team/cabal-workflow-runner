@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.17.1
+
+**v0.17 review closure.** Read-only Agent dispatch no longer trusts cabal
+registry capability metadata or bundled/project/global YAML adapters. It
+resolves only the available handwritten `Claude_code` and `Codex_cli` command
+builders, whose actual argv blocks Claude Bash/Edit/Write and selects Codex's
+read-only sandbox. Unknown or unsafe explicit `agent_type` values fail without
+fallback or dispatch. The direct audited path also avoids target-directory
+project-config writes.
+
+Structured Runs now reject truncated stdout before parsing, including replay,
+and lint/validation reject any Run using `input` or `stdout_schema` beneath
+Parallel. Fake-PATH CLI tests pin exact argv, defeat a project YAML ID spoof,
+and verify zero target mutation; focused Cabal command-builder suites remain
+green.
+
+## v0.17
+
+**Structured `Run` I/O.** `run` steps may select dotted context paths with
+`input`; CWR sends their restricted-canonical JSON projection to the child on
+stdin and records a SHA-256 input digest. Optional `stdout_schema` requires
+stdout to be a restricted-canonical JSON object satisfying the existing schema
+vocabulary and binds it as `outputs.<id>.parsed`. The digest and parsed object
+are ledger-bound and replay-verified without executing the command. Parser,
+schema, lint, runner/backend, compiler refusal, documentation, and regression
+tests were updated; Runs omitting both fields retain their prior behavior.
+
+## v0.16
+
+**Read-only attestation producer enforcement.** An `attest` step may select an
+`outputs.<id>` value produced by an Agent only when every Agent producer with that ID is
+declared `read_only`. Lint and validation reject drift statically. At runtime, read-only
+Agent dispatch selects only backends whose cabal `Backend_registry` descriptor declares
+`read_only_support`; an explicitly selected unsafe backend fails before dispatch and the
+default selector filters to declared read-only backends.
+
 ## v0.15
 
 **Authenticated native output export.** Added the `attest` step and canonical

@@ -28,7 +28,7 @@ let print_trace trace =
       | Types.Loop_stopped { iterations; reason } ->
           Printf.printf "  loop     stopped after %d iter(s) (%s)\n" iterations
             reason
-      | Types.Run_executed { id; result } ->
+      | Types.Run_executed { id; result; _ } ->
           Printf.printf
             "  run      %-16s exit=%d truncated=%b files=%d\n" id
             result.Types.exit result.Types.truncated
@@ -527,7 +527,7 @@ let to_claude_workflow_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.15.0" ~doc in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.17.1" ~doc in
   let group =
     Cmd.group info
       [ lint_cmd; validate_cmd; run_cmd; replay_cmd; schema_cmd;

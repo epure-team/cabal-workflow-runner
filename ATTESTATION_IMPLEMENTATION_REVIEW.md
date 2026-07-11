@@ -92,3 +92,4 @@ canonical bytes and Ed25519 signatures in Node.
 | Cross-language drift | Exact UTF-8 byte-order and JS-safe integer vectors run in OCaml and Node. |
 | Artifact-embedded self-signing | Node verification requires independent identity/key ID, workflow digest, step/domain/session/occurrence/output, and selected-value pins; attacker-signed regression fails. |
 | Relative secure reads/writes | Basename, `./file`, relative pin/ledger/workflow, and artifact root `.` regressions pass while descendant `.` remains forbidden. |
+| Read-only backend descriptor spoof | Runtime bypasses Registry/YAML and permits only available handwritten Claude/Codex builders; fake-PATH tests pin read-only argv, reject unsafe/unknown IDs without fallback, defeat a project YAML ID override, and observe zero target mutation. |

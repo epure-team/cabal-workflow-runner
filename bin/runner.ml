@@ -110,8 +110,9 @@ let make ~sw ~env ~base :
     working_dir:string ->
     timeout_ms:int option ->
     observe:string list option ->
+    stdin_content:string option ->
     Types.run_result =
- fun ~id:_ ~argv ~working_dir ~timeout_ms ~observe ->
+ fun ~id:_ ~argv ~working_dir ~timeout_ms ~observe ~stdin_content ->
   let wd = Filename.concat base working_dir in
   (* Ensure the working_dir exists so a command can write into it. *)
   (try Unix.mkdir wd 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) | _ -> ());
@@ -138,7 +139,7 @@ let make ~sw ~env ~base :
   try
     let pr =
       Cabal.Backend_process.run_process ~sw ~env ~cmd:argv ~working_dir:wd
-        ~timeout_seconds ()
+        ~stdin_content ~timeout_seconds ()
     in
     let files = files_now () in
     let stdout, t1 = cap_string pr.Cabal.Backend_process.stdout in

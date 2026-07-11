@@ -329,7 +329,12 @@ and compile_step ctx step =
       if governors = [] then
         add_note ctx ~kind:"loop"
           ~description:"no JS-level termination: engine ceiling not emitted"
-  | Types.Run { id; cmd; working_dir; timeout_ms = _; observe = _ } ->
+  | Types.Run { id; cmd; working_dir; timeout_ms = _; observe = _;
+                input; stdout_schema } ->
+      if input <> None || stdout_schema <> None then
+        raise (Compile_error (Printf.sprintf
+          "structured Run step %S cannot be compiled faithfully: CWR context-selected stdin, canonical stdout validation, and replay bindings have no Claude Workflow JS equivalent"
+          id));
       let cmd_str = cmd_to_string cmd in
       emit_comment ctx (Printf.sprintf
         "[CWR run: cmd=%S working_dir=%S — replay safety and allowlist not preserved]"

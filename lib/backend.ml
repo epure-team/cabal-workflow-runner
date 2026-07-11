@@ -13,6 +13,7 @@ type t = {
     working_dir:string ->
     timeout_ms:int option ->
     observe:string list option ->
+    stdin_content:string option ->
     Types.run_result;
   run_shell_command : string -> int;
       (** Run a shell command string via [sh -c]; return its exit code.
@@ -29,7 +30,8 @@ let default_budget () = max_int
 (* By default a [Run] step is a no-op success: exit 0, empty output, no files.
    The real process execution lives in [bin/]; tests inject a deterministic
    [run_command]. The lib never spawns a process. *)
-let default_run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ :
+let default_run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_
+    ~stdin_content:_ :
     Types.run_result =
   { Types.exit = 0; stdout = ""; stderr = ""; truncated = false; files = [] }
 

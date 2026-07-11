@@ -356,11 +356,21 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
   | Agent { id; output_schema; _ } ->
       let fields = Option.map schema_fields output_schema in
       (id, fields) :: List.remove_assoc id produced
-  | Run { id; _ } ->
+  | Run { id; input; stdout_schema; _ } ->
+      Option.iter
+        (List.iter (fun path ->
+             check_expr_refs ~loc ~produced ~warned_missing acc
+               (Expr.Path (String.split_on_char '.' path))))
+        input;
       (* A Run step binds outputs.<id> with a FIXED shape (see
          [Types.json_of_run_result]); register those field names so references
          like outputs.<id>.exit are not flagged dangling. *)
-      let fields = Some [ "exit"; "stdout"; "stderr"; "truncated"; "files" ] in
+      let fields =
+        Some
+          ([ "exit"; "stdout"; "stderr"; "truncated"; "files" ]
+          @ (match input with None -> [] | Some _ -> [ "input_digest" ])
+          @ match stdout_schema with None -> [] | Some _ -> [ "parsed" ])
+      in
       (id, fields) :: List.remove_assoc id produced
   | Gate { when_; _ } ->
       check_expr_refs ~loc ~produced ~warned_missing acc when_;
@@ -590,6 +600,17 @@ let rec run_steps ~loc_prefix acc steps =
 
 let attest_safety acc steps =
   let seen_ids = Hashtbl.create 16 and seen_outputs = Hashtbl.create 16 in
+  let agent_read_only = Hashtbl.create 16 in
+  let rec collect_agents steps = List.iter (function
+    | Agent { id; read_only; _ } ->
+        let prior = Option.value ~default:true (Hashtbl.find_opt agent_read_only id) in
+        Hashtbl.replace agent_read_only id (prior && read_only)
+    | Branch { then_; else_; _ } -> collect_agents then_; collect_agents else_
+    | Loop { body; _ } -> collect_agents body
+    | Foreach { steps; _ } -> collect_agents steps
+    | Parallel { branches } -> List.iter collect_agents branches
+    | Attest _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> ()) steps in
+  collect_agents steps;
   let has_occurrence_template output =
     let needle = "{occurrence}" in
     let rec search i = i + String.length needle <= String.length output &&
@@ -600,7 +621,7 @@ let attest_safety acc steps =
     List.iteri (fun i step ->
       let loc = loc_index loc_prefix i in
       match step with
-      | Attest { id; output; _ } ->
+      | Attest { id; output; select; _ } ->
           if in_parallel then acc := { severity = Error; code = "attest-in-parallel";
             message = "Attest is forbidden beneath Parallel because branch replay does not authenticate embedded traces";
             loc } :: !acc;
@@ -616,7 +637,16 @@ let attest_safety acc steps =
           (match Hashtbl.find_opt seen_outputs output with
           | Some prior -> acc := { severity = Error; code = "duplicate-attest-output";
               message = Printf.sprintf "attest output %S duplicates %s" output prior; loc } :: !acc
-          | None -> Hashtbl.add seen_outputs output loc)
+          | None -> Hashtbl.add seen_outputs output loc);
+          List.iter (fun path -> match String.split_on_char '.' path with
+            | "outputs" :: producer :: _ ->
+                (match Hashtbl.find_opt agent_read_only producer with
+                | Some false -> acc := { severity = Error; code = "attest-selects-mutable-agent";
+                    message = Printf.sprintf
+                      "Attest %S selects output from Agent %S, which is not read_only on every path"
+                      id producer; loc } :: !acc
+                | _ -> ())
+            | _ -> ()) select
       | Branch { then_; else_; _ } ->
           walk ~in_parallel ~repeatable ~loc_prefix:(loc ^ ".then") then_;
           walk ~in_parallel ~repeatable ~loc_prefix:(loc ^ ".else") else_
@@ -627,6 +657,13 @@ let attest_safety acc steps =
       | Parallel { branches } -> List.iteri (fun n branch ->
           walk ~in_parallel:true ~repeatable
             ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc n) branch) branches
+      | Run { id; input; stdout_schema; _ }
+        when in_parallel && (input <> None || stdout_schema <> None) ->
+          acc := { severity = Error; code = "structured-run-in-parallel";
+            message = Printf.sprintf
+              "structured Run %S is beneath Parallel; input/stdout replay bindings are not supported in parallel branch traces"
+              id;
+            loc } :: !acc
       | Agent _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> ()) steps
   in
   walk ~in_parallel:false ~repeatable:false ~loc_prefix:"steps" steps

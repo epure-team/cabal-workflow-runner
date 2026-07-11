@@ -94,6 +94,17 @@ let opt_string_list key json =
            l)
   | Some _ -> err "field %S must be a list" key
 
+let opt_nonempty_unique_paths key json =
+  match opt_string_list key json with
+  | None -> None
+  | Some [] -> err "field %S must be a non-empty list" key
+  | Some paths ->
+      if List.exists (fun path -> String.trim path = "") paths then
+        err "field %S entries must be non-empty dotted paths" key;
+      if List.length paths <> List.length (List.sort_uniq String.compare paths) then
+        err "field %S must not contain duplicates" key;
+      Some paths
+
 (* Path-escape discipline (mirrors the run-step effect scope): a relative path
    with no [..] component and not absolute. Rejected fail-closed otherwise. The
    [what] names the offending field in the error. *)
@@ -319,10 +330,13 @@ let rec step_of_json json =
             working_dir = req_relative_path "working_dir" json;
             timeout_ms = opt_bounded_int "timeout_ms" json;
             observe = opt_string_list "observe" json;
+            input = opt_nonempty_unique_paths "input" json;
+            stdout_schema = opt_schema "stdout_schema" json;
           }
       in
       reject_unknown_keys ~what:"run step"
-        ~known:[ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe" ]
+        ~known:[ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe";
+                 "input"; "stdout_schema" ]
         json;
       s
   | "commit" ->
@@ -522,7 +536,7 @@ let rec step_to_json = function
             ("governors", `List (List.map governor_to_json governors));
             ("body", `List (List.map step_to_json body));
           ])
-  | Run { id; cmd; working_dir; timeout_ms; observe } ->
+  | Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema } ->
       `Assoc
         ([
            ("kind", `String "run");
@@ -532,9 +546,16 @@ let rec step_to_json = function
          ]
         @ (match timeout_ms with None -> [] | Some n -> [ ("timeout_ms", `Int n) ])
         @
-        match observe with
+        (match observe with
         | None -> []
         | Some l -> [ ("observe", `List (List.map (fun s -> `String s) l)) ])
+        @ (match input with
+          | None -> []
+          | Some paths ->
+              [ ("input", `List (List.map (fun s -> `String s) paths)) ])
+        @ match stdout_schema with
+          | None -> []
+          | Some schema -> [ ("stdout_schema", schema_to_json schema) ])
   | Commit { id } -> `Assoc [ ("kind", `String "commit"); ("id", `String id) ]
   | Parallel { branches } ->
       `Assoc

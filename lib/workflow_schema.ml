@@ -286,6 +286,15 @@ let step_def : Yojson.Safe.t =
               ] );
           ("timeout_ms", bounded_int);
           ("observe", obj [ ("type", s "array"); ("items", typ "string") ]);
+          ( "input",
+            obj
+              [
+                ("type", s "array");
+                ("items", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]);
+                ("minItems", `Int 1);
+                ("uniqueItems", `Bool true);
+              ] );
+          ("stdout_schema", ref_ "output_schema");
         ]
   in
   let commit =

@@ -51,6 +51,9 @@ val run :
     - [Run] -> execute an observable shell command via the INJECTED
       [backend.run_command] effect, recording the full {!Types.run_result} as a
       [Run_executed] trace entry and binding it into ["outputs.<id>"]. The
+      optional [input] projection is restricted-canonicalized onto child stdin
+      and digest-bound; optional [stdout_schema] validates object stdout and
+      binds it as ["outputs.<id>.parsed"].
       command executes only if the basename of its head is in [run_allowlist] OR
       [run_allowlist] contains ["*"]; otherwise the step is [Blocked]
       (fail-closed). The command runs exactly ONCE (on the live run); replay

@@ -6,7 +6,8 @@
     fed to {!Engine.replay} for a {b byte-identical} re-interpretation. The
     serialisation round-trips ALL trace entry variants — including a full
     [Run_executed] result (exit / stdout / stderr / truncated / files[] with
-    path / change / size / digest) — so persisted replay is exactly as faithful
+    path / change / size / digest), optional selected-input digest, and optional
+    parsed stdout object — so persisted replay is exactly as faithful
     as the in-process replay it supersedes.
 
     This module is pure and depends on {b yojson only}: it is the on-disk

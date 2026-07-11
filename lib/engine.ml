@@ -48,6 +48,42 @@ let bind_output st id output =
 
 let bind_loop_iter st index = bind st "loop" (`Assoc [ ("iter", `Int index) ])
 
+let run_input st paths =
+  Result.bind (Attestation.select_context st.ctx paths) (fun selected ->
+      Result.map
+        (fun canonical ->
+          let digest =
+            "sha256:"
+            ^ Digestif.SHA256.(to_hex (digest_string canonical))
+          in
+          (canonical, digest))
+        (Canonical_json.to_string (`Assoc selected)))
+
+let run_output_json ~input_digest ~parsed result =
+  match json_of_run_result result with
+  | `Assoc fields ->
+      `Assoc
+        (fields
+        @ (match input_digest with
+          | None -> []
+          | Some digest -> [ ("input_digest", `String digest) ])
+        @ match parsed with None -> [] | Some json -> [ ("parsed", json) ])
+  | json -> json
+
+let parse_run_stdout schema (result : run_result) =
+  if result.truncated then Error "stdout was truncated"
+  else match Yojson.Safe.from_string result.stdout with
+  | exception Yojson.Json_error msg -> Error ("stdout is not JSON: " ^ msg)
+  | (`Assoc _ as parsed) ->
+      Result.bind (Canonical_json.to_string parsed) (fun canonical ->
+          let normalized = Yojson.Safe.from_string canonical in
+          Result.map
+            (fun () -> normalized)
+            (Result.map_error
+               (fun field -> "stdout schema mismatch: " ^ field)
+               (Schema.validate schema normalized)))
+  | _ -> Error "stdout must be a JSON object"
+
 (* ------------------------------------------------------------------ *)
 (* run: deterministic interpreter driven by a backend.                 *)
 (* ------------------------------------------------------------------ *)
@@ -167,7 +203,7 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
         let chosen = match verdict with Pass -> then_ | Fail -> else_ in
         go st chosen
     | Loop { body; until; governors } -> run_loop st body until governors
-    | Run { id; cmd; working_dir; timeout_ms; observe } ->
+    | Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema } ->
         (* Fail-closed allowlist gate. The allowlist is operator-supplied at
            runtime; if the binary is not permitted, the step is Blocked WITHOUT
            executing — mirroring the gate/commit Fail arms (emit Blocked_at,
@@ -199,14 +235,52 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
           { st with terminal = Some (Blocked reason) }
         end
         else begin
-          (* Execute the injected effect exactly ONCE, record the full result,
-             and bind it into ctx. Replay re-feeds this without re-executing. *)
-          let result =
-            backend.Backend.run_command ~id ~argv:cmd ~working_dir ~timeout_ms
-              ~observe
+          let input_material =
+            match input with
+            | None -> Ok (None, None)
+            | Some paths ->
+                Result.map
+                  (fun (canonical, digest) -> (Some canonical, Some digest))
+                  (run_input st paths)
           in
-          let st = emit st (Run_executed { id; result }) in
-          bind_output st id (json_of_run_result result)
+          match input_material with
+          | Error detail ->
+              let reason = Printf.sprintf "run input selection failed: %s" detail in
+              let st = emit st (Blocked_at { id; reason }) in
+              { st with terminal = Some (Aborted reason) }
+          | Ok (stdin_content, input_digest) ->
+              (* Execute the injected effect exactly ONCE, record the full result,
+                 and bind it into ctx. Replay re-feeds this without re-executing. *)
+              let result =
+                backend.Backend.run_command ~id ~argv:cmd ~working_dir ~timeout_ms
+                  ~observe ~stdin_content
+              in
+              let parsed_result =
+                match stdout_schema with
+                | None -> Ok None
+                | Some schema ->
+                    Result.map Option.some
+                      (parse_run_stdout schema result)
+              in
+              (match parsed_result with
+              | Ok parsed ->
+                  let st =
+                    emit st (Run_executed { id; input_digest; parsed; result })
+                  in
+                  bind_output st id
+                    (run_output_json ~input_digest ~parsed result)
+              | Error detail ->
+                  let st =
+                    emit st
+                      (Run_executed
+                         { id; input_digest; parsed = None; result })
+                  in
+                  let reason =
+                    Printf.sprintf "run %S structured stdout rejected: %s" id
+                      detail
+                  in
+                  let st = emit st (Blocked_at { id; reason }) in
+                  { st with terminal = Some (Aborted reason) })
         end
     | Commit { id } ->
         if token_is_wellformed token then begin
@@ -600,17 +674,54 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
         | _ -> raise (Replay_mismatch "branch entry mismatch"))
     | Loop { body; until; governors } ->
         replay_loop st body until governors
-    | Run { id; cmd = _; working_dir = _; timeout_ms = _; observe = _ } -> (
+    | Run { id; cmd = _; working_dir = _; timeout_ms = _; observe = _;
+            input; stdout_schema } -> (
         (* NEVER re-execute: re-feed the recorded result (or reproduce the
            recorded allowlist-Blocked). The allowlist is NOT consulted on replay
            (nothing executes), mirroring the Agent_ran replay arm. *)
         match next () with
-        | Run_executed { id = rid; result } when rid = id ->
-            let st = emit st (Run_executed { id; result }) in
-            bind_output st id (json_of_run_result result)
+        | Run_executed { id = rid; input_digest; parsed; result } when rid = id ->
+            let expected_digest =
+              match input with
+              | None -> None
+              | Some paths ->
+                  (match run_input st paths with
+                  | Ok (_, digest) -> Some digest
+                  | Error e -> raise (Replay_mismatch ("run input selection diverged: " ^ e)))
+            in
+            if expected_digest <> input_digest then
+              raise (Replay_mismatch "run input digest diverged");
+            let st = emit st (Run_executed { id; input_digest; parsed; result }) in
+            (match stdout_schema, parsed with
+            | None, None -> bind_output st id (run_output_json ~input_digest ~parsed result)
+            | Some schema, Some json ->
+                (match parse_run_stdout schema result with
+                | Ok recomputed when recomputed = json ->
+                    bind_output st id (run_output_json ~input_digest ~parsed result)
+                | _ -> raise (Replay_mismatch "run parsed stdout diverged"))
+            | Some schema, None ->
+                (match parse_run_stdout schema result with
+                | Ok _ -> raise (Replay_mismatch "run parsed stdout missing")
+                | Error _ ->
+                    (match next () with
+                    | Blocked_at { id = rid; reason } when rid = id ->
+                        let st = emit st (Blocked_at { id; reason }) in
+                        { st with terminal = Some (Aborted reason) }
+                    | _ -> raise (Replay_mismatch "run stdout rejection entry mismatch")))
+            | None, Some _ ->
+                raise (Replay_mismatch "unexpected run parsed stdout binding"))
         | Blocked_at { id = rid; reason } when rid = id ->
             let st = emit st (Blocked_at { id; reason }) in
-            { st with terminal = Some (Blocked reason) }
+            let input_failure_prefix = "run input selection failed:" in
+            let is_input_failure =
+              String.length reason >= String.length input_failure_prefix
+              && String.sub reason 0 (String.length input_failure_prefix)
+                 = input_failure_prefix
+            in
+            { st with
+              terminal =
+                Some
+                  (if is_input_failure then Aborted reason else Blocked reason) }
         | _ -> raise (Replay_mismatch "run entry mismatch"))
     | Commit { id } -> (
         match next () with
