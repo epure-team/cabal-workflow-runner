@@ -2,6 +2,27 @@
 
 ## v0.19.0
 
+**Run-start approval ledger identity.** `run --ledger` now initializes its
+ledger before execution. When `--approve` is supplied, a singleton
+`approval_supplied` header binds a domain-separated SHA-256 token digest to the actual
+workflow digest, attestation session, and canonical run-context digest. Early
+Blocked/Aborted runs retain this evidence; approval-less runs cannot claim it.
+Replay validates placement and every binding, including equality with any
+Commit token digest, while remaining compatible with legacy ledgers. The raw
+approval token is never persisted, and replay explicitly provides consistency
+validation rather than token reauthentication.
+
+A requested ledger is opened once without following symlinks, locked before
+truncation, required to be an unaliased regular file, and held at mode `0600`
+through prefix and terminal writes. The prefix is flushed before execution.
+Initialization failures prevent effects; terminal persistence or pathname
+identity failures refuse a successful CLI result and explicitly warn that
+effects may already have occurred.
+
+New Commit events use `sha256("cwr.approval-token/v2\\0" || raw_token)` as well.
+Replay remains compatible with legacy header-free ledgers containing the prior
+32-hex Commit digest because no new approval header claims v2 binding there.
+
 **Digest-pinned `Run` executables.** A `run` step may declare
 `executable_digest` (`sha256:<hex>`). CWR resolves the bare command through the
 operator's `PATH`, opens it with `O_NOFOLLOW`, requires a single-link regular

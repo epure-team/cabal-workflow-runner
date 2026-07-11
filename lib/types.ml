@@ -245,6 +245,15 @@ type trace_entry =
           [replay --ledger file] can reconstruct the same initial context.
           NOT emitted by the engine and NOT fed to [Engine.replay] as a trace
           entry — it is stripped by [cmd_replay] before parsing the trace. *)
+  | Approval_supplied of {
+      token_digest : string;
+      workflow_digest : string;
+      session_nonce : string option;
+      run_context_digest : string;
+    }
+      (** Ledger-layer run-start header proving that runtime approval was
+          supplied without persisting its raw token. It immediately follows
+          [Ctx_snapshot] and is stripped/validated by [cmd_replay]. *)
   | Shell_executed of { id : string; results : (string * int) list }
       (** A [Shell] step's commands ran; [(command_string, exit_code)] pairs in
           execution order (stops at first failure). Replay re-binds without

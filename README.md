@@ -362,6 +362,23 @@ process, exiting non-zero on a corrupt ledger or a `Replay_mismatch`. Tooling
 such as `tools/bounty-pipeline` thus gains **persisted** replay: a run's trace
 survives the process and can be audited / re-verified later.
 
+When `--approve` is supplied, the CLI initializes the ledger before workflow
+execution with an `approval_supplied` header immediately after `ctx_snapshot`.
+It contains only the domain-separated SHA-256 token digest plus the actual validated
+workflow digest, optional attestation session, and a SHA-256 digest of their
+canonical run-context binding. The raw token is never written. This prefix is
+retained even when a gate blocks before Commit; a run without `--approve` cannot
+claim it. Replay validates header position, workflow/session/context binding,
+and equality with any `committed_step.token_digest`. This is consistency
+validation, not reauthentication of the unavailable raw token.
+
+The requested ledger path is opened once without following symlinks, locked
+before truncation, required to name a single-link regular file, forced to mode
+`0600`, and retained as the same descriptor for both phases. CWR flushes the
+prefix before executing the workflow. If initialization fails, the workflow is
+not run; if the terminal write, flush, pathname-identity check, or close fails
+after execution, CWR refuses success and warns that effects may have occurred.
+
 ## Meta-agent: building workflows dynamically
 
 Three layers guard a generated workflow, each tighter than the last:

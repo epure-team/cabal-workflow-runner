@@ -1,6 +1,8 @@
 open Types
 
-let token_digest tok = Digest.to_hex (Digest.string tok)
+let token_digest tok =
+  let domain = "cwr.approval-token/v2\000" in
+  "sha256:" ^ Digestif.SHA256.(to_hex (digest_string (domain ^ tok)))
 
 let token_is_wellformed = function
   | None -> false

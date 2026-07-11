@@ -66,6 +66,8 @@ let print_trace trace =
             (match envelope with `Assoc f -> (match List.assoc_opt "key_id" f with
              Some (`String s) -> s | _ -> "<unknown>") | _ -> "<invalid>")
       | Types.Ctx_snapshot _ ->
+          (* ledger-layer header, never appears in an engine trace *) ()
+      | Types.Approval_supplied _ ->
           (* ledger-layer header, never appears in an engine trace *) ())
     trace
 
@@ -136,6 +138,47 @@ let check_expected_workflow_digest validated expected required =
       Error "--expected-workflow-digest is required with --require-attestation"
   | None -> Ok ()
 
+let approval_run_context_digest ~workflow_digest ~session_nonce ~initial_ctx =
+  let binding = `Assoc [
+    ("workflow_digest", `String workflow_digest);
+    ("session_nonce", match session_nonce with None -> `Null | Some value -> `String value);
+    ("initial_ctx", `Assoc initial_ctx);
+  ] in
+  Result.map (fun canonical -> "sha256:" ^ Digestif.SHA256.(to_hex
+    (digest_string canonical))) (Canonical_json.to_string binding)
+
+let approval_header ~workflow_digest ~session_nonce ~initial_ctx token =
+  Result.map (fun run_context_digest -> Types.Approval_supplied {
+    token_digest = Engine.token_digest token; workflow_digest; session_nonce;
+    run_context_digest;
+  }) (approval_run_context_digest ~workflow_digest ~session_nonce ~initial_ctx)
+
+let ledger_prefix ~initial_ctx approval =
+  let header = Ledger.entry_to_json (Types.Ctx_snapshot { ctx = initial_ctx }) in
+  Yojson.Safe.to_string header ^ "\n" ^
+  match approval with None -> "" | Some entry ->
+    Yojson.Safe.to_string (Ledger.entry_to_json entry) ^ "\n"
+
+let prepare_ledger path prefix =
+  Result.bind (Secure_fs.ledger_open path) (fun handle ->
+    match Result.bind (Secure_fs.ledger_write handle ~phase:"prefix" prefix)
+      (fun () -> Secure_fs.ledger_flush handle ~phase:"prefix") with
+    | Ok () -> Ok handle
+    | Error message ->
+        ignore (Secure_fs.ledger_close handle);
+        Error message)
+
+let finish_ledger handle trace =
+  let result = Result.bind
+    (Secure_fs.ledger_write handle ~phase:"append" (Ledger.to_ndjson trace))
+    (fun () -> Result.bind (Secure_fs.ledger_flush handle ~phase:"append")
+      (fun () -> Result.bind (Secure_fs.ledger_identity_matches handle)
+        (function true -> Ok () | false -> Error "ledger path identity changed during workflow"))) in
+  let close_result = Secure_fs.ledger_close handle in
+  match result, close_result with
+  | Ok (), Ok () -> Ok ()
+  | Error message, _ | Ok (), Error message -> Error message
+
 let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_fd
     attestation_root attestation_session required_attestations expected_digest =
   match load_and_validate ~required_attestations ~floor_gates file with
@@ -158,7 +201,7 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_f
                 | Some raw ->
                     (match Yojson.Safe.from_string raw with
                      | `Assoc fields as json ->
-                         (match Canonical_json.validate_no_duplicates json with
+                         (match Attestation.validate_canonical_json json with
                          | Ok () -> fields
                          | Error e ->
                              Printf.eprintf "--ctx is non-canonical: %s\n" e;
@@ -170,39 +213,56 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_f
                          Printf.eprintf "--ctx parse error: %s\n" msg;
                          exit 1)
               in
-              let outcome, trace =
-                Engine.run ~sw ~run_allowlist:allow_run ~backend ~token:approve
-                  ~initial_ctx ?attestation_signer
-                  ?attestation_artifact_root:attestation_root
-                  ?attestation_session_nonce:attestation_session
-                  ~agent_backend_id:"cabal-read-only-v1" validated
+              let actual_workflow_digest =
+                Attestation.workflow_digest (Validate.Validated.workflow validated)
               in
-              Printf.printf "outcome: %s\ntrace:\n"
-                (Types.string_of_outcome outcome);
-              print_trace trace;
-              (* Persist the run's trace as an on-disk ledger so it can be
-                 replayed byte-identically in a later process. Written after a
-                 successful walk only (a Blocked/Aborted run exits 2 below). *)
-              (match (ledger, outcome) with
-              | Some path, (Types.Committed _ | Types.Completed_no_commit) -> (
-                  (* Fail gracefully on an unwritable path (matches the read
-                     path), rather than an uncaught Sys_error after the run's
-                     effects already happened. *)
-                  try
-                    Out_channel.with_open_bin path (fun oc ->
-                        let header = Ledger.entry_to_json
-                          (Types.Ctx_snapshot { ctx = initial_ctx }) in
-                        Out_channel.output_string oc
-                          (Yojson.Safe.to_string header ^ "\n");
-                        Out_channel.output_string oc (Ledger.to_ndjson trace));
-                    Printf.printf "ledger written: %s\n" path
-                  with Sys_error msg ->
-                    Printf.eprintf "could not write ledger: %s\n" msg)
-              | _ -> ());
-              match outcome with
-              | Types.Committed _ | Types.Completed_no_commit -> ()
-              | Types.Blocked _ | Types.Aborted _ -> exit 2));
-      0))
+              let approval_result = match approve with
+                | None -> Ok None
+                | Some token -> Result.map Option.some
+                    (approval_header ~workflow_digest:actual_workflow_digest
+                      ~session_nonce:attestation_session ~initial_ctx token)
+              in
+              match approval_result with
+              | Error message ->
+                  Printf.eprintf "--ctx is non-canonical: %s\n" message;
+                  1
+              | Ok supplied_approval ->
+                  let ledger_result = match ledger with
+                    | None -> Ok None
+                    | Some path -> Result.map Option.some
+                        (prepare_ledger path (ledger_prefix ~initial_ctx supplied_approval))
+                  in
+                  (match ledger_result with
+                  | Error message ->
+                      Printf.eprintf "could not initialize audit ledger: %s\n" message;
+                      1
+                  | Ok ledger_handle ->
+                      let outcome, trace =
+                        Engine.run ~sw ~run_allowlist:allow_run ~backend ~token:approve
+                          ~initial_ctx ?attestation_signer
+                          ?attestation_artifact_root:attestation_root
+                          ?attestation_session_nonce:attestation_session
+                          ~agent_backend_id:"cabal-read-only-v1" validated
+                      in
+                      let ledger_finish = match ledger_handle with
+                        | None -> Ok ()
+                        | Some handle -> finish_ledger handle trace
+                      in
+                      (match ledger_finish with
+                      | Error message ->
+                          Printf.eprintf
+                            "audit ledger incomplete after workflow effects; refusing success: %s\n"
+                            message;
+                          1
+                      | Ok () ->
+                          Printf.printf "outcome: %s\ntrace:\n"
+                            (Types.string_of_outcome outcome);
+                          print_trace trace;
+                          Option.iter (fun path -> Printf.printf "ledger written: %s\n" path) ledger;
+                          match outcome with
+                          | Types.Committed _ | Types.Completed_no_commit -> 0
+                          | Types.Blocked _ | Types.Aborted _ -> 2))));
+      ))
 
 (* ---- replay subcommand ---- *)
 
@@ -210,6 +270,35 @@ let load_public_identity path =
   Result.bind (Secure_fs.read_regular path) (fun raw ->
     try Attestation.verifier_of_identity (Yojson.Safe.from_string raw)
     with Yojson.Json_error e -> Error ("invalid public-key JSON: " ^ e))
+
+let valid_token_digest value =
+  String.length value = 71 && String.starts_with ~prefix:"sha256:" value &&
+  String.for_all (function
+    | '0' .. '9' | 'a' .. 'f' -> true
+    | _ -> false) (String.sub value 7 64)
+
+let validate_approval_header ~workflow_digest ~session_nonce ~initial_ctx
+    approval trace =
+  match approval with
+  | None -> Ok () (* legacy ledgers remain replayable *)
+  | Some (Types.Approval_supplied supplied) ->
+      Result.bind (approval_run_context_digest
+        ~workflow_digest ~session_nonce ~initial_ctx) (fun expected_context ->
+        if supplied.workflow_digest <> workflow_digest then
+          Error "approval header workflow digest mismatch"
+        else if supplied.session_nonce <> session_nonce then
+          Error "approval header session nonce mismatch"
+        else if supplied.run_context_digest <> expected_context then
+          Error "approval header run context digest mismatch"
+        else if not (valid_token_digest supplied.token_digest) then
+          Error "approval header token digest is malformed"
+        else
+          let committed_digests = List.filter_map (function
+            | Types.Committed_step { token_digest; _ } -> Some token_digest
+            | _ -> None) trace in
+          if List.for_all (( = ) supplied.token_digest) committed_digests then Ok ()
+          else Error "approval header token digest disagrees with committed step")
+  | Some _ -> Error "invalid approval header"
 
 let cmd_replay file floor_gates ledger attestation_public_key attestation_session
     required_attestations expected_digest =
@@ -240,7 +329,7 @@ let cmd_replay file floor_gates ledger attestation_public_key attestation_sessio
              empty initial_ctx and all lines fed to of_ndjson. *)
           let lines = String.split_on_char '\n' contents
                       |> List.filter (fun s -> String.trim s <> "") in
-          let initial_ctx, trace_lines =
+          let initial_ctx, after_ctx =
             match lines with
             | first :: rest -> (
                 match Ledger.entry_of_json (Yojson.Safe.from_string first) with
@@ -249,12 +338,31 @@ let cmd_replay file floor_gates ledger attestation_public_key attestation_sessio
                 | exception _ -> ([], lines))
             | [] -> ([], [])
           in
+          let approval, trace_lines =
+            match after_ctx with
+            | first :: rest -> (
+                match Ledger.entry_of_json (Yojson.Safe.from_string first) with
+                | Types.Approval_supplied _ as header -> (Some header, rest)
+                | _ -> (None, after_ctx)
+                | exception _ -> (None, after_ctx))
+            | [] -> (None, [])
+          in
           let trace_str = String.concat "\n" trace_lines in
           match Ledger.of_ndjson trace_str with
           | Error e ->
               Printf.eprintf "corrupt ledger: %s\n" e;
               1
           | Ok trace ->
+              let actual_workflow_digest =
+                Attestation.workflow_digest (Validate.Validated.workflow validated)
+              in
+              (match Result.bind (Attestation.validate_canonical_json (`Assoc initial_ctx))
+                (fun () -> validate_approval_header ~workflow_digest:actual_workflow_digest
+                  ~session_nonce:attestation_session ~initial_ctx approval trace) with
+              | Error message ->
+                  Printf.eprintf "corrupt ledger: %s\n" message;
+                  exit 1
+              | Ok () -> ());
               (* Re-feed the recorded trace; NO backend is consulted and no
                  command is ever dispatched/executed (same as in-memory replay).
                  A workflow/ledger mismatch surfaces as Replay_mismatch. *)

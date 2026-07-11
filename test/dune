@@ -10,3 +10,8 @@
  (name test_attestation)
  (modules test_attestation)
  (libraries cabal_workflow_runner alcotest eio eio_main unix))
+
+(rule
+ (alias runtest)
+ (deps test_approval_ledger.sh)
+ (action (run bash %{dep:test_approval_ledger.sh} %{exe:../bin/main.exe})))

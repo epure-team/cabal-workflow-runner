@@ -352,9 +352,13 @@ parameter supplied by the embedder.
 
 The engine, executing a `Commit`, requires a well-formed token passed **at runtime**
 to `Engine.run ~token`. The token is **never** a field of any step and never present
-in a workflow file. No token (or an empty/blank one) ⇒ `Blocked`. The token is hashed
-(`Digest.MD5` → hex) for the trace; the raw token is never stored. There is
-structurally no way for a workflow file to express "commit without a token."
+in a workflow file. No token (or an empty/blank one) ⇒ `Blocked`. New runs record
+`sha256("cwr.approval-token/v2\\0" || raw_token)`; the raw token is never stored.
+The domain prevents cross-protocol digest reuse but does not make a low-entropy
+or reused token secret, so approval tokens must be high-entropy and scoped to one
+run. Header-free legacy ledgers with the former 32-hex Commit digest remain
+replay-compatible. There is structurally no way for a workflow file to express
+"commit without a token."
 
 An optional Commit `preflight` is evaluated **after** this token check. Its command
 head must be a bare PATH-resolved name allowed by the operator's runtime Run allowlist.
@@ -489,6 +493,27 @@ is dispatched/executed). A workflow/ledger mismatch fails closed as
 `Replay_mismatch`. The ledger is **runtime output, not workflow input** — the
 schema is unchanged and there is no parity impact. Consumers such as
 `tools/bounty-pipeline` thereby gain persisted, deterministic replay.
+
+The CLI initializes a requested ledger before engine execution. Line one is the
+legacy-compatible `ctx_snapshot`. If a runtime `--approve` value was supplied,
+line two is the singleton `approval_supplied` header and precedes every engine
+event. It records `sha256("cwr.approval-token/v2\\0" || raw_token)` (never the raw token), the actual
+validated workflow digest, the optional attestation session nonce, and only a
+SHA-256 digest of canonical `{workflow_digest,session_nonce,initial_ctx}`.
+Blocked and aborted runs retain the prefix and their trace. Replay strips the
+header only from that exact position, recomputes the workflow/session/context
+binding, validates digest shape, and requires every recorded `committed_step`
+to use the same token digest. Legacy ledgers without this header remain valid.
+Because replay does not receive the raw token, this proves ledger consistency;
+it does not reauthenticate token possession.
+
+When `--ledger` is requested, the path is opened once through a no-symlink
+directory walk, locked before truncation, required to be an unaliased regular
+file, forced to mode `0600`, and retained as the same descriptor for prefix and
+terminal writes. The prefix must flush before engine execution or no workflow
+step runs. A terminal write, flush, pathname-identity, or close failure after
+execution returns non-zero and reports that effects may have occurred; it must
+not be represented as a successful run.
 
 **What replay attests — and what it does NOT (read before trusting a ledger).**
 Replay re-evaluates the pure DSL over the rebuilt context and asserts each recorded

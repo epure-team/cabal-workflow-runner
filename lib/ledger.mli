@@ -19,7 +19,10 @@
     fails closed); it does {b not} authenticate those outputs or the commit token.
     A forged ledger whose forged outputs make the gates pass can replay to
     [Committed]. [Attestation_exported] entries are authenticated only when replay
-    receives an independently pinned key and expected nonce; other entries are not. *)
+    receives an independently pinned key and expected nonce. The ledger-layer
+    [Approval_supplied] header is checked for exact workflow/session/context and
+    Commit-digest consistency, but cannot reauthenticate a raw token that replay
+    does not receive. *)
 
 val to_ndjson : Types.trace -> string
 (** [to_ndjson trace] serialises [trace] to newline-delimited JSON: one JSON

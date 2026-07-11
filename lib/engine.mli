@@ -110,5 +110,5 @@ val replay :
     (including trailing extra entries after the walk completes). *)
 
 val token_digest : string -> string
-(** Hash of an approval token, as recorded in traces. The raw token is never
-    persisted. *)
+(** Domain-separated SHA-256 of an approval token, encoded as
+    [sha256:<64 lowercase hex>]. The raw token is never persisted. *)

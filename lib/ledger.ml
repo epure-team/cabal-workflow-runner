@@ -126,6 +126,13 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
         [ ("id", `String id); ("envelope", envelope) ]
   | Ctx_snapshot { ctx } ->
       tagged "ctx_snapshot" [ ("ctx", `Assoc ctx) ]
+  | Approval_supplied { token_digest; workflow_digest; session_nonce;
+      run_context_digest } ->
+      tagged "approval_supplied"
+        [ ("token_digest", `String token_digest);
+          ("workflow_digest", `String workflow_digest);
+          ("session_nonce", match session_nonce with None -> `Null | Some value -> `String value);
+          ("run_context_digest", `String run_context_digest) ]
 
 (* [Yojson.Safe.to_string] emits no embedded newline for a single object, so one
    object per line is well-formed NDJSON. Each line is newline-terminated. *)
@@ -190,6 +197,12 @@ let dec_opt_json key json =
   match json with
   | `Assoc fields -> List.assoc_opt key fields
   | _ -> err "entry must be a JSON object"
+
+let dec_nullable_string key json =
+  match assoc_field key json with
+  | `Null -> None
+  | `String value -> Some value
+  | _ -> err "field %S must be a string or null" key
 
 let dec_verdict key json =
   match assoc_field key json with
@@ -352,6 +365,13 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
         | _ -> err "field \"ctx\" must be an object"
       in
       Ctx_snapshot { ctx }
+  | "approval_supplied" ->
+      Approval_supplied {
+        token_digest = dec_string "token_digest" json;
+        workflow_digest = dec_string "workflow_digest" json;
+        session_nonce = dec_nullable_string "session_nonce" json;
+        run_context_digest = dec_string "run_context_digest" json;
+      }
   | other -> err "unknown entry kind %S" other
 
 (* Split on '\n'; ignore blank lines (so a trailing newline is fine). Any line

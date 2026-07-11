@@ -1536,6 +1536,9 @@ let test_commit_token_digest_only () =
   | Committed { token_digest; _ } ->
       Alcotest.(check string) "digest matches Engine.token_digest"
         (Engine.token_digest tok) token_digest;
+      Alcotest.(check string) "domain-separated SHA-256 known answer"
+        "sha256:bfc3cd991b7a385b3b1e1eabe31e3d68e970f30f227fa0ef83109921b6b2a5da"
+        token_digest;
       Alcotest.(check bool) "raw token not in digest" false (token_digest = tok)
   | o -> Alcotest.failf "expected Committed, got %s" (Types.string_of_outcome o));
   let trace_text =
@@ -1566,7 +1569,8 @@ let test_commit_token_digest_only () =
            | Shell_executed { id; _ } -> id
            | Evidence_evaluated { id; _ } -> id
            | Attestation_exported { id; _ } -> id
-           | Ctx_snapshot _ -> "ctx_snapshot")
+           | Ctx_snapshot _ -> "ctx_snapshot"
+           | Approval_supplied { token_digest; _ } -> token_digest)
          trace)
   in
   let contains hay needle =
@@ -2793,6 +2797,16 @@ let test_ledger_corrupt_and_tampered () =
       Alcotest.(check outcome_testable)
         "untampered ledger replays to original outcome" outcome
         (engine_replay ~trace:t v)
+
+let test_ledger_decodes_approval_supplied_header () =
+  let raw =
+    {|{"kind":"approval_supplied","token_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","workflow_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","session_nonce":"session-1","run_context_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+|}
+  in
+  match Ledger.of_ndjson raw with
+  | Ok [ _ ] -> ()
+  | Ok _ -> Alcotest.fail "approval header decoded to the wrong entry count"
+  | Error error -> Alcotest.failf "approval header did not decode: %s" error
 
 (* ---- foreach step tests ---- *)
 
@@ -4559,6 +4573,9 @@ let () =
           Alcotest.test_case
             "corrupt line => Error; tampered (trailing) => Replay_mismatch"
             `Quick test_ledger_corrupt_and_tampered;
+          Alcotest.test_case
+            "approval-supplied ledger header decodes"
+            `Quick test_ledger_decodes_approval_supplied_header;
         ] );
       ( "run-step",
         [

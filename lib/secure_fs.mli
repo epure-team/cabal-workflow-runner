@@ -15,3 +15,10 @@ val with_exclusive_lock : root:string -> relative:string ->
   ('a, string) result
 val lock_identity_matches : root:string -> relative:string -> lock_identity ->
   (bool, string) result
+
+type ledger_handle
+val ledger_open : string -> (ledger_handle, string) result
+val ledger_write : ledger_handle -> phase:string -> string -> (unit, string) result
+val ledger_flush : ledger_handle -> phase:string -> (unit, string) result
+val ledger_identity_matches : ledger_handle -> (bool, string) result
+val ledger_close : ledger_handle -> (unit, string) result
