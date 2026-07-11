@@ -12,12 +12,13 @@
     This module is pure and depends on {b yojson only}: it is the on-disk
     encoding, not an effect. Reading/writing the file lives in [bin/].
 
-    {b Integrity caveat.} A ledger is an unauthenticated, externally-editable
+    {b Integrity caveat.} A ledger is generally an unauthenticated, externally-editable
     file. {!Engine.replay} attests that the trace is {e internally consistent}
     with the workflow and the recorded agent/run outputs (every structural tamper
     fails closed); it does {b not} authenticate those outputs or the commit token.
     A forged ledger whose forged outputs make the gates pass can replay to
-    [Committed]. For tamper-evidence, sign/MAC the ledger out of band. *)
+    [Committed]. [Attestation_exported] entries are authenticated only when replay
+    receives an independently pinned key and expected nonce; other entries are not. *)
 
 val to_ndjson : Types.trace -> string
 (** [to_ndjson trace] serialises [trace] to newline-delimited JSON: one JSON

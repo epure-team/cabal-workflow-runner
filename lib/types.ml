@@ -89,6 +89,12 @@ type step =
       tier : string;
       output : string;
     }
+  | Attest of {
+      id : string;
+      select : string list;
+      replay_domain : string;
+      output : string;
+    }
 
 and governor =
   | Max_iters of int
@@ -201,6 +207,7 @@ type trace_entry =
   | Evidence_evaluated of { id : string; tier : string; passed : bool }
       (** A [Evidence] step evaluated; [passed] iff build + check succeeded and
           the zero_admits pattern was absent from the output file. *)
+  | Attestation_exported of { id : string; envelope : Yojson.Safe.t }
 
 type trace = trace_entry list
 

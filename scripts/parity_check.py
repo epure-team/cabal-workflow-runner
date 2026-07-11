@@ -32,6 +32,23 @@ if not os.path.exists(BIN):
 
 V = Draft202012Validator(json.load(open(SCHEMA)))
 
+def canonical_profile_valid(value):
+    """CWR's signed restricted-JSON profile: no floats, recursively."""
+    if isinstance(value, float): return False
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and canonical_profile_valid(v)
+                   for k, v in value.items())
+    if isinstance(value, list): return all(canonical_profile_valid(v) for v in value)
+    if isinstance(value, bool) or value is None or isinstance(value, str): return True
+    if isinstance(value, int): return -9007199254740991 <= value <= 9007199254740991
+    return False
+
+def contains_attest(value):
+    if isinstance(value, dict):
+        return value.get("kind") == "attest" or any(contains_attest(v) for v in value.values())
+    if isinstance(value, list): return any(contains_attest(v) for v in value)
+    return False
+
 
 def parser_parses(wf):
     """True iff the parser accepts wf structurally (a parse failure surfaces as
@@ -50,6 +67,23 @@ def parser_parses(wf):
     finally:
         os.unlink(p)
 
+def parser_parses_raw(raw):
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        f.write(raw); p = f.name
+    try:
+        out = subprocess.run([BIN, "lint", p, "--json"], capture_output=True,
+                             text=True).stdout
+        return not any(d.get("code") in ("invalid-json", "invalid-shape")
+                       for d in json.loads(out).get("diagnostics", []))
+    finally: os.unlink(p)
+
+def loads_unique(raw):
+    def hook(pairs):
+        keys = [k for k, _ in pairs]
+        if len(keys) != len(set(keys)): raise ValueError("duplicate key")
+        return dict(pairs)
+    return json.loads(raw, object_pairs_hook=hook)
+
 
 def A(i): return {"kind": "agent", "id": i, "prompt": "x", "read_only": True}
 def G(): return {"kind": "gate", "id": "g", "when": {"lit": True}}
@@ -59,6 +93,9 @@ def mi(n): return loop([{"kind": "max_iters", "n": n}])
 def fpw(w): return loop([{"kind": "fixpoint", "window": w, "progress": {"lit": True}}])
 def parallel(branches): return {"kind": "parallel", "branches": branches}
 def foreach(over, steps): return {"kind": "foreach", "over": over, "steps": steps}
+def attest(**extra): return {"kind": "attest", "id": "export",
+    "select": ["outputs.prove"], "replay_domain": "bounty/v1",
+    "output": "artifacts/proof.json", **extra}
 
 CASES = [
     ("baseline valid", wf([A("a")])),
@@ -144,6 +181,23 @@ CASES = [
     ("foreach missing steps", wf([{"kind": "foreach", "over": "results"}])),
     ("foreach +junk", wf([{**foreach("results", [A("a")]), "junk": 1}])),
     ("foreach +_note", wf([{**foreach("results", [A("a")]), "_note": "n"}])),
+    # attest step / restricted canonical profile
+    ("attest valid", wf([attest()])),
+    ("attest unicode", wf([{**attest(), "replay_domain": "bounty/é"}])),
+    ("attest +junk", wf([{**attest(), "junk": 1}])),
+    ("attest missing select", wf([{k:v for k,v in attest().items() if k != "select"}])),
+    ("attest duplicate select", wf([{**attest(), "select": ["x", "x"]}])),
+    ("attest blank domain", wf([{**attest(), "replay_domain": " "}])),
+    ("attest absolute output", wf([{**attest(), "output": "/tmp/x"}])),
+    ("attest traversal output", wf([{**attest(), "output": "a/../x"}])),
+    ("attest float metadata", wf([{**attest(), "_number": 1.0}])),
+    ("attest JS-safe max", wf([{**attest(), "_number": 9007199254740991}])),
+    ("attest JS-safe min", wf([{**attest(), "_number": -9007199254740991}])),
+    ("attest JS-safe max + 1", wf([{**attest(), "_number": 9007199254740992}])),
+    ("attest JS-safe min - 1", wf([{**attest(), "_number": -9007199254740992}])),
+    ("attest nested branch", wf([{"kind":"branch", "when":{"lit":True},
+      "then":[attest()], "else":[]}])),
+    ("attest beneath parallel", wf([parallel([[attest()], [A("a")]])])),
     # workflow version field
     ("workflow with version", wf([A("a")], version="1.0")),
     ("workflow version not string", {"name": "w", "steps": [A("a")], "version": 42}),
@@ -151,11 +205,24 @@ CASES = [
 
 div = 0
 for name, w in CASES:
-    s = V.is_valid(w)
+    s = V.is_valid(w) and (not contains_attest(w) or canonical_profile_valid(w))
     p = parser_parses(w)
     ok = (s == p)
     div += not ok
     print(f"{name:34s} schema={str(s):5s} parser={str(p):5s} "
           f"{'AGREE' if ok else '*** DIVERGE ***'}")
 print(f"\nparity_check: {div} divergence(s) across {len(CASES)} cases")
+RAW_CASES = [
+    ("duplicate workflow name", '{"name":"a","name":"b","steps":[]}'),
+    ("duplicate attest domain", '{"name":"w","steps":[{"kind":"attest","id":"a","select":["x"],"replay_domain":"a","replay_domain":"b","output":"a.json"}]}'),
+]
+for name, raw in RAW_CASES:
+    try:
+        value = loads_unique(raw)
+        s = V.is_valid(value) and (not contains_attest(value) or canonical_profile_valid(value))
+    except (ValueError, json.JSONDecodeError): s = False
+    p = parser_parses_raw(raw); ok = s == p; div += not ok
+    print(f"{name:34s} schema+profile={str(s):5s} parser={str(p):5s} "
+          f"{'AGREE' if ok else '*** DIVERGE ***'}")
+print(f"\nparity_check total: {div} divergence(s) across {len(CASES)+len(RAW_CASES)} cases")
 sys.exit(1 if div else 0)

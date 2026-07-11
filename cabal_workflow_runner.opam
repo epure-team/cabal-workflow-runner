@@ -17,6 +17,9 @@ depends: [
   "eio" {>= "1.0"}
   "eio_main" {>= "1.0"}
   "cmdliner"
+  "base64"
+  "digestif"
+  "mirage-crypto-ec"
   "alcotest" {with-test}
   "odoc" {with-doc}
 ]

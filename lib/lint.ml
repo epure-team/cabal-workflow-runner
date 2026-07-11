@@ -71,7 +71,7 @@ let rec any_commit steps =
       | Loop { body; _ } -> any_commit body
       | Parallel { branches } -> List.exists any_commit branches
       | Foreach { steps = body; _ } -> any_commit body
-      | Agent _ | Gate _ | Run _ | Shell _ | Evidence _ -> false)
+      | Agent _ | Gate _ | Run _ | Shell _ | Evidence _ | Attest _ -> false)
     steps
 
 (* Check if a single step (at any depth) contains a Commit. Used for
@@ -88,7 +88,7 @@ and collect_agent_ids_step step : string list =
   | Loop { body; _ } -> collect_agent_ids body
   | Parallel { branches } -> List.concat_map collect_agent_ids branches
   | Foreach { steps = body; _ } -> collect_agent_ids body
-  | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> []
+  | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ | Attest _ -> []
 
 and collect_agent_ids steps =
   List.concat_map collect_agent_ids_step steps
@@ -110,6 +110,7 @@ and floor_step ~floor ~loc ~guaranteed acc step =
   | Run _ -> guaranteed
   | Shell _ -> guaranteed
   | Evidence _ -> guaranteed
+  | Attest _ -> guaranteed
   | Gate { id; when_ = _ } -> String_set.add id guaranteed
   | Commit { id } ->
       let missing =
@@ -351,6 +352,7 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
   match step with
   | Shell _ -> produced
   | Evidence _ -> produced
+  | Attest _ -> produced
   | Agent { id; output_schema; _ } ->
       let fields = Option.map schema_fields output_schema in
       (id, fields) :: List.remove_assoc id produced
@@ -471,7 +473,7 @@ let rec any_continue_agent steps =
       | Loop { body; _ } -> any_continue_agent body
       | Parallel { branches } -> List.exists any_continue_agent branches
       | Foreach { steps = body; _ } -> any_continue_agent body
-      | Agent _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> false)
+      | Agent _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ | Attest _ -> false)
     steps
 
 (* Flag steps that follow a Commit at the same level (a commit ends the run). *)
@@ -586,6 +588,49 @@ let rec run_steps ~loc_prefix acc steps =
       | _ -> ())
     steps
 
+let attest_safety acc steps =
+  let seen_ids = Hashtbl.create 16 and seen_outputs = Hashtbl.create 16 in
+  let has_occurrence_template output =
+    let needle = "{occurrence}" in
+    let rec search i = i + String.length needle <= String.length output &&
+      (String.sub output i (String.length needle) = needle || search (i + 1)) in
+    search 0
+  in
+  let rec walk ~in_parallel ~repeatable ~loc_prefix steps =
+    List.iteri (fun i step ->
+      let loc = loc_index loc_prefix i in
+      match step with
+      | Attest { id; output; _ } ->
+          if in_parallel then acc := { severity = Error; code = "attest-in-parallel";
+            message = "Attest is forbidden beneath Parallel because branch replay does not authenticate embedded traces";
+            loc } :: !acc;
+          if repeatable && not (has_occurrence_template output) then
+            acc := { severity = Error;
+              code = "attest-occurrence-template-required";
+              message = "Attest beneath Loop/Foreach must include {occurrence} in output";
+              loc } :: !acc;
+          (match Hashtbl.find_opt seen_ids id with
+          | Some prior -> acc := { severity = Error; code = "duplicate-attest-id";
+              message = Printf.sprintf "attest id %S duplicates %s" id prior; loc } :: !acc
+          | None -> Hashtbl.add seen_ids id loc);
+          (match Hashtbl.find_opt seen_outputs output with
+          | Some prior -> acc := { severity = Error; code = "duplicate-attest-output";
+              message = Printf.sprintf "attest output %S duplicates %s" output prior; loc } :: !acc
+          | None -> Hashtbl.add seen_outputs output loc)
+      | Branch { then_; else_; _ } ->
+          walk ~in_parallel ~repeatable ~loc_prefix:(loc ^ ".then") then_;
+          walk ~in_parallel ~repeatable ~loc_prefix:(loc ^ ".else") else_
+      | Loop { body; _ } -> walk ~in_parallel ~repeatable:true
+          ~loc_prefix:(loc ^ ".body") body
+      | Foreach { steps; _ } -> walk ~in_parallel ~repeatable:true
+          ~loc_prefix:(loc ^ ".steps") steps
+      | Parallel { branches } -> List.iteri (fun n branch ->
+          walk ~in_parallel:true ~repeatable
+            ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc n) branch) branches
+      | Agent _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> ()) steps
+  in
+  walk ~in_parallel:false ~repeatable:false ~loc_prefix:"steps" steps
+
 (* ---- top-level check ---------------------------------------------------- *)
 
 let check ?(floor_gates = []) (wf : Types.workflow) : diagnostic list =
@@ -602,6 +647,7 @@ let check ?(floor_gates = []) (wf : Types.workflow) : diagnostic list =
   unreachable_steps ~loc_prefix:"steps" acc wf.steps;
   (* Warnings: run steps execute commands (+ destructive-command notice). *)
   run_steps ~loc_prefix:"steps" acc wf.steps;
+  attest_safety acc wf.steps;
   (* Error: a soft-failing agent (on_failure=continue) in a workflow that can
      Commit. The commit-floor invariant guarantees a Commit is gate-ID-preceded
      but NOT that those gates' predicates consume the soft-failed agent's output —

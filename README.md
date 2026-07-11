@@ -32,8 +32,8 @@ The project is **domain-neutral**. [`examples/bounty.workflow.json`](examples/bo
 is just one illustration — the bounty pipeline expressed as a single workflow file.
 
 - **Library** `cabal_workflow_runner` (`lib/`): types, fail-closed validator,
-  deterministic engine + replay, backend abstraction, JSON loader. Depends on
-  **yojson only** — *not* on cabal.
+  deterministic engine + replay, backend abstraction, JSON loader, and native
+  Ed25519 attestation. It does *not* depend on cabal.
 - **Executable** `cabal-workflow-runner` (`bin/`): a small CLI; this is the only place
   that links cabal.
 
@@ -83,6 +83,67 @@ cabal-workflow-runner run examples/run-demo.workflow.json \
 cabal-workflow-runner replay examples/run-demo.workflow.json \
   --floor g-ran-ok --ledger run.ndjson
 ```
+
+### Authenticated engine-output export
+
+`attest` is an engine-native step that selects prior context values and atomically
+writes a canonical Ed25519-signed JSON envelope. It binds the canonical workflow
+digest and identity, step ID, selection paths and values, workflow replay domain,
+and an operator-supplied run/session nonce.
+
+```json
+{ "kind": "attest", "id": "export-proof",
+  "select": ["outputs.prove", "campaign"],
+  "replay_domain": "bounty-triage/v1",
+  "output": "artifacts/proof.attestation.json" }
+```
+
+Private key material is accepted only through an inherited descriptor: CWR reads
+exactly 32 bytes and closes it before constructing or dispatching any backend.
+
+```sh
+cabal-workflow-runner attestation-public-key --attestation-key-fd 3 > signer.public.json
+# Loaded from protected deployment/campaign configuration over an independent
+# provisioning channel. Never derive this pin from the mutable workflow at run time.
+WORKFLOW_DIGEST=$(protected-config read cwr.workflow_digest)
+cabal-workflow-runner run workflow.json --attestation-key-fd 3 \
+  --attestation-root "$PWD/trusted-artifacts" \
+  --attestation-session "$UNIQUE_RUN_NONCE" --ledger run.ndjson \
+  --require-attestation export-proof \
+  --expected-workflow-digest "$WORKFLOW_DIGEST"
+cabal-workflow-runner replay workflow.json --ledger run.ndjson \
+  --attestation-public-key signer.public.json \
+  --attestation-session "$UNIQUE_RUN_NONCE" \
+  --require-attestation export-proof \
+  --expected-workflow-digest "$WORKFLOW_DIGEST"
+
+# Verify the durable artifact directly, without a backend or ledger.
+cabal-workflow-runner verify-attestation workflow.json \
+  --attestation trusted-artifacts/artifacts/proof.attestation.json \
+  --step export-proof --attestation-public-key signer.public.json \
+  --attestation-session "$UNIQUE_RUN_NONCE" --ctx-file expected-context.json \
+  --expected-workflow-digest "$WORKFLOW_DIGEST"
+```
+
+`workflow-digest` is a provisioning-time tool: an authorized release process may use
+it before pinning the result in protected configuration. Runtime run/replay/verification
+must compare against that independently stored value; computing it from the same mutable
+workflow immediately before verification provides no substitution protection.
+
+Do not pass a private key or key pathname as a command-line argument. Output paths
+must be normalized and relative; traversal, ambiguous components, and symlinks fail
+closed. Descriptor-relative `openat`/`renameat2` traversal prevents symlink and
+same-user directory/target swap attacks. Replay never signs or writes: it recomputes every binding and verifies against
+the pinned key and expected nonce. This authenticates the attestation entry, not the
+rest of the ledger. Run `scripts/attestation-selftest.sh` for an end-to-end check.
+
+Signed values use a restricted canonical JSON profile: valid UTF-8, recursively sorted
+object keys, no duplicate keys, and only null/boolean/string/native integer/array/object
+values (no floats or oversized `Intlit`). Legacy non-attestation workflows retain their
+existing numeric behavior. Each repeated Loop/Foreach occurrence is signed with a
+zero-based occurrence index. Distinct attest steps must have globally unique IDs and
+output paths; Attest is forbidden beneath Parallel. CWR→JS compilation refuses any
+workflow containing Attest rather than silently dropping signing authority.
 
 ```sh
 # Print the canonical JSON Schema (draft 2020-12) of the workflow format. Point a

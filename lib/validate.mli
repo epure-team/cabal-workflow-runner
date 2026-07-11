@@ -15,9 +15,12 @@ module Validated : sig
 
   val floor_gates : t -> string list
   (** The floor gates this workflow was validated against. *)
+
+  val required_attestations : t -> string list
 end
 
 val workflow :
+  ?required_attestations:string list ->
   floor_gates:string list ->
   Types.workflow ->
   (Validated.t, string) result

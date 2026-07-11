@@ -1,3 +1,7 @@
 (library
  (name cabal_workflow_runner)
- (libraries yojson eio))
+ (foreign_stubs
+  (language c)
+  (names secure_fs_stubs)
+  (flags (-Wall -Wextra -Werror)))
+ (libraries yojson eio unix base64 digestif mirage-crypto-ec))

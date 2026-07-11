@@ -106,6 +106,19 @@ let req_relative_path key json =
       Filename.parent_dir_name p
   else p
 
+let req_safe_artifact_path key json =
+  let p = req_relative_path key json in
+  let parts = String.split_on_char '/' p in
+  if p = "" || String.contains p '\\' ||
+     List.exists (fun part -> part = "" || part = ".") parts
+  then err "field %S must be a normalized non-empty relative path" key;
+  p
+
+let req_nonempty_string key json =
+  let s = req_string key json in
+  if String.trim s = "" then err "field %S must be non-empty" key;
+  s
+
 (* A required list that the schema declares with [minItems:1] (e.g. a loop's
    [governors]): an empty array is a parse-level shape error, matching the
    schema. ([Lint]/[Validate] keep their richer [ungoverned-loop] diagnostic;
@@ -369,10 +382,39 @@ let rec step_of_json json =
         ~known:[ "kind"; "id"; "build"; "check"; "zero_admits"; "tier"; "output" ]
         json;
       s
+  | "attest" ->
+      let select = req_string_nonempty_list "select" json in
+      if List.exists (fun p -> String.trim p = "") select then
+        err "field \"select\" entries must be non-empty dotted paths";
+      if List.length (List.sort_uniq String.compare select) <> List.length select then
+        err "field \"select\" must not contain duplicates";
+      let s = Attest {
+        id = req_nonempty_string "id" json; select;
+        replay_domain = req_nonempty_string "replay_domain" json;
+        output = req_safe_artifact_path "output" json;
+      } in
+      reject_unknown_keys ~what:"attest step"
+        ~known:[ "kind"; "id"; "select"; "replay_domain"; "output" ] json;
+      s
   | other -> err "unknown step kind %S" other
 
 let of_json json =
   try
+    (match Canonical_json.validate_no_duplicates json with
+    | Ok () -> ()
+    | Error e -> err "non-canonical JSON: %s" e);
+    let rec has_attest = function
+      | `Assoc fields ->
+          List.assoc_opt "kind" fields = Some (`String "attest")
+          || List.exists (fun (_, value) -> has_attest value) fields
+      | `List values -> List.exists has_attest values
+      | _ -> false
+    in
+    if has_attest json then
+      (match Canonical_json.validate json with
+      | Ok () -> ()
+      | Error e ->
+          err "attestation workflow is not restricted canonical JSON: %s" e);
     let name = req_string "name" json in
     let steps = List.map step_of_json (req_list "steps" json) in
     let version =
@@ -391,10 +433,9 @@ let of_string s =
   | exception Yojson.Json_error msg -> Error ("malformed JSON: " ^ msg)
 
 let of_file path =
-  match Yojson.Safe.from_file path with
-  | json -> of_json json
-  | exception Yojson.Json_error msg -> Error ("malformed JSON: " ^ msg)
-  | exception Sys_error msg -> Error ("cannot read file: " ^ msg)
+  match Secure_fs.read_regular path with
+  | Error msg -> Error ("cannot read file securely: " ^ msg)
+  | Ok raw -> of_string raw
 
 (* ---- serialisation ------------------------------------------------------ *)
 
@@ -533,6 +574,12 @@ let rec step_to_json = function
           ("tier", `String tier);
           ("output", `String output);
         ]
+  | Attest { id; select; replay_domain; output } ->
+      `Assoc [
+        ("kind", `String "attest"); ("id", `String id);
+        ("select", `List (List.map (fun p -> `String p) select));
+        ("replay_domain", `String replay_domain); ("output", `String output);
+      ]
 
 let to_json { name; steps; version } =
   `Assoc

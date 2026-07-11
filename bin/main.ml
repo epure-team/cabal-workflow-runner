@@ -1,10 +1,10 @@
 open Cabal_workflow_runner
 
-let load_and_validate ~floor_gates file =
+let load_and_validate ?(required_attestations = []) ~floor_gates file =
   match Workflow_json.of_file file with
   | Error e -> Error (Printf.sprintf "parse error: %s" e)
   | Ok wf -> (
-      match Validate.workflow ~floor_gates wf with
+      match Validate.workflow ~required_attestations ~floor_gates wf with
       | Error e -> Error (Printf.sprintf "validation rejected workflow: %s" e)
       | Ok v -> Ok v)
 
@@ -57,6 +57,10 @@ let print_trace trace =
           Printf.printf "  shell    %-16s %d command(s)\n" id (List.length results)
       | Types.Evidence_evaluated { id; tier; passed } ->
           Printf.printf "  evidence %-16s tier=%s passed=%b\n" id tier passed
+      | Types.Attestation_exported { id; envelope } ->
+          Printf.printf "  attest   %-16s key=%s\n" id
+            (match envelope with `Assoc f -> (match List.assoc_opt "key_id" f with
+             Some (`String s) -> s | _ -> "<unknown>") | _ -> "<invalid>")
       | Types.Ctx_snapshot _ ->
           (* ledger-layer header, never appears in an engine trace *) ())
     trace
@@ -90,8 +94,7 @@ let print_lint_table (ds : Lint.diagnostic list) =
 
 let cmd_lint file floor_gates json =
   let raw =
-    try Ok (In_channel.with_open_bin file In_channel.input_all)
-    with Sys_error msg -> Error msg
+    Secure_fs.read_regular file
   in
   match raw with
   | Error msg ->
@@ -111,12 +114,37 @@ let cmd_schema () =
 
 (* ---- run subcommand ---- *)
 
-let cmd_run file floor_gates approve allow_run ledger ctx_json =
-  match load_and_validate ~floor_gates file with
+external file_descr_of_int : int -> Unix.file_descr = "%identity"
+
+let signer_from_fd = function
+  | None -> Ok None
+  | Some n when n >= 0 -> Result.map Option.some
+      (Attestation.signer_of_fd (file_descr_of_int n))
+  | Some _ -> Error "--attestation-key-fd must be non-negative"
+
+let check_expected_workflow_digest validated expected required =
+  let actual = Attestation.workflow_digest (Validate.Validated.workflow validated) in
+  match expected with
+  | Some digest when digest = actual -> Ok ()
+  | Some digest -> Error (Printf.sprintf
+      "workflow digest mismatch: expected %s, actual %s" digest actual)
+  | None when required <> [] ->
+      Error "--expected-workflow-digest is required with --require-attestation"
+  | None -> Ok ()
+
+let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_fd
+    attestation_root attestation_session required_attestations expected_digest =
+  match load_and_validate ~required_attestations ~floor_gates file with
   | Error e ->
       Printf.eprintf "%s\n" e;
       1
   | Ok validated ->
+      (match check_expected_workflow_digest validated expected_digest required_attestations with
+      | Error e -> Printf.eprintf "%s\n" e; 1
+      | Ok () ->
+      (match signer_from_fd attestation_key_fd with
+      | Error e -> Printf.eprintf "attestation key error: %s\n" e; 1
+      | Ok attestation_signer ->
       Eio_main.run (fun env ->
           Eio.Switch.run (fun sw ->
               let cwd = Sys.getcwd () in
@@ -125,7 +153,12 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json =
                 | None -> []
                 | Some raw ->
                     (match Yojson.Safe.from_string raw with
-                     | `Assoc fields -> fields
+                     | `Assoc fields as json ->
+                         (match Canonical_json.validate_no_duplicates json with
+                         | Ok () -> fields
+                         | Error e ->
+                             Printf.eprintf "--ctx is non-canonical: %s\n" e;
+                             exit 1)
                      | _ ->
                          Printf.eprintf "--ctx must be a JSON object\n";
                          exit 1
@@ -135,7 +168,9 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json =
               in
               let outcome, trace =
                 Engine.run ~sw ~run_allowlist:allow_run ~backend ~token:approve
-                  ~initial_ctx validated
+                  ~initial_ctx ?attestation_signer
+                  ?attestation_artifact_root:attestation_root
+                  ?attestation_session_nonce:attestation_session validated
               in
               Printf.printf "outcome: %s\ntrace:\n"
                 (Types.string_of_outcome outcome);
@@ -162,19 +197,32 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json =
               match outcome with
               | Types.Committed _ | Types.Completed_no_commit -> ()
               | Types.Blocked _ | Types.Aborted _ -> exit 2));
-      0
+      0))
 
 (* ---- replay subcommand ---- *)
 
-let cmd_replay file floor_gates ledger =
-  match load_and_validate ~floor_gates file with
+let load_public_identity path =
+  Result.bind (Secure_fs.read_regular path) (fun raw ->
+    try Attestation.verifier_of_identity (Yojson.Safe.from_string raw)
+    with Yojson.Json_error e -> Error ("invalid public-key JSON: " ^ e))
+
+let cmd_replay file floor_gates ledger attestation_public_key attestation_session
+    required_attestations expected_digest =
+  match load_and_validate ~required_attestations ~floor_gates file with
   | Error e ->
       Printf.eprintf "%s\n" e;
       1
   | Ok validated -> (
+      match check_expected_workflow_digest validated expected_digest required_attestations with
+      | Error e -> Printf.eprintf "%s\n" e; 1
+      | Ok () ->
+      let attestation_verifier = match attestation_public_key with None -> Ok None
+        | Some p -> Result.map Option.some (load_public_identity p) in
+      match attestation_verifier with
+      | Error e -> Printf.eprintf "attestation public-key error: %s\n" e; 1
+      | Ok attestation_verifier ->
       let raw =
-        try Ok (In_channel.with_open_bin ledger In_channel.input_all)
-        with Sys_error msg -> Error msg
+        Secure_fs.read_regular ledger
       in
       match raw with
       | Error msg ->
@@ -208,7 +256,8 @@ let cmd_replay file floor_gates ledger =
               let result = ref 0 in
               Eio_main.run (fun _env ->
                 Eio.Switch.run (fun sw ->
-                  match Engine.replay ~sw ~trace ~initial_ctx validated with
+                  match Engine.replay ~sw ~trace ~initial_ctx ?attestation_verifier
+                    ?attestation_session_nonce:attestation_session validated with
                   | outcome ->
                       Printf.printf "replayed outcome: %s\ntrace:\n"
                         (Types.string_of_outcome outcome);
@@ -217,6 +266,76 @@ let cmd_replay file floor_gates ledger =
                       Printf.eprintf "replay mismatch: %s\n" reason;
                       result := 2));
               !result))
+
+let cmd_attestation_public_key key_fd =
+  match signer_from_fd (Some key_fd) with
+  | Error e -> Printf.eprintf "attestation key error: %s\n" e; 1
+  | Ok None -> assert false
+  | Ok (Some signer) ->
+      print_endline (Attestation.canonical_string
+        (Attestation.public_identity signer)); 0
+
+let cmd_workflow_digest file =
+  match Workflow_json.of_file file with
+  | Error e -> Printf.eprintf "parse error: %s\n" e; 1
+  | Ok wf -> print_endline (Attestation.workflow_digest wf); 0
+
+let parse_context ~ctx_json ~ctx_file =
+  match ctx_json, ctx_file with
+  | Some _, Some _ -> Error "use only one of --ctx and --ctx-file"
+  | None, None -> Ok []
+  | Some raw, None | None, Some raw ->
+      let parsed = match ctx_file with
+        | Some path -> Result.bind (Secure_fs.read_regular path) (fun raw ->
+            try Ok (Yojson.Safe.from_string raw) with Yojson.Json_error e -> Error e)
+        | None -> (try Ok (Yojson.Safe.from_string raw) with Yojson.Json_error e -> Error e) in
+      Result.bind parsed (function
+        | `Assoc f as json ->
+            Result.map (fun () -> f)
+              (Canonical_json.validate_no_duplicates json)
+        | _ -> Error "context must be a JSON object")
+
+let rec attest_steps steps = List.concat_map (function
+  | Types.Attest { id; select; replay_domain; output } ->
+      [id, select, replay_domain, output]
+  | Types.Branch { then_; else_; _ } -> attest_steps then_ @ attest_steps else_
+  | Types.Loop { body; _ } -> attest_steps body
+  | Types.Parallel { branches } -> List.concat_map attest_steps branches
+  | Types.Foreach { steps; _ } -> attest_steps steps
+  | Types.Agent _ | Types.Gate _ | Types.Run _ | Types.Commit _ | Types.Shell _
+  | Types.Evidence _ -> []) steps
+
+let load_regular_json label path =
+  Result.bind (Secure_fs.read_regular path) (fun raw ->
+    try
+      let json = Yojson.Safe.from_string raw in
+      Result.map (fun () -> json) (Canonical_json.validate json)
+    with Yojson.Json_error e -> Error (label ^ " is invalid JSON: " ^ e))
+
+let cmd_verify_attestation file floor_gates artifact step_id public_key_path
+    session_nonce ctx_json ctx_file expected_digest occurrence =
+  match load_and_validate ~floor_gates file with
+  | Error e -> Printf.eprintf "%s\n" e; 1
+  | Ok validated ->
+      let wf = Validate.Validated.workflow validated in
+      if Attestation.workflow_digest wf <> expected_digest then
+        (Printf.eprintf "workflow digest mismatch\n"; 1)
+      else
+      match List.filter (fun (id, _, _, _) -> id = step_id) (attest_steps wf.steps) with
+      | [] -> Printf.eprintf "attest step %S not found\n" step_id; 1
+      | _ :: _ :: _ -> Printf.eprintf "attest step %S is not unique\n" step_id; 1
+      | [(_, select, replay_domain, output)] ->
+          let result = Result.bind (load_public_identity public_key_path) (fun verifier ->
+            Result.bind (parse_context ~ctx_json ~ctx_file) (fun ctx ->
+              Result.bind (Attestation.select_context ctx select) (fun selected ->
+                Result.bind (load_regular_json "attestation artifact" artifact) (fun envelope ->
+                  Attestation.verify ~verifier ~workflow:wf ~step_id ~occurrence
+                    ~output_path:(Attestation.materialize_output_path
+                      ~template:output
+                      ~occurrence)
+                    ~replay_domain ~session_nonce ~selected envelope)))) in
+          (match result with Ok () -> Printf.printf "VALID ATTESTATION: %s (%s)\n" artifact step_id; 0
+           | Error e -> Printf.eprintf "INVALID ATTESTATION: %s\n" e; 1)
 
 (* ---- to-claude-workflow subcommand ---- *)
 
@@ -322,12 +441,33 @@ let ctx_arg =
         ~doc:
           "Pre-populate the run context with a top-level JSON object.            Each top-level key becomes a bare ctx key accessible to            foreach.over and expressions. Absent => empty context.")
 
+let attestation_key_fd_arg = Arg.(value & opt (some int) None &
+  info ["attestation-key-fd"] ~docv:"FD" ~doc:"Read an exact 32-byte Ed25519 seed from inherited FD and close it before backend construction.")
+let required_attestation_key_fd_arg = Arg.(required & opt (some int) None & info ["attestation-key-fd"] ~docv:"FD")
+let attestation_root_arg = Arg.(value & opt (some string) None & info ["attestation-root"] ~docv:"DIR")
+let attestation_session_arg = Arg.(value & opt (some string) None & info ["attestation-session"] ~docv:"NONCE")
+let attestation_public_key_arg = Arg.(value & opt (some string) None & info ["attestation-public-key"] ~docv:"PATH")
+let required_attestation_public_key_arg = Arg.(required & opt (some string) None & info ["attestation-public-key"] ~docv:"PATH")
+let attestation_artifact_arg = Arg.(required & opt (some string) None & info ["attestation"] ~docv:"PATH")
+let attestation_step_arg = Arg.(required & opt (some string) None & info ["step"] ~docv:"STEP_ID")
+let required_attestation_session_arg = Arg.(required & opt (some string) None & info ["attestation-session"] ~docv:"NONCE")
+let ctx_file_arg = Arg.(value & opt (some string) None & info ["ctx-file"] ~docv:"PATH")
+let require_attestation_arg = Arg.(value & opt_all string [] &
+  info ["require-attestation"] ~docv:"STEP_ID")
+let expected_workflow_digest_arg = Arg.(value & opt (some string) None &
+  info ["expected-workflow-digest"] ~docv:"SHA256")
+let required_workflow_digest_arg = Arg.(required & opt (some string) None &
+  info ["expected-workflow-digest"] ~docv:"SHA256")
+let occurrence_arg = Arg.(value & opt int 0 & info ["occurrence"] ~docv:"N")
+
 let run_cmd =
   let doc = "Run a workflow deterministically, dispatching agents via cabal." in
   Cmd.v (Cmd.info "run" ~doc)
     Term.(
       const cmd_run $ file_arg $ floor_arg $ approve_arg $ allow_run_arg
-      $ ledger_arg $ ctx_arg)
+      $ ledger_arg $ ctx_arg $ attestation_key_fd_arg $ attestation_root_arg
+      $ attestation_session_arg $ require_attestation_arg
+      $ expected_workflow_digest_arg)
 
 let replay_ledger_arg =
   Arg.(
@@ -348,7 +488,24 @@ let replay_cmd =
      Replay_mismatch (incl. a workflow/ledger mismatch)."
   in
   Cmd.v (Cmd.info "replay" ~doc)
-    Term.(const cmd_replay $ file_arg $ floor_arg $ replay_ledger_arg)
+    Term.(const cmd_replay $ file_arg $ floor_arg $ replay_ledger_arg
+      $ attestation_public_key_arg $ attestation_session_arg
+      $ require_attestation_arg $ expected_workflow_digest_arg)
+
+let attestation_public_key_cmd =
+  Cmd.v (Cmd.info "attestation-public-key" ~doc:"Derive a pinnable public identity from an inherited seed FD.")
+    Term.(const cmd_attestation_public_key $ required_attestation_key_fd_arg)
+
+let workflow_digest_cmd =
+  Cmd.v (Cmd.info "workflow-digest" ~doc:"Print the canonical pinned workflow digest.")
+    Term.(const cmd_workflow_digest $ file_arg)
+
+let verify_attestation_cmd =
+  Cmd.v (Cmd.info "verify-attestation" ~doc:"Verify a durable native attestation without a backend or ledger.")
+    Term.(const cmd_verify_attestation $ file_arg $ floor_arg $ attestation_artifact_arg
+      $ attestation_step_arg $ required_attestation_public_key_arg
+      $ required_attestation_session_arg $ ctx_arg $ ctx_file_arg
+      $ required_workflow_digest_arg $ occurrence_arg)
 
 let schema_cmd =
   let doc =
@@ -370,10 +527,11 @@ let to_claude_workflow_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.14.0" ~doc in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.15.0" ~doc in
   let group =
     Cmd.group info
       [ lint_cmd; validate_cmd; run_cmd; replay_cmd; schema_cmd;
-        to_claude_workflow_cmd ]
+        to_claude_workflow_cmd; attestation_public_key_cmd;
+        verify_attestation_cmd; workflow_digest_cmd ]
   in
   exit (Cmd.eval' group)

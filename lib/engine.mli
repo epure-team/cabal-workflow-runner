@@ -17,6 +17,9 @@ val run :
   ?max_loop_iters:int ->
   ?run_allowlist:string list ->
   ?initial_ctx:(string * Yojson.Safe.t) list ->
+  ?attestation_signer:Attestation.signer ->
+  ?attestation_artifact_root:string ->
+  ?attestation_session_nonce:string ->
   sw:Eio.Switch.t ->
   backend:Backend.t ->
   token:string option ->
@@ -75,6 +78,8 @@ exception Replay_mismatch of string
 val replay :
   ?max_loop_iters:int ->
   ?initial_ctx:(string * Yojson.Safe.t) list ->
+  ?attestation_verifier:Attestation.verifier ->
+  ?attestation_session_nonce:string ->
   sw:Eio.Switch.t ->
   trace:Types.trace ->
   Validate.Validated.t ->

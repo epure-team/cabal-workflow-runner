@@ -91,6 +91,9 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
   | Evidence_evaluated { id; tier; passed } ->
       tagged "evidence_evaluated"
         [ ("id", `String id); ("tier", `String tier); ("passed", `Bool passed) ]
+  | Attestation_exported { id; envelope } ->
+      tagged "attestation_exported"
+        [ ("id", `String id); ("envelope", envelope) ]
   | Ctx_snapshot { ctx } ->
       tagged "ctx_snapshot" [ ("ctx", `Assoc ctx) ]
 
@@ -183,6 +186,9 @@ let outcome_of_json json =
   | other -> err "unknown outcome kind %S" other
 
 let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
+  (match Canonical_json.validate_no_duplicates json with
+  | Ok () -> ()
+  | Error e -> err "non-canonical ledger JSON: %s" e);
   match dec_string "kind" json with
   | "agent_ran" ->
       Agent_ran
@@ -256,6 +262,9 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
         { id = dec_string "id" json;
           tier = dec_string "tier" json;
           passed = dec_bool "passed" json }
+  | "attestation_exported" ->
+      Attestation_exported
+        { id = dec_string "id" json; envelope = assoc_field "envelope" json }
   | "ctx_snapshot" ->
       let ctx = match assoc_field "ctx" json with
         | `Assoc fields -> fields

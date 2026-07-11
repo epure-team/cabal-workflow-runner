@@ -168,6 +168,27 @@
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "id", "select", "replay_domain", "output" ],
+          "properties": {
+            "kind": { "const": "attest" },
+            "id": { "type": "string", "pattern": ".*\\S.*" },
+            "select": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "pattern": ".*\\S.*" }
+            },
+            "replay_domain": { "type": "string", "pattern": ".*\\S.*" },
+            "output": {
+              "type": "string",
+              "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\).+$"
+            }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
         }
       ]
     },

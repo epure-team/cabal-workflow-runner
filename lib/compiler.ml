@@ -385,11 +385,28 @@ and compile_step ctx step =
         ~description:(Printf.sprintf
           "evidence step %S (tier %s) omitted from JS output; \
            formal verification not representable in Claude Workflow JS" id tier)
+  | Types.Attest { id; select; replay_domain; output } ->
+      emit_comment ctx (Printf.sprintf
+        "[CWR attest: id=%S domain=%S output=%S selections=%d — engine-held signing key unavailable in Claude Workflow JS]"
+        id replay_domain output (List.length select));
+      add_note ctx ~kind:"attest"
+        ~description:(Printf.sprintf
+          "attest step %S omitted: authenticated engine export cannot be preserved by the JS backend" id)
 
 (* Compile a validated CWR workflow to Claude Workflow JS text.
    Returns (js_text, notes) where notes is a list of compilation notes
    for display on stderr. *)
 let compile_workflow (wf : Types.workflow) : string * note list =
+  let rec has_attest steps = List.exists (function
+    | Types.Attest _ -> true
+    | Types.Branch { then_; else_; _ } -> has_attest then_ || has_attest else_
+    | Types.Loop { body; _ } -> has_attest body
+    | Types.Parallel { branches } -> List.exists has_attest branches
+    | Types.Foreach { steps; _ } -> has_attest steps
+    | _ -> false) steps in
+  if has_attest wf.steps then
+    raise (Compile_error
+      "workflow contains Attest; Claude Workflow JS cannot preserve engine-held signing authority");
   let buf = Buffer.create 512 in
   let notes = ref [] in
   let version_str = match wf.version with

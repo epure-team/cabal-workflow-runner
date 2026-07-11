@@ -1372,6 +1372,7 @@ let test_commit_token_digest_only () =
                Printf.sprintf "foreach_completed_%d" iterations
            | Shell_executed { id; _ } -> id
            | Evidence_evaluated { id; _ } -> id
+           | Attestation_exported { id; _ } -> id
            | Ctx_snapshot _ -> "ctx_snapshot")
          trace)
   in
@@ -1821,7 +1822,7 @@ let test_schema_no_drift () =
    unknown kind. *)
 let test_schema_kinds_agree () =
   (* Hard-coded expected set the parser (Workflow_json.step_of_json) accepts. *)
-  let expected = [ "agent"; "branch"; "commit"; "evidence"; "foreach"; "gate"; "loop"; "parallel"; "run"; "shell" ] in
+  let expected = [ "agent"; "attest"; "branch"; "commit"; "evidence"; "foreach"; "gate"; "loop"; "parallel"; "run"; "shell" ] in
   (* Extract the kind consts enumerated under $defs/step/oneOf in the schema. *)
   let top = match Workflow_schema.schema with `Assoc l -> l | _ -> [] in
   let step_def =
@@ -1992,6 +1993,10 @@ let test_parser_rejects_unknown_keys () =
       ( "commit step",
         {|{ "name": "x", "steps": [
              { "kind": "commit", "id": "c", "junk": 1 } ] }|} );
+      ( "attest step",
+        {|{ "name": "x", "steps": [
+             { "kind": "attest", "id": "a", "select": ["outputs.x"],
+               "replay_domain": "test/v1", "output": "a.json", "junk": 1 } ] }|} );
       ( "max_iters governor",
         {|{ "name": "x", "steps": [
              { "kind": "loop", "body": [],
@@ -2048,6 +2053,7 @@ let parser_known_keys =
     ("foreach", [ "kind"; "over"; "steps" ]);
     ("shell", [ "kind"; "id"; "commands"; "on_failure" ]);
     ("evidence", [ "kind"; "id"; "build"; "check"; "zero_admits"; "tier"; "output" ]);
+    ("attest", [ "kind"; "id"; "select"; "replay_domain"; "output" ]);
     ("max_iters", [ "kind"; "n" ]);
     ("budget", [ "kind" ]);
     ("fixpoint", [ "kind"; "window"; "progress" ]);

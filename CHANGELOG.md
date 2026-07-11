@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.15
+
+**Authenticated native output export.** Added the `attest` step and canonical
+Ed25519 envelopes binding workflow digest/identity, step, selected context values,
+replay domain, and operator session nonce. Live execution writes atomically under a
+checked artifact root; missing configuration and unsafe/symlink paths block. Replay
+is effect-free and requires a pinned public-key identity plus the expected nonce, so
+tampered ledger entries and cross-session reuse fail authentication.
+
+Private seeds enter the CLI only through `--attestation-key-fd`: exactly 32 bytes are
+read and the descriptor is closed before backend construction. `Backend.t` is unchanged,
+so Agent, Run, and Shell adapters never receive signer material. Added public-key export,
+schema/parser/lint/compiler/ledger integration, focused tests, and an end-to-end CLI
+security selftest; the existing 110 tests remain green.
+
+Adversarial follow-up hardened the boundary with recursive duplicate-key rejection,
+restricted canonical signed JSON, signed occurrence counters, global ID/output
+uniqueness, Parallel rejection, compiler refusal, operator-pinned workflow digests and
+required-attestation paths, secure descriptor-relative reads/writes, concurrent-swap
+tests, explicit post-rename `published-uncertain`, and a cross-language Node Ed25519
+verifier. The final closure removed replacement entirely, requires immutable
+`{occurrence}` paths in repeatable control flow, fixes trusted relative `.` roots,
+pins every Node-verifier binding independently, and aligns UTF-8 ordering/JS-safe
+integer vectors. The focused attestation suite now contains 20 tests (130 total), including
+controlled engine, replay, CLI, and standalone-verifier rejection of unsafe numeric selections.
+
 ## v0.14
 
 **Faithful CWR→JS compiler.** `to-claude-workflow` now emits runnable Claude Workflow

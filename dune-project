@@ -15,6 +15,9 @@
   (eio (>= 1.0))
   (eio_main (>= 1.0))
   cmdliner
+  base64
+  digestif
+  mirage-crypto-ec
   (alcotest :with-test))
  (license MIT)
  (authors "Epure Team")

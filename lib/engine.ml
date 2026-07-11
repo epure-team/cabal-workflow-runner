@@ -14,13 +14,15 @@ let token_is_wellformed = function
 type state = {
   rev_trace : trace_entry list;
   ctx : (string * Yojson.Safe.t) list;
+  attest_counts : (string * int) list;
   terminal : outcome option;
 }
 
 let emit st entry = { st with rev_trace = entry :: st.rev_trace }
 
 (* Bind/overwrite a key in ctx (most recent write wins; assoc lookup finds it). *)
-let bind st key json = { st with ctx = (key, json) :: st.ctx }
+let bind st key json =
+  { st with ctx = (key, json) :: List.remove_assoc key st.ctx }
 
 (* The expression context: agent outputs are nested under "outputs". We expose
    that to the DSL by keeping ctx keyed by "outputs" and "loop". The actual
@@ -78,8 +80,9 @@ let path_bearing_head = function
   | head :: _ -> String.contains head '/'
   | [] -> false
 
-let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initial_ctx = [])
-    ~sw:(_sw : Eio.Switch.t) ~backend ~token validated =
+let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
+    ?(initial_ctx = []) ?attestation_signer ?attestation_artifact_root
+    ?attestation_session_nonce ~sw:(_sw : Eio.Switch.t) ~backend ~token validated =
   let wf = Validate.Validated.workflow validated in
   let agent ~id ~prompt ~read_only ~agent_type ~model =
     backend.Backend.run_agent ~id ~prompt ~read_only ~agent_type ~model
@@ -389,6 +392,46 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initi
           let st = { st with terminal = Some (Aborted reason) } in
           emit st (Blocked_at { id; reason })
         end else st
+    | Attest { id; select; replay_domain; output } ->
+        let occurrence = Option.value (List.assoc_opt id st.attest_counts) ~default:0 in
+        let st = { st with attest_counts =
+          (id, occurrence + 1) :: List.remove_assoc id st.attest_counts } in
+        let result =
+          match (attestation_signer, attestation_artifact_root,
+                 attestation_session_nonce) with
+          | Some signer, Some artifact_root, Some session_nonce
+            when String.trim session_nonce <> "" -> (
+              match Attestation.select_context st.ctx select with
+              | Error e -> Error (`Failed e)
+              | Ok selected ->
+                  let output_path = Attestation.materialize_output_path
+                    ~template:output ~occurrence in
+                  (match Attestation.create ~signer ~workflow:wf
+                           ~step_id:id ~occurrence ~output_path ~replay_domain
+                           ~session_nonce ~selected with
+                  | Error e -> Error (`Failed
+                      ("attestation canonical-profile rejected selection: " ^ e))
+                  | Ok envelope ->
+                      (match Attestation.write_atomic ~artifact_root
+                               ~relative_path:output_path envelope with
+                      | Ok () -> Ok envelope
+                      | Error (Attestation.Failed e) ->
+                          Error (`Failed ("attestation export failed: " ^ e))
+                      | Error (Attestation.Published_uncertain e) ->
+                          Error (`Uncertain e))))
+          | _ -> Error (`Failed "missing signer, artifact root, or non-empty session nonce")
+        in
+        (match result with
+        | Ok envelope -> emit st (Attestation_exported { id; envelope })
+        | Error (`Failed detail) ->
+            let reason = Printf.sprintf "attest step %S blocked: %s" id detail in
+            emit { st with terminal = Some (Blocked reason) }
+              (Blocked_at { id; reason })
+        | Error (`Uncertain detail) ->
+            let reason = Printf.sprintf
+              "published-uncertain at attest step %S: %s" id detail in
+            emit { st with terminal = Some (Aborted reason) }
+              (Blocked_at { id; reason }))
   (* Governed loop. Per iteration: bind loop.iter, run body, then stop if
      [until] holds OR any governor fires. The bound is a pure function of
      recorded inputs (agent outputs, budget readings, fixpoint verdicts), so the
@@ -449,7 +492,8 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initi
     in
     iter st 0
   in
-  finish (go { rev_trace = []; ctx = initial_ctx; terminal = None } wf.steps)
+  finish (go { rev_trace = []; ctx = initial_ctx; attest_counts = [];
+               terminal = None } wf.steps)
 
 (* ------------------------------------------------------------------ *)
 (* replay: re-interpret from the recorded trace, no backend consulted. *)
@@ -457,9 +501,15 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = []) ?(initi
 
 exception Replay_mismatch of string
 
-let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = []) ~sw:(_sw : Eio.Switch.t)
+let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
+    ?attestation_verifier ?attestation_session_nonce ~sw:(_sw : Eio.Switch.t)
     ~trace validated =
   let wf = Validate.Validated.workflow validated in
+  (match attestation_verifier with
+  | Some _ when Validate.Validated.required_attestations validated = [] ->
+      raise (Replay_mismatch
+        "authenticated replay requires validated required_attestations")
+  | _ -> ());
   let pending = ref trace in
   let next () =
     match !pending with
@@ -707,6 +757,32 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = []) ~sw:(_
               | _ -> raise (Replay_mismatch "evidence block entry mismatch")
             end else st
         | _ -> raise (Replay_mismatch "evidence_evaluated entry mismatch"))
+    | Attest { id; select; replay_domain; output } -> (
+        let occurrence = Option.value (List.assoc_opt id st.attest_counts) ~default:0 in
+        let st = { st with attest_counts =
+          (id, occurrence + 1) :: List.remove_assoc id st.attest_counts } in
+        match next () with
+        | Attestation_exported { id = rid; envelope } when rid = id ->
+            let selected = match Attestation.select_context st.ctx select with
+              | Ok values -> values
+              | Error e -> raise (Replay_mismatch
+                  ("attestation selection failed: " ^ e)) in
+            (match (attestation_verifier, attestation_session_nonce) with
+            | Some verifier, Some session_nonce when String.trim session_nonce <> "" ->
+                let output_path = Attestation.materialize_output_path
+                  ~template:output ~occurrence in
+                (match Attestation.verify ~verifier ~workflow:wf ~step_id:id
+                         ~occurrence ~output_path ~replay_domain ~session_nonce
+                         ~selected envelope with
+                | Ok () -> emit st (Attestation_exported { id; envelope })
+                | Error e -> raise (Replay_mismatch
+                    ("attestation verification failed: " ^ e)))
+            | _ -> raise (Replay_mismatch
+                "attestation replay requires a pinned public key and session nonce"))
+        | Blocked_at { id = rid; reason } when rid = id ->
+            let st = emit st (Blocked_at { id; reason }) in
+            { st with terminal = Some (Blocked reason) }
+        | _ -> raise (Replay_mismatch "attestation entry mismatch"))
   and replay_loop st body until governors =
     let fixpoint_counts = Array.make (List.length governors) 0 in
     let rec iter st index =
@@ -785,7 +861,8 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = []) ~sw:(_
     iter st 0
   in
   let outcome, _trace =
-    finish (go { rev_trace = []; ctx = initial_ctx; terminal = None } wf.steps)
+    finish (go { rev_trace = []; ctx = initial_ctx; attest_counts = [];
+                 terminal = None } wf.steps)
   in
   (* The walk must have consumed the WHOLE trace: a trace that is a valid prefix
      followed by extra (garbage) entries must NOT replay successfully. *)

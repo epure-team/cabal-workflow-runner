@@ -348,12 +348,27 @@ let step_def : Yojson.Safe.t =
           ("output", typ "string");
         ]
   in
+  let attest =
+    closed_object_with
+      ~required:[ "kind"; "id"; "select"; "replay_domain"; "output" ]
+      ~props:[
+        ("kind", kind_const "attest");
+        ("id", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]);
+        ("select", obj [ ("type", s "array"); ("minItems", `Int 1);
+          ("uniqueItems", `Bool true);
+          ("items", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]) ]);
+        ("replay_domain", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]);
+        ("output", obj [ ("type", s "string");
+          ("pattern", s "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\).+$") ]);
+      ]
+  in
   obj
     [
       ( "description",
         s "A workflow step, discriminated by the \"kind\" key." );
       ( "oneOf",
-        arr [ agent; gate; branch; loop; run; commit; parallel; foreach; shell; evidence ] );
+        arr [ agent; gate; branch; loop; run; commit; parallel; foreach; shell;
+              evidence; attest ] );
     ]
 
 (* ---- top level ---------------------------------------------------------- *)

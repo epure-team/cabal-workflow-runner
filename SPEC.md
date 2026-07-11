@@ -31,10 +31,45 @@ commit). A `workflow` is a name plus a `step list`:
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
 | `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
 | `Run { id; cmd; working_dir; timeout_ms; observe }` | Execute an observable shell command (no shell) via the **injected** `Backend.run_command` effect, recording the `run_result` and binding it under `outputs.<id>`. Executes **only** if the binary is in the operator's runtime **allowlist** (`[]` = fail-closed/off, `"*"` = all), else `Blocked`. | Command runs **exactly once** on the live run (recorded as `Run_executed`); **replay re-feeds the recorded result and never re-executes** (side-effect-free, byte-identical). |
+| `Attest { id; select; replay_domain; output }` | Select context paths and atomically export a canonical Ed25519 envelope beneath an operator artifact root. Requires an engine-held signer and non-empty operator session nonce. | No backend receives the private key. Replay and standalone verification recompute bindings and verify against a pin without writing. |
 | `Commit { id }` | The **only** step that can file/submit. | Requires a runtime token (below). |
 
 Illegal states are made hard to express: there is **no** step constructor that can
 carry an approval token, and `Commit` is the only constructor that can file/submit.
+
+#### Authenticated export trust boundary
+
+The signed payload contains the canonical SHA-256 workflow digest plus workflow
+name/version, step ID, workflow replay domain, operator session nonce, and the exact
+selected dotted paths and JSON values. Verification requires an independently pinned
+public-key identity and expected session nonce; the key embedded in an editable artifact
+is not itself a trust anchor.
+
+The CLI reads an exact 32-byte seed from `--attestation-key-fd N`, requires EOF, and
+closes `N` before constructing the cabal backend. The signer is absent from `Backend.t`,
+prompts, `Run`, and `Shell`. Missing signer/root/session blocks. Artifact paths are
+normalized and relative; `lstat` rejects symlink roots, parents, and targets. Writing
+uses descriptor-relative `openat(O_NOFOLLOW|O_DIRECTORY)`, an exclusive same-directory
+temporary file, file `fsync`, `renameat2`, and directory `fsync`. Parent inode rechecks
+and `RENAME_NOREPLACE` publication fail closed under concurrent swaps. Existing
+artifacts are accepted only when byte-identical; they are never replaced.
+Failure after rename is reported as `published-uncertain`, never as an ordinary failure.
+
+The signed representation is a restricted canonical JSON profile: valid UTF-8 strings
+and keys; recursive bytewise UTF-8 key ordering; Yojson's compact escaping; no
+duplicate object keys; and only null, booleans, strings, native integers, arrays, and
+objects. Floats and `Intlit` are rejected only for attestation-bearing workflows and
+selected/signed values, preserving legacy workflow compatibility. `occurrence` is a
+zero-based per-step counter recomputed during replay. An Attest beneath Loop/Foreach
+must include `{occurrence}` in its output template; the engine substitutes the signed
+counter to publish immutable, collision-free paths. IDs and output templates are globally
+unique across distinct Attest nodes, and Attest is invalid beneath Parallel.
+
+Replay verifies `Attestation_exported` without filesystem effects. The standalone
+`verify-attestation` command performs the same check from a workflow, unique step ID,
+artifact, context JSON/file, pin, and expected nonce, without a ledger or backend.
+Authenticated replay additionally requires `--require-attestation ID` and a pinned
+`--expected-workflow-digest`; static analysis rejects empty or branched-around bypasses.
 
 `on_failure = "continue"` does **not** weaken the commit safety floor, because the
 validator **rejects** it in any workflow that contains a `Commit` (the

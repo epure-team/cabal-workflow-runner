@@ -145,6 +145,13 @@ type step =
       (** Formal-verification quality gate: build + check + zero-admits search.
           Passes iff build exits 0, check exits 0, and [zero_admits] is absent
           from [output]. Fail-closed: a failed [Evidence] aborts the run. *)
+  | Attest of {
+      id : string;
+      select : string list;
+      replay_domain : string;
+      output : string;
+    }
+      (** Native authenticated export; never calls a backend. *)
 
 (** A loop governor — each can independently fire to stop the loop. *)
 and governor =
@@ -263,6 +270,7 @@ type trace_entry =
   | Evidence_evaluated of { id : string; tier : string; passed : bool }
       (** Outcome of an {!Evidence} step: [passed] iff build + check succeeded
           and the zero_admits pattern was absent from the output file. *)
+  | Attestation_exported of { id : string; envelope : Yojson.Safe.t }
 
 type trace = trace_entry list
 (** Trace entries in execution order (first executed step first). *)
