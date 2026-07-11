@@ -26,13 +26,13 @@ commit). A `workflow` is a name plus a `step list`:
 
 | Step | Meaning | Determinism |
 |------|---------|-------------|
-| `Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. A **`success = false` run fails closed** → `Aborted` **by default** (`on_failure = "abort"`); with **`on_failure = "continue"`** the failure is **soft** — the failed `Agent_ran` is recorded and the walk continues (for continuous loops where one iteration's failure must not kill the run). On success, if `output_schema` is present the JSON is validated **fail-closed**. Optional routing/inlining hints: `protocol`/`brief` (file paths whose contents prepend the prompt), `agent_type` (backend adapter selector), and **`model`** (per-step model override, e.g. `"claude-fable-5"`, that takes precedence over the backend's global `CWR_MODEL` for this step only; absent ⇒ backend default). | Effect isolated to the backend; structured result recorded. |
+| `Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model; input }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. Optional `input` selects guaranteed predecessor paths for a **read-only** Agent and creates engine-owned request/result receipts under `receipts.<id>`. A **`success = false` run fails closed** → `Aborted` **by default** (`on_failure = "abort"`); with **`on_failure = "continue"` the failure is soft. On success, `output_schema` is validated fail-closed. | Effect isolated to the backend; structured output and optional receipts recorded and replay-checked. |
 | `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). A `Pass` records the verdict and continues; a **`Fail` BLOCKS** the run (`Blocked`, naming the gate id). | Verdict recorded; a false gate is a terminal block. |
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
 | `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
 | `Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema }` | Execute an observable command (no shell) via the injected `Backend.run_command`. Optional `input` selects dotted context paths into restricted-canonical JSON on stdin; optional `stdout_schema` requires a non-truncated canonical-profile object stdout and binds it as `outputs.<id>.parsed`. Structured Runs are invalid beneath Parallel. | Command runs **exactly once** live. `Run_executed` binds result, input digest, and parsed stdout; replay recomputes/revalidates them and **never executes**. |
 | `Attest { id; select; replay_domain; output }` | Select context paths and atomically export a canonical Ed25519 envelope beneath an operator artifact root. Requires an engine-held signer and non-empty operator session nonce. | No backend receives the private key. Replay and standalone verification recompute bindings and verify against a pin without writing. |
-| `Commit { id }` | The **only** step that can file/submit. | Requires a runtime token (below). |
+| `Commit { id; preflight }` | The **only** step that can file/submit. Optional preflight contains required `cmd`, `input`, `stdout_schema` and optional `working_dir`, `timeout_ms`. | Requires a runtime token first. Preflight then executes once through the Run allowlist immediately before Commit; its receipt is Commit-bound and replay never executes it. |
 
 Illegal states are made hard to express: there is **no** step constructor that can
 carry an approval token, and `Commit` is the only constructor that can file/submit.
@@ -86,6 +86,15 @@ failed agent *aborts the walk*; the default remains fail-closed `"abort"`.
 engine maintains a **run context** `ctx`: each agent's output is bound under
 `outputs.<id>`, and inside a loop the current 0-based iteration index is exposed at
 `loop.iter`. The DSL addresses into it by dotted path (`outputs.assess.severity`).
+
+When `input` is present, lint requires `read_only=true`, rejects Parallel placement,
+and checks each selector against guaranteed predecessors. The request receipt binds
+the session-derived dispatch ID, backend capability ID, role, read-only bit, declared
+selector list, exact canonical projection, and input digest. The result receipt binds
+the dispatch/request, success/outcome, exact output and output digest. Both are bound
+under `receipts.<id>` and may be selected by Attest. Replay reconstructs both receipts
+from the workflow, prior context, nonce, and recorded output; any field or selector
+tamper is a mismatch.
 
 An `output_schema` is a minimal required-field spec — a list of `(field, ty)` with
 `ty ∈ { String | Int | Number | Bool | Enum of string list | Any }`. After a
@@ -346,6 +355,18 @@ to `Engine.run ~token`. The token is **never** a field of any step and never pre
 in a workflow file. No token (or an empty/blank one) ⇒ `Blocked`. The token is hashed
 (`Digest.MD5` → hex) for the trace; the raw token is never stored. There is
 structurally no way for a workflow file to express "commit without a token."
+
+An optional Commit `preflight` is evaluated **after** this token check. Its command
+head must be a bare PATH-resolved name allowed by the operator's runtime Run allowlist.
+Its non-empty unique `input` paths are restricted-canonicalized onto stdin, and its
+stdout must exit zero, be untruncated canonical object JSON, and satisfy
+`stdout_schema`. Any failure blocks without a Commit entry. Success emits an adjacent
+engine receipt `{step_id,input_digest,process_exit,output_digest,parsed}`; the
+`Committed_step` binds the exact receipt and its canonical digest. Replay reselects
+the current input, revalidates the recorded result/schema and exact Commit binding,
+and never executes the command. Domain predicates are enforced by the trusted command
+exiting nonzero, not hard-coded into CWR. Absent `preflight`, legacy behavior is
+unchanged.
 
 ### 2.2 `Validate.workflow ~floor_gates wf` is fail-closed
 

@@ -112,7 +112,7 @@ and floor_step ~floor ~loc ~guaranteed acc step =
   | Evidence _ -> guaranteed
   | Attest _ -> guaranteed
   | Gate { id; when_ = _ } -> String_set.add id guaranteed
-  | Commit { id } ->
+  | Commit { id; _ } ->
       let missing =
         List.filter (fun g -> not (String_set.mem g guaranteed)) floor
       in
@@ -271,6 +271,8 @@ and floor_step ~floor ~loc ~guaranteed acc step =
 
 type produced = (string * string list option) list
 
+let produced_key root id = root ^ "." ^ id
+
 let schema_fields (s : Schema.t) : string list = List.map fst s
 
 (* Check one expression's references against [produced]; push warnings into
@@ -282,7 +284,7 @@ let check_expr_refs ~loc ~(produced : produced) ~warned_missing acc (e : Expr.t)
     (fun path ->
       match path with
       | "outputs" :: id :: rest -> (
-          match List.assoc_opt id produced with
+          match List.assoc_opt (produced_key "outputs" id) produced with
           | None ->
               acc :=
                 {
@@ -331,8 +333,34 @@ let check_expr_refs ~loc ~(produced : produced) ~warned_missing acc (e : Expr.t)
                     }
                     :: !acc
               | _ -> ()))
+      | "receipts" :: id :: rest -> (
+          match List.assoc_opt (produced_key "receipts" id) produced with
+          | None ->
+              acc := { severity = Warning; code = "dangling-receipt-ref";
+                message = Printf.sprintf
+                  "reference to receipts.%s.* but no prior structured Agent %S produces it on this path"
+                  id id; loc } :: !acc
+          | Some (Some fields) ->
+              (match rest with
+              | field :: _ when not (List.mem field fields) ->
+                  acc := { severity = Warning; code = "dangling-receipt-ref";
+                    message = Printf.sprintf
+                      "reference to receipts.%s.%s but Agent receipt %S exposes only request/result"
+                      id field id; loc } :: !acc
+              | _ -> ())
+          | Some None -> ())
       | _ -> ())
     (expr_paths e)
+
+let check_selected_predecessor ~loc ~(produced : produced) acc path =
+  match String.split_on_char '.' path with
+  | ("outputs" as root) :: id :: _ | ("receipts" as root) :: id :: _ ->
+      if List.assoc_opt (produced_key root id) produced = None then
+        acc := { severity = Error; code = "structured-input-missing-predecessor";
+          message = Printf.sprintf
+            "selected path %S has no guaranteed prior %s producer %S on this path"
+            path root id; loc } :: !acc
+  | _ -> ()
 
 let rec refs_steps ~loc_prefix ~(produced : produced) ~warned_missing acc steps
     : produced =
@@ -352,10 +380,27 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
   match step with
   | Shell _ -> produced
   | Evidence _ -> produced
-  | Attest _ -> produced
-  | Agent { id; output_schema; _ } ->
+  | Attest { select; _ } ->
+      List.iter (fun path ->
+        check_selected_predecessor ~loc ~produced acc path;
+        check_expr_refs ~loc ~produced ~warned_missing acc
+          (Expr.Path (String.split_on_char '.' path))) select;
+      produced
+  | Agent { id; output_schema; input; _ } ->
+      Option.iter
+        (List.iter (fun path ->
+             check_selected_predecessor ~loc ~produced acc path;
+             check_expr_refs ~loc ~produced ~warned_missing acc
+               (Expr.Path (String.split_on_char '.' path)))) input;
       let fields = Option.map schema_fields output_schema in
-      (id, fields) :: List.remove_assoc id produced
+      let produced =
+        (produced_key "outputs" id, fields)
+        :: List.remove_assoc (produced_key "outputs" id) produced in
+      (match input with
+      | None -> produced
+      | Some _ ->
+          (produced_key "receipts" id, Some [ "request"; "result" ])
+          :: List.remove_assoc (produced_key "receipts" id) produced)
   | Run { id; input; stdout_schema; _ } ->
       Option.iter
         (List.iter (fun path ->
@@ -371,7 +416,8 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
           @ (match input with None -> [] | Some _ -> [ "input_digest" ])
           @ match stdout_schema with None -> [] | Some _ -> [ "parsed" ])
       in
-      (id, fields) :: List.remove_assoc id produced
+      (produced_key "outputs" id, fields)
+      :: List.remove_assoc (produced_key "outputs" id) produced
   | Gate { when_; _ } ->
       check_expr_refs ~loc ~produced ~warned_missing acc when_;
       produced
@@ -428,7 +474,15 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
           | _ -> ())
         governors;
       p_body
-  | Commit _ -> produced
+  | Commit { preflight; _ } ->
+      Option.iter
+        (fun ({ input; _ } : commit_preflight) ->
+          List.iter (fun path ->
+            check_selected_predecessor ~loc ~produced acc path;
+            check_expr_refs ~loc ~produced ~warned_missing acc
+              (Expr.Path (String.split_on_char '.' path))) input)
+        preflight;
+      produced
   | Parallel { branches } ->
       (* Each branch sees [produced] so far. After parallel, an output is
          available only if ALL branches produce it — intersection semantics,
@@ -601,10 +655,12 @@ let rec run_steps ~loc_prefix acc steps =
 let attest_safety acc steps =
   let seen_ids = Hashtbl.create 16 and seen_outputs = Hashtbl.create 16 in
   let agent_read_only = Hashtbl.create 16 in
+  let structured_agents = Hashtbl.create 16 in
   let rec collect_agents steps = List.iter (function
-    | Agent { id; read_only; _ } ->
+    | Agent { id; read_only; input; _ } ->
         let prior = Option.value ~default:true (Hashtbl.find_opt agent_read_only id) in
-        Hashtbl.replace agent_read_only id (prior && read_only)
+        Hashtbl.replace agent_read_only id (prior && read_only);
+        if input <> None then Hashtbl.replace structured_agents id true
     | Branch { then_; else_; _ } -> collect_agents then_; collect_agents else_
     | Loop { body; _ } -> collect_agents body
     | Foreach { steps; _ } -> collect_agents steps
@@ -646,6 +702,20 @@ let attest_safety acc steps =
                       "Attest %S selects output from Agent %S, which is not read_only on every path"
                       id producer; loc } :: !acc
                 | _ -> ())
+            | "receipts" :: producer :: _ ->
+                if Hashtbl.find_opt structured_agents producer <> Some true then
+                  acc := { severity = Error; code = "attest-selects-missing-agent-receipt";
+                    message = Printf.sprintf
+                      "Attest %S selects receipt from Agent %S, which does not produce structured receipts"
+                      id producer; loc } :: !acc
+                else
+                  (match Hashtbl.find_opt agent_read_only producer with
+                  | Some false -> acc := { severity = Error;
+                      code = "attest-selects-mutable-agent-receipt";
+                      message = Printf.sprintf
+                        "Attest %S selects receipt from Agent %S, which is not read_only on every path"
+                        id producer; loc } :: !acc
+                  | _ -> ())
             | _ -> ()) select
       | Branch { then_; else_; _ } ->
           walk ~in_parallel ~repeatable ~loc_prefix:(loc ^ ".then") then_;
@@ -664,6 +734,17 @@ let attest_safety acc steps =
               "structured Run %S is beneath Parallel; input/stdout replay bindings are not supported in parallel branch traces"
               id;
             loc } :: !acc
+      | Agent { id; input = Some _; read_only; _ } ->
+          if not read_only then
+            acc := { severity = Error; code = "structured-agent-not-read-only";
+              message = Printf.sprintf
+                "structured Agent %S must declare read_only=true before it can receive selected predecessor input or produce attestable receipts"
+                id; loc } :: !acc;
+          if in_parallel then
+            acc := { severity = Error; code = "structured-agent-in-parallel";
+              message = Printf.sprintf
+                "structured Agent %S is beneath Parallel; receipt context is not preserved by parallel branch replay"
+                id; loc } :: !acc
       | Agent _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> ()) steps
   in
   walk ~in_parallel:false ~repeatable:false ~loc_prefix:"steps" steps

@@ -220,6 +220,14 @@ let step_def : Yojson.Safe.t =
           ("brief", typ "string");
           ("agent_type", typ "string");
           ("model", typ "string");
+          ( "input",
+            obj
+              [
+                ("type", s "array");
+                ("items", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]);
+                ("minItems", `Int 1);
+                ("uniqueItems", `Bool true);
+              ] );
         ]
   in
   let gate =
@@ -299,7 +307,22 @@ let step_def : Yojson.Safe.t =
   in
   let commit =
     closed_object_with ~required:[ "kind"; "id" ]
-      ~props:[ ("kind", kind_const "commit"); ("id", typ "string") ]
+      ~props:
+        [ ("kind", kind_const "commit"); ("id", typ "string");
+          ( "preflight",
+            closed_object_with ~required:[ "cmd"; "input"; "stdout_schema" ]
+              ~props:
+                [ ("cmd", obj [ ("type", s "array"); ("items", typ "string");
+                                  ("minItems", `Int 1) ]);
+                  ("input", obj [ ("type", s "array");
+                                    ("items", obj [ ("type", s "string");
+                                                    ("pattern", s ".*\\S.*") ]);
+                                    ("minItems", `Int 1);
+                                    ("uniqueItems", `Bool true) ]);
+                  ("stdout_schema", ref_ "output_schema");
+                  ("working_dir", obj [ ("type", s "string");
+                                         ("pattern", s "^(?!/)(?!(.*/)?\\.\\.(/|$)).+$") ]);
+                  ("timeout_ms", bounded_int) ] ) ]
   in
   let parallel =
     closed_object_with

@@ -41,9 +41,13 @@ let run_result_to_json (r : run_result) : Yojson.Safe.t =
 let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
   let tagged kind fields = `Assoc (("kind", `String kind) :: fields) in
   match e with
-  | Agent_ran { id; success; output } ->
+  | Agent_ran { id; success; output; request_receipt; result_receipt } ->
       tagged "agent_ran"
-        [ ("id", `String id); ("success", `Bool success); ("output", output) ]
+        ([ ("id", `String id); ("success", `Bool success); ("output", output) ]
+        @ (match request_receipt with None -> []
+          | Some receipt -> [ ("request_receipt", receipt) ])
+        @ match result_receipt with None -> []
+          | Some receipt -> [ ("result_receipt", receipt) ])
   | Gate_evaluated { id; verdict } ->
       tagged "gate_evaluated"
         [ ("id", `String id); ("verdict", verdict_to_json verdict) ]
@@ -63,9 +67,20 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
           | None -> []
           | Some digest -> [ ("input_digest", `String digest) ])
         @ match parsed with None -> [] | Some json -> [ ("parsed", json) ])
-  | Committed_step { id; token_digest } ->
+  | Commit_preflight_executed { id; input_digest; parsed; result; receipt } ->
+      tagged "commit_preflight_executed"
+        ([ ("id", `String id); ("input_digest", `String input_digest);
+           ("result", run_result_to_json result) ]
+        @ (match parsed with None -> [] | Some json -> [ ("parsed", json) ])
+        @ match receipt with None -> [] | Some json -> [ ("receipt", json) ])
+  | Committed_step { id; token_digest; preflight_receipt;
+      preflight_receipt_digest } ->
       tagged "committed_step"
-        [ ("id", `String id); ("token_digest", `String token_digest) ]
+        ([ ("id", `String id); ("token_digest", `String token_digest) ]
+        @ (match preflight_receipt with None -> []
+          | Some json -> [ ("preflight_receipt", json) ])
+        @ match preflight_receipt_digest with None -> []
+          | Some digest -> [ ("preflight_receipt_digest", `String digest) ])
   | Blocked_at { id; reason } ->
       tagged "blocked_at" [ ("id", `String id); ("reason", `String reason) ]
   | Parallel_started -> tagged "parallel_started" []
@@ -214,6 +229,8 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
           id = dec_string "id" json;
           success = dec_bool "success" json;
           output = assoc_field "output" json;
+          request_receipt = dec_opt_json "request_receipt" json;
+          result_receipt = dec_opt_json "result_receipt" json;
         }
   | "gate_evaluated" ->
       Gate_evaluated
@@ -236,11 +253,22 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
         parsed = dec_opt_json "parsed" json;
         result = dec_run_result json;
       }
+  | "commit_preflight_executed" ->
+      Commit_preflight_executed {
+        id = dec_string "id" json;
+        input_digest = dec_string "input_digest" json;
+        parsed = dec_opt_json "parsed" json;
+        result = dec_run_result json;
+        receipt = dec_opt_json "receipt" json;
+      }
   | "committed_step" ->
       Committed_step
         {
           id = dec_string "id" json;
           token_digest = dec_string "token_digest" json;
+          preflight_receipt = dec_opt_json "preflight_receipt" json;
+          preflight_receipt_digest =
+            dec_opt_string "preflight_receipt_digest" json;
         }
   | "blocked_at" ->
       Blocked_at { id = dec_string "id" json; reason = dec_string "reason" json }

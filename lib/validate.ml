@@ -23,7 +23,7 @@ let required_attestation_errors required steps =
   let rec sequence guaranteed errors = function
     | [] -> guaranteed, errors
     | Attest { id; _ } :: rest -> sequence (S.add id guaranteed) errors rest
-    | Commit { id } :: _ ->
+    | Commit { id; _ } :: _ ->
         let absent = missing guaranteed in
         guaranteed,
         (if absent = [] then errors else

@@ -29,7 +29,13 @@
             "protocol": { "type": "string" },
             "brief": { "type": "string" },
             "agent_type": { "type": "string" },
-            "model": { "type": "string" }
+            "model": { "type": "string" },
+            "input": {
+              "type": "array",
+              "items": { "type": "string", "pattern": ".*\\S.*" },
+              "minItems": 1,
+              "uniqueItems": true
+            }
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false
@@ -110,7 +116,36 @@
           "required": [ "kind", "id" ],
           "properties": {
             "kind": { "const": "commit" },
-            "id": { "type": "string" }
+            "id": { "type": "string" },
+            "preflight": {
+              "type": "object",
+              "required": [ "cmd", "input", "stdout_schema" ],
+              "properties": {
+                "cmd": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "minItems": 1
+                },
+                "input": {
+                  "type": "array",
+                  "items": { "type": "string", "pattern": ".*\\S.*" },
+                  "minItems": 1,
+                  "uniqueItems": true
+                },
+                "stdout_schema": { "$ref": "#/$defs/output_schema" },
+                "working_dir": {
+                  "type": "string",
+                  "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$)).+$"
+                },
+                "timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4611686018427387903
+                }
+              },
+              "patternProperties": { "^_": {} },
+              "additionalProperties": false
+            }
           },
           "patternProperties": { "^_": {} },
           "additionalProperties": false

@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.18.0
+
+**Engine-owned decision receipts and approval-time preflight.** A read-only
+`Agent` may now select guaranteed predecessor context with `input`. CWR sends a
+restricted-canonical projection in an engine envelope and records request/result
+receipts under `receipts.<id>`, binding the session dispatch, concrete backend
+capability, role, `read_only=true`, declared selector paths, input/output digests,
+success, and exact structured output. Attest may select those receipts; lint
+rejects mutable or parallel structured Agents and unsafe receipt producers.
+Replay reconstructs every binding and rejects receipt or predecessor tampering.
+
+`Commit` has an optional structured `preflight` using the Run command/input/schema
+vocabulary. It executes only after a runtime approval token, through the runtime
+allowlist, and immediately before commitment. Nonzero exit, truncation, invalid
+JSON/schema, unsafe command path, missing input, or absent allowlist authority
+blocks the Commit. The engine records a canonical preflight receipt and binds it
+and its digest into the adjacent Commit trace entry; replay validates it without
+executing. Legacy Agent and Commit workflows retain their prior encoding and
+behavior.
+
 ## v0.17.1
 
 **v0.17 review closure.** Read-only Agent dispatch no longer trusts cabal

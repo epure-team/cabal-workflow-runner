@@ -47,6 +47,14 @@ end
 
 type on_failure = Abort | Continue
 
+type commit_preflight = {
+  cmd : string list;
+  working_dir : string;
+  timeout_ms : int option;
+  input : string list;
+  stdout_schema : Schema.t;
+}
+
 type step =
   | Agent of {
       id : string;
@@ -58,6 +66,7 @@ type step =
       brief : string option;
       agent_type : string option;
       model : string option;
+      input : string list option;
     }
   | Gate of { id : string; when_ : Expr.t }
   | Branch of { when_ : Expr.t; then_ : step list; else_ : step list }
@@ -75,7 +84,7 @@ type step =
       input : string list option;
       stdout_schema : Schema.t option;
     }
-  | Commit of { id : string }
+  | Commit of { id : string; preflight : commit_preflight option }
   | Parallel of { branches : step list list }
   | Foreach of { over : string; steps : step list }
   | Shell of {
@@ -171,7 +180,13 @@ let json_of_run_result (r : run_result) : Yojson.Safe.t =
    byte-identical and the (data-driven, possibly unbounded) loop bound is purely
    a function of recorded inputs. *)
 type trace_entry =
-  | Agent_ran of { id : string; success : bool; output : Yojson.Safe.t }
+  | Agent_ran of {
+      id : string;
+      success : bool;
+      output : Yojson.Safe.t;
+      request_receipt : Yojson.Safe.t option;
+      result_receipt : Yojson.Safe.t option;
+    }
   | Gate_evaluated of { id : string; verdict : gate_verdict }
   | Branch_taken of { verdict : gate_verdict }
   | Loop_iter of { index : int }  (** start of loop iteration [index] (0-based). *)
@@ -186,7 +201,19 @@ type trace_entry =
     }
       (** A [Run] step's command executed once; the full result is recorded so
           replay re-binds it WITHOUT re-executing the command. *)
-  | Committed_step of { id : string; token_digest : string }
+  | Commit_preflight_executed of {
+      id : string;
+      input_digest : string;
+      parsed : Yojson.Safe.t option;
+      result : run_result;
+      receipt : Yojson.Safe.t option;
+    }
+  | Committed_step of {
+      id : string;
+      token_digest : string;
+      preflight_receipt : Yojson.Safe.t option;
+      preflight_receipt_digest : string option;
+    }
   | Blocked_at of { id : string; reason : string }
   | Parallel_started
   | Parallel_branch_completed of {

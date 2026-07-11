@@ -56,16 +56,21 @@ let json_backend table =
   Backend.stub ~agent ()
 
 (* Wrap Engine.run in an Eio context (required after ~sw threading). *)
-let engine_run ?max_loop_iters ?run_allowlist ?initial_ctx ~backend ~token validated =
+let engine_run ?max_loop_iters ?run_allowlist ?initial_ctx
+    ?attestation_session_nonce ?agent_backend_id ~backend ~token validated =
   Eio_main.run (fun _env ->
     Eio.Switch.run (fun sw ->
-      Engine.run ?max_loop_iters ?run_allowlist ?initial_ctx ~sw ~backend ~token validated))
+      Engine.run ?max_loop_iters ?run_allowlist ?initial_ctx
+        ?attestation_session_nonce ?agent_backend_id ~sw ~backend ~token
+        validated))
 
 (* Wrap Engine.replay in an Eio context. *)
-let engine_replay ?max_loop_iters ?initial_ctx ~trace validated =
+let engine_replay ?max_loop_iters ?initial_ctx ?attestation_session_nonce
+    ~trace validated =
   Eio_main.run (fun _env ->
     Eio.Switch.run (fun sw ->
-      Engine.replay ?max_loop_iters ?initial_ctx ~sw ~trace validated))
+      Engine.replay ?max_loop_iters ?initial_ctx ?attestation_session_nonce
+        ~sw ~trace validated))
 
 (* A workflow whose Commit is guaranteed-gated by "g" on every path. The gate
    condition is trivially true. *)
@@ -76,9 +81,9 @@ let gated_workflow =
     steps =
       [
         Agent
-          { id = "draft"; prompt = "do work"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+          { id = "draft"; prompt = "do work"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
         Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
-        Commit { id = "submit" };
+        Commit { id = "submit"; preflight = None };
       ];
   }
 
@@ -184,7 +189,7 @@ let branch_wf =
     version = None;
     steps =
       [
-        Agent { id = "a"; prompt = "assess"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+        Agent { id = "a"; prompt = "assess"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
         Branch
           {
             when_ =
@@ -192,9 +197,9 @@ let branch_wf =
                 ( Expr.Path [ "outputs"; "a"; "severity" ],
                   Expr.Lit (Expr.List [ Expr.String "high"; Expr.String "critical" ]) );
             then_ =
-              [ Agent { id = "esc"; prompt = "escalate"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+              [ Agent { id = "esc"; prompt = "escalate"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
             else_ =
-              [ Agent { id = "drop"; prompt = "drop"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+              [ Agent { id = "drop"; prompt = "drop"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
           };
       ];
   }
@@ -230,10 +235,10 @@ let test_schema_fail_closed () =
       steps =
         [
           Agent
-            { id = "a"; prompt = "p"; read_only = true; output_schema = Some schema; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+            { id = "a"; prompt = "p"; read_only = true; output_schema = Some schema; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
           (* would commit if it got here, but the agent output lacks "severity" *)
           Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -262,9 +267,9 @@ let test_failed_agent_fails_closed () =
       version = None;
       steps =
         [
-          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
           Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -301,8 +306,8 @@ let test_soft_fail_agent_continues () =
       version = None;
       steps =
         [
-          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None };
-          Agent { id = "b"; prompt = "q"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None; input = None };
+          Agent { id = "b"; prompt = "q"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
         ];
     }
   in
@@ -349,9 +354,9 @@ let test_soft_fail_with_commit_rejected () =
       version = None;
       steps =
         [
-          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None };
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None; input = None };
           Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -368,9 +373,9 @@ let test_soft_fail_with_commit_rejected () =
       with_commit with
       steps =
         [
-          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+          Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
           Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -383,7 +388,7 @@ let test_soft_fail_with_commit_rejected () =
       name = "soft-fail-no-commit";
       version = None;
       steps =
-        [ Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None } ];
+        [ Agent { id = "a"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
     }
   in
   match Validate.workflow ~floor_gates:[] commit_free with
@@ -403,7 +408,7 @@ let test_ungoverned_loop_rejected () =
           Loop
             {
               body =
-                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               until = None;
               governors = [];
             };
@@ -468,7 +473,7 @@ let test_loop_budget_terminates () =
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               (* until never holds *)
               until = Some (Expr.Lit (Expr.Bool false));
               governors = [ Budget ];
@@ -512,7 +517,7 @@ let test_loop_fixpoint_terminates () =
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               until = Some (Expr.Lit (Expr.Bool false));
               governors =
                 [
@@ -562,7 +567,7 @@ let test_loop_ceiling_budget_constant () =
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               until = Some (Expr.Lit (Expr.Bool false));
               governors = [ Budget ];
             };
@@ -603,7 +608,7 @@ let test_loop_ceiling_fixpoint_always_progresses () =
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               until = Some (Expr.Lit (Expr.Bool false));
               governors =
                 [
@@ -646,11 +651,11 @@ let test_replay_with_loop () =
       version = None;
       steps =
         [
-          Agent { id = "assess"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+          Agent { id = "assess"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
           Loop
             {
               body =
-                [ Agent { id = "work"; prompt = "q"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "work"; prompt = "q"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               until = Some (Expr.Lit (Expr.Bool false));
               governors = [ Budget ];
             };
@@ -661,9 +666,9 @@ let test_replay_with_loop () =
                 Expr.In
                   ( Expr.Path [ "outputs"; "assess"; "severity" ],
                     Expr.Lit (Expr.List [ Expr.String "high" ]) );
-              then_ = [ Commit { id = "submit" } ];
+              then_ = [ Commit { id = "submit"; preflight = None } ];
               else_ =
-                [ Agent { id = "noop"; prompt = "r"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "noop"; prompt = "r"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
             };
         ];
     }
@@ -1409,7 +1414,7 @@ let test_run_step_structured_parser_lint_compiler () =
 (* ---- KEEP: fail-closed validation ---- *)
 
 let test_validate_commit_no_gate () =
-  let wf = { name = "ungated"; version = None; steps = [ Commit { id = "submit" } ] } in
+  let wf = { name = "ungated"; version = None; steps = [ Commit { id = "submit"; preflight = None } ] } in
   match Validate.workflow ~floor_gates:[ "g" ] wf with
   | Error _ -> ()
   | Ok _ -> Alcotest.fail "commit without floor gate must be rejected"
@@ -1426,9 +1431,9 @@ let test_validate_commit_one_branch_only () =
               when_ = Expr.Lit (Expr.Bool true);
               then_ = [ Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) } ];
               else_ =
-                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
             };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -1449,7 +1454,7 @@ let test_validate_loop_gate_not_guaranteed () =
               until = None;
               governors = [ Max_iters 3 ];
             };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -1491,6 +1496,7 @@ let test_commit_token_digest_only () =
            | Fixpoint_progress { progress } -> string_of_bool progress
            | Loop_stopped { reason; _ } -> reason
            | Run_executed { id; _ } -> id
+           | Commit_preflight_executed { id; _ } -> id
            | Blocked_at { reason; _ } -> reason
            | Parallel_started -> "parallel_started"
            | Parallel_branch_completed { branch_idx; _ } ->
@@ -1527,10 +1533,10 @@ let test_false_gate_blocks () =
       steps =
         [
           Agent
-            { id = "a"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+            { id = "a"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
           (* gate predicate is false: outputs.a.ok does not exist *)
           Gate { id = "g"; when_ = Expr.Exists [ "outputs"; "a"; "ok" ] };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -1646,11 +1652,11 @@ let test_lint_all_at_once () =
           Loop
             {
               body =
-                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "x"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               until = None;
               governors = [];
             };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -1707,12 +1713,13 @@ let test_lint_branch_one_arm_only_dangling () =
                       output_schema = Some [ ("v", Schema.Int) ];
                       on_failure = Types.Abort;
                       protocol = None; brief = None; agent_type = None; model = None;
+                      input = None;
                     };
                 ];
               else_ =
                 [
                   Agent
-                    { id = "y"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+                    { id = "y"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
                 ];
             };
           (* references x.v, produced only in the then arm *)
@@ -1736,6 +1743,7 @@ let test_lint_branch_both_arms_ok () =
         output_schema = Some [ ("v", Schema.Int) ];
                       on_failure = Types.Abort;
                       protocol = None; brief = None; agent_type = None; model = None;
+                      input = None;
       }
   in
   let wf =
@@ -1781,7 +1789,7 @@ let test_lint_contract_examples () =
 
 let test_lint_contract_badness () =
   (* A known-bad workflow: commit with no required floor gate. *)
-  let wf = { name = "bad"; version = None; steps = [ Commit { id = "submit" } ] } in
+  let wf = { name = "bad"; version = None; steps = [ Commit { id = "submit"; preflight = None } ] } in
   let ds = Lint.check ~floor_gates:[ "g" ] wf in
   Alcotest.(check bool) "has_errors true" true (Lint.has_errors ds);
   match Validate.workflow ~floor_gates:[ "g" ] wf with
@@ -1884,11 +1892,11 @@ let test_lint_generate_fix_loop () =
           Loop
             {
               body =
-                [ Agent { id = "w"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                [ Agent { id = "w"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               until = None;
               governors = [];
             };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -2175,13 +2183,13 @@ let test_parser_accepts_underscore_metadata () =
 let parser_known_keys =
   [
     ("workflow", [ "name"; "steps"; "version" ]);
-    ("agent", [ "kind"; "id"; "prompt"; "read_only"; "output_schema"; "on_failure"; "protocol"; "brief"; "agent_type"; "model" ]);
+    ("agent", [ "kind"; "id"; "prompt"; "read_only"; "output_schema"; "on_failure"; "protocol"; "brief"; "agent_type"; "model"; "input" ]);
     ("gate", [ "kind"; "id"; "when" ]);
     ("branch", [ "kind"; "when"; "then"; "else" ]);
     ("loop", [ "kind"; "until"; "governors"; "body" ]);
     ("run", [ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe";
               "input"; "stdout_schema" ]);
-    ("commit", [ "kind"; "id" ]);
+    ("commit", [ "kind"; "id"; "preflight" ]);
     ("parallel", [ "kind"; "branches" ]);
     ("foreach", [ "kind"; "over"; "steps" ]);
     ("shell", [ "kind"; "id"; "commands"; "on_failure" ]);
@@ -2339,6 +2347,12 @@ let behavioral_parity_cases : (string * string * bool) list =
     ( "agent: read_only wrong type (string)",
       wf {|{ "kind": "agent", "id": "a", "prompt": "p", "read_only": "yes" }|},
       false );
+    ( "agent: structured input",
+      wf {|{ "kind": "agent", "id": "a", "prompt": "p",
+              "read_only": true, "input": ["outputs.p"] }|}, true );
+    ( "agent: empty structured input",
+      wf {|{ "kind": "agent", "id": "a", "prompt": "p", "input": [] }|},
+      false );
     (* output_schema is the one intentionally-open map: arbitrary field keys ok *)
     ( "agent: output_schema open map",
       wf
@@ -2367,6 +2381,23 @@ let behavioral_parity_cases : (string * string * bool) list =
     ("commit: ok", wf {|{ "kind": "commit", "id": "c" }|}, true);
     ( "commit: unknown key",
       wf {|{ "kind": "commit", "id": "c", "junk": 1 }|}, false );
+    ( "commit: valid preflight",
+      wf {|{ "kind": "commit", "id": "c", "preflight": {
+              "cmd": ["check"], "input": ["transaction"],
+              "stdout_schema": {"ready":"bool"} } }|}, true );
+    ( "commit: preflight missing schema",
+      wf {|{ "kind": "commit", "id": "c", "preflight": {
+              "cmd": ["check"], "input": ["transaction"] } }|}, false );
+    ( "commit: preflight unknown key",
+      wf {|{ "kind": "commit", "id": "c", "preflight": {
+              "cmd": ["check"], "input": ["transaction"],
+              "stdout_schema": {"ready":"bool"}, "observe": ["."] } }|},
+      false );
+    ( "commit: preflight absolute working_dir",
+      wf {|{ "kind": "commit", "id": "c", "preflight": {
+              "cmd": ["check"], "input": ["transaction"],
+              "stdout_schema": {"ready":"bool"}, "working_dir": "/tmp" } }|},
+      false );
     (* ---- unknown step kind ---- *)
     ("step: unknown kind", wf {|{ "kind": "frobnicate" }|}, false);
     (* ---- loop step + governors ---- *)
@@ -2503,8 +2534,15 @@ let test_ledger_roundtrip_all_variants () =
           id = "assess";
           success = true;
           output = `Assoc [ ("severity", `String "high"); ("n", `Int 3) ];
+          request_receipt = None;
+          result_receipt = None;
         };
-      Agent_ran { id = "bad"; success = false; output = `Assoc [] };
+      Agent_ran { id = "bad"; success = false; output = `Assoc [];
+        request_receipt = None; result_receipt = None };
+      Agent_ran { id = "review"; success = true;
+        output = `Assoc [ ("verdict", `String "go") ];
+        request_receipt = Some (`Assoc [ ("step_id", `String "review") ]);
+        result_receipt = Some (`Assoc [ ("step_id", `String "review") ]) };
       Gate_evaluated { id = "g"; verdict = Pass };
       Gate_evaluated { id = "g2"; verdict = Fail };
       Branch_taken { verdict = Pass };
@@ -2534,14 +2572,25 @@ let test_ledger_roundtrip_all_variants () =
                 ];
             };
         };
-      Committed_step { id = "submit"; token_digest = "deadbeef" };
+      Commit_preflight_executed {
+        id = "publish"; input_digest = "sha256:input";
+        parsed = Some (`Assoc [ ("ready", `Bool true) ]);
+        result = { exit = 0; stdout = {|{"ready":true}|}; stderr = "";
+          truncated = false; files = [] };
+        receipt = Some (`Assoc [ ("step_id", `String "publish") ]) };
+      Committed_step { id = "publish"; token_digest = "cafebabe";
+        preflight_receipt = Some (`Assoc [ ("step_id", `String "publish") ]);
+        preflight_receipt_digest = Some "sha256:receipt" };
+      Committed_step { id = "submit"; token_digest = "deadbeef";
+        preflight_receipt = None; preflight_receipt_digest = None };
       Blocked_at { id = "b"; reason = "gate \"g\" evaluated false" };
       Parallel_started;
       Parallel_branch_completed
         {
           branch_idx = 0;
           trace =
-            [ Agent_ran { id = "b0"; success = true; output = `Assoc [] } ];
+            [ Agent_ran { id = "b0"; success = true; output = `Assoc [];
+                request_receipt = None; result_receipt = None } ];
           outcome = Completed_no_commit;
           branch_outputs = [ ("b0", `Assoc [ ("result", `String "ok") ]) ];
         };
@@ -2595,7 +2644,7 @@ let test_ledger_persist_then_replay_from_file () =
       steps =
         [
           Agent
-            { id = "assess"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+            { id = "assess"; prompt = "p"; read_only = true; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
           Run
             {
               id = "mk";
@@ -2611,7 +2660,7 @@ let test_ledger_persist_then_replay_from_file () =
                 Expr.Eq
                   (Expr.Path [ "outputs"; "mk"; "exit" ], Expr.Lit (Expr.Int 0));
             };
-          Commit { id = "submit" };
+          Commit { id = "submit"; preflight = None };
         ];
     }
   in
@@ -2714,6 +2763,7 @@ let test_foreach_3_elements () =
               output_schema = None;
               on_failure = Types.Abort;
               protocol = None; brief = None; agent_type = None; model = None;
+              input = None;
             };
           Foreach
             {
@@ -2807,6 +2857,7 @@ let test_foreach_iterates_over_ctx_array () =
               output_schema = None;
               on_failure = Types.Abort;
               protocol = None; brief = None; agent_type = None; model = None;
+              input = None;
             };
           Foreach
             {
@@ -2879,9 +2930,9 @@ let test_parallel_two_branches_succeed () =
               branches =
                 [
                   [ Agent { id = "a1"; prompt = "p"; read_only = true;
-                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
                   [ Agent { id = "a2"; prompt = "p"; read_only = true;
-                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
                 ];
             };
         ];
@@ -2924,9 +2975,9 @@ let test_parallel_one_branch_aborts () =
               branches =
                 [
                   [ Agent { id = "ok"; prompt = "p"; read_only = true;
-                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
                   [ Agent { id = "bad"; prompt = "p"; read_only = true;
-                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
                 ];
             };
         ];
@@ -2962,9 +3013,9 @@ let test_parallel_replay_success () =
               branches =
                 [
                   [ Agent { id = "r1"; prompt = "p"; read_only = true;
-                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
                   [ Agent { id = "r2"; prompt = "p"; read_only = true;
-                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                             output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
                 ];
             };
         ];
@@ -2985,7 +3036,7 @@ let test_parallel_replay_success () =
 
 let make_agent id =
   Agent { id; prompt = Printf.sprintf "do %s" id; read_only = true;
-          output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None }
+          output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None }
 
 let test_compiler_header () =
   (* Workflow with version = "1.0" must produce "// Compiled from CWR v1.0" *)
@@ -3046,7 +3097,7 @@ let test_agent_model_field () =
       steps = [ Agent { id = "draft"; prompt = "p"; read_only = false;
                         output_schema = None; on_failure = Types.Abort;
                         protocol = None; brief = None; agent_type = None;
-                        model = Some "claude-fable-5" } ] } in
+                        model = Some "claude-fable-5"; input = None } ] } in
   let js, _ = Compiler.compile_workflow wf_m in
   Alcotest.(check bool) "compiler emits model option" true
     (contains_substring js {|, model: "claude-fable-5"|});
@@ -3112,7 +3163,7 @@ let test_compiler_gate_commit_steps () =
     { name = "gc"; version = Some "1.0";
       steps =
         [ Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) };
-          Commit { id = "submit" } ] }
+          Commit { id = "submit"; preflight = None } ] }
   in
   let js, notes = Compiler.compile_workflow wf in
   (* Gate now compiles faithfully: if (!(true)) { throw ... } — no [CWR gate:] comment *)
@@ -3201,7 +3252,7 @@ let test_compiler_agent_schema () =
   let wf = { name = "s"; version = None;
     steps = [ Agent { id = "check"; prompt = "evaluate";
                       read_only = false; output_schema = Some schema;
-                      on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js, _ = Compiler.compile_workflow wf in
   Alcotest.(check bool) "agent schema: type object" true
     (contains_substring js {|type: "object"|});
@@ -3218,7 +3269,7 @@ let test_compiler_agent_schema_types () =
                                ("kind", Enum ["a"; "b"]) ] in
   let wf = { name = "t"; version = None;
     steps = [ Agent { id = "x"; prompt = "p"; read_only = false;
-                      output_schema = Some schema; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = Some schema; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js, _ = Compiler.compile_workflow wf in
   Alcotest.(check bool) "Bool → boolean" true
     (contains_substring js {|"flag": {type: "boolean"}|});
@@ -3231,7 +3282,7 @@ let test_compiler_agent_on_failure () =
   (* Continue → try/catch; Abort → no try *)
   let wf_cont = { name = "c"; version = None;
     steps = [ Agent { id = "soft"; prompt = "p"; read_only = false;
-                      output_schema = None; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = None; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js_cont, _ = Compiler.compile_workflow wf_cont in
   Alcotest.(check bool) "Continue: try block present" true
     (contains_substring js_cont "try {");
@@ -3242,7 +3293,7 @@ let test_compiler_agent_on_failure () =
 
   let wf_abort = { name = "a"; version = None;
     steps = [ Agent { id = "hard"; prompt = "p"; read_only = false;
-                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js_abort, _ = Compiler.compile_workflow wf_abort in
   Alcotest.(check bool) "Abort: no try block" true
     (not (contains_substring js_abort "try {"));
@@ -3252,7 +3303,7 @@ let test_compiler_agent_on_failure () =
 let test_compiler_agent_read_only () =
   let wf = { name = "ro"; version = None;
     steps = [ Agent { id = "fetch"; prompt = "read data"; read_only = true;
-                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js, _ = Compiler.compile_workflow wf in
   Alcotest.(check bool) "read_only: comment present" true
     (contains_substring js "// [read-only]");
@@ -3313,7 +3364,7 @@ let test_compiler_js_escape_completeness () =
   let ctrl_prompt = "tab\there\rreturn\x01ctrl" in
   let wf = { name = "esc"; version = None;
     steps = [ Agent { id = "a"; prompt = ctrl_prompt; read_only = false;
-                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js, _ = Compiler.compile_workflow wf in
   Alcotest.(check bool) "\\t escaped" true (contains_substring js "\\t");
   Alcotest.(check bool) "\\r escaped" true (contains_substring js "\\r");
@@ -3325,7 +3376,7 @@ let test_compiler_js_escape_completeness () =
   let schema = Types.Schema.[ ("content-type", String) ] in
   let wf2 = { name = "sq"; version = None;
     steps = [ Agent { id = "b"; prompt = "p"; read_only = false;
-                      output_schema = Some schema; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = Some schema; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js2, _ = Compiler.compile_workflow wf2 in
   Alcotest.(check bool) "hyphen schema key: quoted" true
     (contains_substring js2 {|"content-type": {type: "string"}|});
@@ -3335,7 +3386,7 @@ let test_compiler_js_escape_completeness () =
   (* Leading-digit ID must be prefixed *)
   let wf3 = { name = "ld"; version = None;
     steps = [ Agent { id = "1abc"; prompt = "p"; read_only = false;
-                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js3, _ = Compiler.compile_workflow wf3 in
   Alcotest.(check bool) "leading-digit id: prefixed with _" true
     (contains_substring js3 "const _1abc = ");
@@ -3345,7 +3396,7 @@ let test_compiler_js_escape_completeness () =
   (* Space in ID must be sanitized *)
   let wf4 = { name = "sp"; version = None;
     steps = [ Agent { id = "step one"; prompt = "p"; read_only = false;
-                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js4, _ = Compiler.compile_workflow wf4 in
   Alcotest.(check bool) "space in id: replaced with _" true
     (contains_substring js4 "const step_one = ");
@@ -3472,7 +3523,7 @@ let test_compiler_hyphenated_ids () =
   let wf = { name = "h"; version = None;
     steps = [
       Agent { id = "deep-dive"; prompt = "p"; read_only = false;
-              output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None };
+              output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None };
       Gate { id = "g";
              when_ = Expr.Path ["outputs"; "deep-dive"; "done"] };
     ] } in
@@ -3611,7 +3662,7 @@ let test_compiler_agent_schema_and_continue () =
   let schema = Types.Schema.[ ("result", String) ] in
   let wf = { name = "sc"; version = None;
     steps = [ Agent { id = "soft"; prompt = "do it"; read_only = false;
-                      output_schema = Some schema; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None } ] } in
+                      output_schema = Some schema; on_failure = Types.Continue; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } in
   let js, _ = Compiler.compile_workflow wf in
   Alcotest.(check bool) "schema+continue: let binding" true
     (contains_substring js "let soft;");
@@ -3654,7 +3705,7 @@ let test_foreach_iterates () =
                           steps = [ Agent { id = "body"; prompt = "p";
                                             read_only = true;
                                             output_schema = None;
-                                            on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } ] }
+                                            on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
   let calls = ref 0 in
   let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
@@ -3686,7 +3737,7 @@ let test_foreach_empty_array () =
                           steps = [ Agent { id = "a"; prompt = "p";
                                             read_only = true;
                                             output_schema = None;
-                                            on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } ] }
+                                            on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
   let called = ref false in
   let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = called := true; (true, `Assoc []) in
@@ -3708,7 +3759,7 @@ let test_foreach_replay_iteration () =
                           steps = [ Agent { id = "b"; prompt = "p";
                                             read_only = true;
                                             output_schema = None;
-                                            on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } ] }
+                                            on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
   let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc [("x", `Int 1)]) in
   let backend = Backend.stub ~agent () in
@@ -3731,9 +3782,9 @@ let test_lint_commit_in_parallel () =
   let wf =
     { name = "cip"; version = None;
       steps = [ Parallel { branches = [
-        [ Commit { id = "bad-commit" } ];
+        [ Commit { id = "bad-commit"; preflight = None } ];
         [ Agent { id = "a"; prompt = "p"; read_only = true;
-                  output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] ] } ] }
+                  output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] ] } ] }
   in
   let diags = Lint.check wf in
   let has_cip = List.exists (fun (d : Lint.diagnostic) ->
@@ -3751,9 +3802,9 @@ let test_lint_parallel_output_collision () =
     { name = "poc"; version = None;
       steps = [ Parallel { branches = [
         [ Agent { id = "dup"; prompt = "p"; read_only = true;
-                  output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                  output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
         [ Agent { id = "dup"; prompt = "p"; read_only = true;
-                  output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] ] } ] }
+                  output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] ] } ] }
   in
   let diags = Lint.check wf in
   let has_collision = List.exists (fun (d : Lint.diagnostic) ->
@@ -3796,7 +3847,7 @@ let test_lint_floor_gate_parallel_intersection () =
         [ Parallel { branches =
             [ [ Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) } ];
               [ Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) } ] ] };
-          Commit { id = "submit" } ] }
+          Commit { id = "submit"; preflight = None } ] }
   in
   (match Validate.workflow ~floor_gates:["g"] wf_all_branches with
    | Ok _ -> ()
@@ -3808,8 +3859,8 @@ let test_lint_floor_gate_parallel_intersection () =
         [ Parallel { branches =
             [ [ Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) } ];
               [ Agent { id = "a"; prompt = "p"; read_only = true;
-                        output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] ] };
-          Commit { id = "submit" } ] }
+                        output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] ] };
+          Commit { id = "submit"; preflight = None } ] }
   in
   (match Validate.workflow ~floor_gates:["g"] wf_one_branch with
    | Error _ -> ()
@@ -3821,9 +3872,9 @@ let test_parallel_branch_output_merge () =
       steps =
         [ Parallel { branches =
             [ [ Agent { id = "r1"; prompt = "p"; read_only = true;
-                        output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ];
+                        output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
               [ Agent { id = "r2"; prompt = "p"; read_only = true;
-                        output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] ] } ] }
+                        output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] ] } ] }
   in
   let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
     (true, `Assoc [("result", `String id)])
@@ -3855,7 +3906,7 @@ let test_foreach_disk_replay () =
                            steps = [ Agent { id = "body"; prompt = "p";
                                              read_only = true;
                                              output_schema = None;
-                                             on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None } ] } ] }
+                                             on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
   let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc []) in
   let backend = Backend.stub ~agent () in
@@ -3902,13 +3953,245 @@ let test_foreach_disk_replay () =
       Alcotest.(check outcome_testable)
         "disk replay matches run" outcome replayed_outcome)
 
+let test_structured_agent_receipts_and_replay () =
+  let seen_prompt = ref "" in
+  let agent ~id ~prompt ~read_only ~agent_type:_ ~model:_ =
+    if id = "proof" then (true, `Assoc [ ("value", `Int 7) ])
+    else begin
+      seen_prompt := prompt;
+      Alcotest.(check bool) "structured dispatch remains read-only" true read_only;
+      (true, `Assoc [ ("verdict", `String "go") ])
+    end
+  in
+  let wf =
+    { name = "agent-receipts"; version = None;
+      steps =
+        [ Agent { id = "proof"; prompt = "prove"; read_only = true;
+            output_schema = Some [ ("value", Schema.Int) ];
+            on_failure = Types.Abort; protocol = None; brief = None;
+            agent_type = None; model = None; input = None };
+          Agent { id = "review"; prompt = "review"; read_only = true;
+            output_schema = Some [ ("verdict", Schema.String) ];
+            on_failure = Types.Abort; protocol = None; brief = None;
+            agent_type = Some "reviewer"; model = None;
+            input = Some [ "outputs.proof.value" ] } ] }
+  in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend:(Backend.stub ~agent ()) ~token:None
+      ~attestation_session_nonce:"session-1" ~agent_backend_id:"safe-backend-v1"
+      v in
+  Alcotest.(check outcome_testable) "structured Agent completes"
+    Completed_no_commit outcome;
+  Alcotest.(check bool) "canonical predecessor input delivered" true
+    (contains_substring !seen_prompt
+       {|CWR_STRUCTURED_INPUT_JSON
+{"outputs.proof.value":7}|});
+  let request, result =
+    match List.find_map (function
+      | Agent_ran { id = "review"; request_receipt = Some request;
+          result_receipt = Some result; _ } -> Some (request, result)
+      | _ -> None) trace with
+    | Some pair -> pair
+    | None -> Alcotest.fail "structured Agent receipts missing"
+  in
+  let field key = function
+    | `Assoc fields -> List.assoc_opt key fields
+    | _ -> None in
+  Alcotest.(check (option string)) "backend identity bound"
+    (Some "safe-backend-v1")
+    (match field "backend_id" request with Some (`String s) -> Some s | _ -> None);
+  Alcotest.(check bool) "read-only capability bound" true
+    (field "read_only" request = Some (`Bool true));
+  Alcotest.(check bool) "declared predecessor paths bound" true
+    (field "input_paths" request =
+       Some (`List [ `String "outputs.proof.value" ]));
+  Alcotest.(check bool) "result binds request digest" true
+    (field "request_digest" result <> None);
+  Alcotest.(check outcome_testable) "receipt replay identical" outcome
+    (engine_replay ~attestation_session_nonce:"session-1" ~trace v);
+  let tampered = List.map (function
+    | Agent_ran ({ id = "review"; result_receipt = Some (`Assoc fields); _ } as e) ->
+        Agent_ran { e with result_receipt = Some (`Assoc
+          (("output_digest", `String "sha256:tampered")
+           :: List.remove_assoc "output_digest" fields)) }
+    | entry -> entry) trace in
+  let rejected = try
+      ignore (engine_replay ~attestation_session_nonce:"session-1"
+        ~trace:tampered v); false
+    with Engine.Replay_mismatch _ -> true in
+  Alcotest.(check bool) "tampered result receipt rejected" true rejected;
+  let path_tampered = List.map (function
+    | Agent_ran ({ id = "review"; request_receipt = Some (`Assoc fields); _ } as e) ->
+        Agent_ran { e with request_receipt = Some (`Assoc
+          (("input_paths", `List [ `String "outputs.other.value" ])
+           :: List.remove_assoc "input_paths" fields)) }
+    | entry -> entry) trace in
+  let path_rejected = try
+      ignore (engine_replay ~attestation_session_nonce:"session-1"
+        ~trace:path_tampered v); false
+    with Engine.Replay_mismatch _ -> true in
+  Alcotest.(check bool) "tampered predecessor membership rejected" true
+    path_rejected;
+  let noncanonical_agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+    if id = "proof" then (true, `Assoc [ ("value", `Int 7) ])
+    else (true, `Assoc [ ("score", `Float 1.5) ]) in
+  let bad_outcome, bad_trace = engine_run
+      ~backend:(Backend.stub ~agent:noncanonical_agent ()) ~token:None
+      ~attestation_session_nonce:"session-1"
+      ~agent_backend_id:"safe-backend-v1" v in
+  (match bad_outcome with Aborted _ -> ()
+   | _ -> Alcotest.fail "non-canonical structured Agent output must abort");
+  Alcotest.(check outcome_testable) "non-canonical Agent replay identical"
+    bad_outcome (engine_replay ~attestation_session_nonce:"session-1"
+      ~trace:bad_trace v);
+  let linted = Lint.check ~floor_gates:[]
+    { wf with steps = wf.steps @ [ Attest { id = "sign";
+        select = [ "receipts.review.request"; "receipts.review.result" ];
+        replay_domain = "test"; output = "receipt.json" } ] } in
+  Alcotest.(check bool) "Attest accepts prior read-only receipts" false
+    (Lint.has_errors linted);
+  let unsafe =
+    { wf with steps = [ Agent { id = "unsafe"; prompt = "p";
+        read_only = false; output_schema = None; on_failure = Types.Abort;
+        protocol = None; brief = None; agent_type = None; model = None;
+        input = Some [ "seed" ] } ] } in
+  Alcotest.(check bool) "structured mutable Agent rejected" true
+    (List.exists (fun (d : Lint.diagnostic) ->
+       d.code = "structured-agent-not-read-only") (Lint.check unsafe));
+  let dangling = { wf with steps = [ Agent { id = "review"; prompt = "p";
+      read_only = true; output_schema = None; on_failure = Types.Abort;
+      protocol = None; brief = None; agent_type = None; model = None;
+      input = Some [ "outputs.missing.value" ] } ] } in
+  Alcotest.(check bool) "missing predecessor rejected by lint" true
+    (List.exists (fun (d : Lint.diagnostic) ->
+       d.code = "structured-input-missing-predecessor")
+       (Lint.check dangling))
+
+let commit_preflight_workflow ?(cmd = [ "preflight" ]) () =
+  { name = "commit-preflight"; version = None;
+    steps =
+      [ Gate { id = "approved-data"; when_ = Expr.Lit (Expr.Bool true) };
+        Commit { id = "publish";
+          preflight = Some { cmd; working_dir = "work";
+            timeout_ms = Some 2500; input = [ "transaction" ];
+            stdout_schema = [ ("ready", Schema.Bool); ("tx", Schema.String) ] } } ] }
+
+let test_commit_preflight_approval_receipt_and_replay () =
+  let calls = ref 0 and seen = ref None in
+  let run_command ~id ~argv ~working_dir ~timeout_ms ~observe ~stdin_content =
+    incr calls; seen := Some (id, argv, working_dir, timeout_ms, observe,
+      stdin_content);
+    { exit = 0; stdout = {|{"ready":true,"tx":"abc"}|}; stderr = "";
+      truncated = false; files = [] }
+  in
+  let wf = commit_preflight_workflow () in
+  let v = validate_ok ~floor:[ "approved-data" ] wf in
+  let initial_ctx = [ ("transaction", `Assoc [ ("id", `String "abc") ]) ] in
+  let blocked, _ = engine_run ~backend:(Backend.stub ~run_command ())
+      ~run_allowlist:[ "preflight" ] ~initial_ctx ~token:None v in
+  (match blocked with Blocked _ -> ()
+   | _ -> Alcotest.fail "approval-less Commit must block");
+  Alcotest.(check int) "preflight does not run before approval" 0 !calls;
+  let outcome, trace = engine_run ~backend:(Backend.stub ~run_command ())
+      ~run_allowlist:[ "preflight" ] ~initial_ctx ~token:(Some "approve") v in
+  (match outcome with Committed { id = "publish"; _ } -> ()
+   | _ -> Alcotest.fail "approved valid preflight must commit");
+  Alcotest.(check int) "preflight executes exactly once" 1 !calls;
+  (match !seen with
+  | Some ("publish", [ "preflight" ], "work", Some 2500, None,
+      Some {|{"transaction":{"id":"abc"}}|}) -> ()
+  | _ -> Alcotest.fail "preflight argv/path/timeout/stdin contract diverged");
+  (match trace with
+  | [ Gate_evaluated _;
+      Commit_preflight_executed { receipt = Some receipt; parsed = Some _; _ };
+      Committed_step { preflight_receipt = Some bound;
+        preflight_receipt_digest = Some _; _ } ] ->
+      Alcotest.(check bool) "Commit binds exact engine receipt" true
+        (receipt = bound)
+  | _ -> Alcotest.fail "preflight and Commit must be adjacent in trace");
+  Alcotest.(check outcome_testable) "preflight replay identical" outcome
+    (engine_replay ~initial_ctx ~trace v);
+  Alcotest.(check int) "replay never executes preflight" 1 !calls;
+  let tampered = List.map (function
+    | Committed_step e -> Committed_step { e with
+        preflight_receipt_digest = Some "sha256:tampered" }
+    | entry -> entry) trace in
+  let rejected = try ignore (engine_replay ~initial_ctx ~trace:tampered v); false
+    with Engine.Replay_mismatch _ -> true in
+  Alcotest.(check bool) "tampered Commit receipt binding rejected" true rejected
+
+let test_commit_preflight_fail_closed () =
+  let v = validate_ok ~floor:[ "approved-data" ]
+      (commit_preflight_workflow ()) in
+  let initial_ctx = [ ("transaction", `Assoc [ ("id", `String "abc") ]) ] in
+  let run result =
+    engine_run ~backend:(Backend.stub ~run_command:(fun ~id:_ ~argv:_
+      ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ -> result) ())
+      ~run_allowlist:[ "preflight" ] ~initial_ctx ~token:(Some "approve") v in
+  List.iter (fun result ->
+    let outcome, trace = run result in
+    (match outcome with Blocked _ -> ()
+     | _ -> Alcotest.fail "invalid preflight must block Commit");
+    Alcotest.(check outcome_testable) "rejected preflight replays" outcome
+      (engine_replay ~initial_ctx ~trace v))
+    [ { exit = 7; stdout = {|{"ready":true,"tx":"abc"}|}; stderr = "";
+        truncated = false; files = [] };
+      { exit = 0; stdout = {|{"ready":true,"tx":"abc"}|}; stderr = "";
+        truncated = true; files = [] };
+      { exit = 0; stdout = {|{"ready":"yes","tx":"abc"}|}; stderr = "";
+        truncated = false; files = [] } ];
+  let calls = ref 0 in
+  let backend = Backend.stub ~run_command:(fun ~id:_ ~argv:_ ~working_dir:_
+      ~timeout_ms:_ ~observe:_ ~stdin_content:_ -> incr calls;
+      { exit = 0; stdout = "{}"; stderr = ""; truncated = false; files = [] }) () in
+  let allowlist_block, _ = engine_run ~backend ~run_allowlist:[] ~initial_ctx
+      ~token:(Some "approve") v in
+  (match allowlist_block with Blocked _ -> () | _ -> Alcotest.fail "allowlist");
+  let path_v = validate_ok ~floor:[ "approved-data" ]
+      (commit_preflight_workflow ~cmd:[ "./preflight" ] ()) in
+  let path_block, _ = engine_run ~backend ~run_allowlist:[ "preflight" ]
+      ~initial_ctx ~token:(Some "approve") path_v in
+  (match path_block with Blocked _ -> () | _ -> Alcotest.fail "path head");
+  Alcotest.(check int) "blocked preflights never dispatch" 0 !calls
+
+let test_commit_preflight_parse_lint_compiler () =
+  let raw = {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["transaction"],"stdout_schema":{"ready":"bool"}}}]}|} in
+  let wf = match Workflow_json.of_string raw with
+    | Ok wf -> wf | Error e -> Alcotest.failf "preflight parse: %s" e in
+  Alcotest.(check bool) "preflight round-trips" true
+    (contains_substring
+       (Yojson.Safe.to_string (Workflow_json.to_json wf)) "preflight");
+  let refused = try ignore (Compiler.compile_workflow wf); false
+    with Compiler.Compile_error msg -> contains_substring msg "preflight" in
+  Alcotest.(check bool) "compiler refuses lossy preflight" true refused;
+  List.iter (fun bad -> match Workflow_json.of_string bad with
+    | Error _ -> () | Ok _ -> Alcotest.fail "invalid preflight accepted")
+    [ {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":[],"stdout_schema":{"ready":"bool"}}}]}|};
+      {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["x"],"stdout_schema":{"ready":"bool"},"observe":["."]}}]}|} ]
+
 let () =
+  let test_agent_structured_input_parses_and_roundtrips () =
+    let raw =
+      {|{"name":"agent-input","steps":[{"kind":"agent","id":"review","prompt":"review","read_only":true,"input":["outputs.proof","campaign"]}]}|}
+    in
+    match Workflow_json.of_string raw with
+    | Error msg -> Alcotest.failf "structured Agent input rejected: %s" msg
+    | Ok wf ->
+        let encoded =
+          Yojson.Safe.to_string (Workflow_json.to_json wf)
+        in
+        Alcotest.(check bool) "input survives roundtrip" true
+          (contains_substring encoded
+             {|"input":["outputs.proof","campaign"]|})
+  in
   Alcotest.run "cabal_workflow_runner"
     [
       ( "parse",
         [
           Alcotest.test_case "valid round-trips" `Quick test_parse_roundtrip;
           Alcotest.test_case "malformed => Error" `Quick test_parse_malformed;
+          Alcotest.test_case "agent structured input round-trips" `Quick
+            test_agent_structured_input_parses_and_roundtrips;
         ] );
       ( "dsl",
         [
@@ -4025,6 +4308,20 @@ let () =
           Alcotest.test_case
             "structured parser/lint/compiler contracts" `Quick
             test_run_step_structured_parser_lint_compiler;
+        ] );
+      ( "engine-receipts",
+        [ Alcotest.test_case
+            "structured read-only Agent binds request/result and replays"
+            `Quick test_structured_agent_receipts_and_replay;
+          Alcotest.test_case
+            "Commit preflight runs after approval, binds receipt, replays"
+            `Quick test_commit_preflight_approval_receipt_and_replay;
+          Alcotest.test_case
+            "Commit preflight fail-closes exit/truncation/schema/authority"
+            `Quick test_commit_preflight_fail_closed;
+          Alcotest.test_case
+            "Commit preflight parser/lint/compiler contract"
+            `Quick test_commit_preflight_parse_lint_compiler;
         ] );
       ( "happy-path",
         [

@@ -32,6 +32,14 @@ end
     - gates / branches / loops carry {b pure} {!Expr.t} predicates evaluated over
       recorded agent outputs — there is no backend gate primitive. *)
 type on_failure = Abort | Continue
+
+type commit_preflight = {
+  cmd : string list;
+  working_dir : string;
+  timeout_ms : int option;
+  input : string list;
+  stdout_schema : Schema.t;
+}
 (** What to do when an [Agent] step's run is UNSUCCESSFUL.
 
     - [Abort] (the default): fail closed — the run aborts ([Aborted]). The
@@ -77,6 +85,10 @@ type step =
               present it overrides the backend's global [CWR_MODEL] for this step
               only; when absent the backend default applies. Emitted as
               [{model: "..."}] in the compiled Claude Workflow JS. *)
+      input : string list option;
+          (** Optional dotted context paths selected into a restricted-canonical
+              object and delivered in an engine-owned prompt envelope. The
+              engine binds request/result receipts under ["receipts.<id>"]. *)
     }
       (** Dispatch agent work; records [(success, structured_json)] and binds the
           output into the run context under ["outputs.<id>"]. *)
@@ -122,8 +134,11 @@ type step =
           (operator-supplied), else the step is [Blocked] (fail-closed). The
           [working_dir] bounds the cwd/snapshot but does NOT sandbox the command
           from absolute paths in its args; the allowlist is the trust control. *)
-  | Commit of { id : string }
-      (** The ONLY step that can file/submit. Requires a runtime token. *)
+  | Commit of { id : string; preflight : commit_preflight option }
+      (** The ONLY step that can file/submit. Requires a runtime token. When
+          present, [preflight] executes only after approval and immediately
+          before commitment; its selected input and structured output are
+          bound into an engine-owned replay receipt. *)
   | Parallel of { branches : step list list }
       (** Run multiple step-list branches concurrently via Eio fibers.
           Requires >= 2 branches (parser rejects fewer). All branches run
@@ -232,7 +247,14 @@ val json_of_run_result : run_result -> Yojson.Safe.t
     governed loop still replays byte-identically (the bound is a function of
     recorded inputs). *)
 type trace_entry =
-  | Agent_ran of { id : string; success : bool; output : Yojson.Safe.t }
+  | Agent_ran of {
+      id : string;
+      success : bool;
+      output : Yojson.Safe.t;
+      request_receipt : Yojson.Safe.t option;
+      result_receipt : Yojson.Safe.t option;
+    }
+      (** Receipt fields are absent for legacy Agents without structured input. *)
   | Gate_evaluated of { id : string; verdict : gate_verdict }
   | Branch_taken of { verdict : gate_verdict }
   | Loop_iter of { index : int }
@@ -249,7 +271,21 @@ type trace_entry =
           {!Engine.replay} re-binds it WITHOUT re-executing. [input_digest]
           binds the selected canonical stdin and [parsed] binds validated
           structured stdout; both are absent for a legacy unstructured Run. *)
-  | Committed_step of { id : string; token_digest : string }
+  | Commit_preflight_executed of {
+      id : string;
+      input_digest : string;
+      parsed : Yojson.Safe.t option;
+      result : run_result;
+      receipt : Yojson.Safe.t option;
+    }
+      (** Engine-owned observation of the optional Commit preflight. Replay
+          validates this entry without re-executing its command. *)
+  | Committed_step of {
+      id : string;
+      token_digest : string;
+      preflight_receipt : Yojson.Safe.t option;
+      preflight_receipt_digest : string option;
+    }
   | Blocked_at of { id : string; reason : string }
   | Parallel_started
       (** Records the start of a parallel step execution. *)

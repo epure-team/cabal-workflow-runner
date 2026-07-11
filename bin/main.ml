@@ -12,7 +12,7 @@ let print_trace trace =
   List.iter
     (fun entry ->
       match entry with
-      | Types.Agent_ran { id; success; output } ->
+      | Types.Agent_ran { id; success; output; _ } ->
           Printf.printf "  agent    %-16s success=%b output=%s\n" id success
             (Yojson.Safe.to_string output)
       | Types.Gate_evaluated { id; verdict } ->
@@ -33,7 +33,11 @@ let print_trace trace =
             "  run      %-16s exit=%d truncated=%b files=%d\n" id
             result.Types.exit result.Types.truncated
             (List.length result.Types.files)
-      | Types.Committed_step { id; token_digest } ->
+      | Types.Commit_preflight_executed { id; result; receipt; _ } ->
+          Printf.printf
+            "  preflight %-16s exit=%d truncated=%b receipt=%b\n" id
+            result.Types.exit result.Types.truncated (Option.is_some receipt)
+      | Types.Committed_step { id; token_digest; _ } ->
           Printf.printf "  commit   %-16s token_digest=%s\n" id token_digest
       | Types.Blocked_at { id; reason } ->
           Printf.printf "  block    %-16s %s\n" id reason
@@ -170,7 +174,8 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_f
                 Engine.run ~sw ~run_allowlist:allow_run ~backend ~token:approve
                   ~initial_ctx ?attestation_signer
                   ?attestation_artifact_root:attestation_root
-                  ?attestation_session_nonce:attestation_session validated
+                  ?attestation_session_nonce:attestation_session
+                  ~agent_backend_id:"cabal-read-only-v1" validated
               in
               Printf.printf "outcome: %s\ntrace:\n"
                 (Types.string_of_outcome outcome);
@@ -527,7 +532,7 @@ let to_claude_workflow_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.17.1" ~doc in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.18.0" ~doc in
   let group =
     Cmd.group info
       [ lint_cmd; validate_cmd; run_cmd; replay_cmd; schema_cmd;

@@ -117,6 +117,11 @@ let req_relative_path key json =
       Filename.parent_dir_name p
   else p
 
+let opt_relative_path key ~default json =
+  match member_opt key json with
+  | None -> default
+  | Some _ -> req_relative_path key json
+
 let req_safe_artifact_path key json =
   let p = req_relative_path key json in
   let parts = String.split_on_char '/' p in
@@ -284,12 +289,13 @@ let rec step_of_json json =
             brief = opt_string "brief" json;
             agent_type = opt_string "agent_type" json;
             model = opt_string "model" json;
+            input = opt_nonempty_unique_paths "input" json;
           }
       in
       reject_unknown_keys ~what:"agent step"
         ~known:
           [ "kind"; "id"; "prompt"; "read_only"; "output_schema"; "on_failure";
-            "protocol"; "brief"; "agent_type"; "model" ]
+            "protocol"; "brief"; "agent_type"; "model"; "input" ]
         json;
       s
   | "gate" ->
@@ -340,8 +346,31 @@ let rec step_of_json json =
         json;
       s
   | "commit" ->
-      let s = Commit { id = req_string "id" json } in
-      reject_unknown_keys ~what:"commit step" ~known:[ "kind"; "id" ] json;
+      let preflight =
+        match member_opt "preflight" json with
+        | None -> None
+        | Some ((`Assoc _) as value) ->
+            let input = match opt_nonempty_unique_paths "input" value with
+              | Some paths -> paths
+              | None -> err "missing required field %S" "input" in
+            let stdout_schema = match opt_schema "stdout_schema" value with
+              | Some schema -> schema
+              | None -> err "missing required field %S" "stdout_schema" in
+            reject_unknown_keys ~what:"commit preflight"
+              ~known:[ "cmd"; "input"; "stdout_schema"; "working_dir";
+                       "timeout_ms" ] value;
+            Some {
+              cmd = req_string_nonempty_list "cmd" value;
+              input;
+              stdout_schema;
+              working_dir = opt_relative_path "working_dir" ~default:"." value;
+              timeout_ms = opt_bounded_int "timeout_ms" value;
+            }
+        | Some _ -> err "field %S must be an object" "preflight"
+      in
+      let s = Commit { id = req_string "id" json; preflight } in
+      reject_unknown_keys ~what:"commit step"
+        ~known:[ "kind"; "id"; "preflight" ] json;
       s
   | "parallel" ->
       let raw_branches = req_list "branches" json in
@@ -496,7 +525,7 @@ let governor_to_json = function
         ]
 
 let rec step_to_json = function
-  | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model } ->
+  | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model; input } ->
       `Assoc
         ([
            ("kind", `String "agent");
@@ -513,6 +542,9 @@ let rec step_to_json = function
         @ (match brief with None -> [] | Some b -> [ ("brief", `String b) ])
         @ (match agent_type with None -> [] | Some t -> [ ("agent_type", `String t) ])
         @ (match model with None -> [] | Some m -> [ ("model", `String m) ])
+        @ (match input with
+          | None -> []
+          | Some paths -> [ ("input", `List (List.map (fun p -> `String p) paths)) ])
         @
         match output_schema with
         | None -> []
@@ -556,7 +588,20 @@ let rec step_to_json = function
         @ match stdout_schema with
           | None -> []
           | Some schema -> [ ("stdout_schema", schema_to_json schema) ])
-  | Commit { id } -> `Assoc [ ("kind", `String "commit"); ("id", `String id) ]
+  | Commit { id; preflight } ->
+      `Assoc
+        ([ ("kind", `String "commit"); ("id", `String id) ]
+        @ match preflight with
+          | None -> []
+          | Some { cmd; working_dir; timeout_ms; input; stdout_schema } ->
+              [ ("preflight", `Assoc
+                  ([ ("cmd", `List (List.map (fun s -> `String s) cmd));
+                     ("input", `List (List.map (fun s -> `String s) input));
+                     ("stdout_schema", schema_to_json stdout_schema) ]
+                  @ (if working_dir = "." then []
+                     else [ ("working_dir", `String working_dir) ])
+                  @ match timeout_ms with None -> []
+                    | Some n -> [ ("timeout_ms", `Int n) ])) ])
   | Parallel { branches } ->
       `Assoc
         [

@@ -46,6 +46,23 @@ let bind_output st id output =
   let merged = `Assoc ((id, output) :: List.remove_assoc id prior) in
   bind st "outputs" merged
 
+let bind_receipts st id request result =
+  let prior =
+    match List.assoc_opt "receipts" st.ctx with
+    | Some (`Assoc fields) -> fields
+    | _ -> []
+  in
+  let receipt = `Assoc [ ("request", request); ("result", result) ] in
+  bind st "receipts"
+    (`Assoc ((id, receipt) :: List.remove_assoc id prior))
+
+let sha256 canonical =
+  "sha256:" ^ Digestif.SHA256.(to_hex (digest_string canonical))
+
+let canonical_digest json =
+  Result.map (fun canonical -> (canonical, sha256 canonical))
+    (Canonical_json.to_string json)
+
 let bind_loop_iter st index = bind st "loop" (`Assoc [ ("iter", `Int index) ])
 
 let run_input st paths =
@@ -84,6 +101,19 @@ let parse_run_stdout schema (result : run_result) =
                (Schema.validate schema normalized)))
   | _ -> Error "stdout must be a JSON object"
 
+let commit_preflight_receipt ~id ~input_digest ~result ~parsed =
+  Result.bind (canonical_digest parsed) (fun (_, output_digest) ->
+      let receipt =
+        `Assoc
+          [ ("step_id", `String id);
+            ("input_digest", `String input_digest);
+            ("process_exit", `Int result.exit);
+            ("output_digest", `String output_digest);
+            ("parsed", parsed) ]
+      in
+      Result.map (fun (_, digest) -> (receipt, digest))
+        (canonical_digest receipt))
+
 (* ------------------------------------------------------------------ *)
 (* run: deterministic interpreter driven by a backend.                 *)
 (* ------------------------------------------------------------------ *)
@@ -118,7 +148,8 @@ let path_bearing_head = function
 
 let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
     ?(initial_ctx = []) ?attestation_signer ?attestation_artifact_root
-    ?attestation_session_nonce ~sw:(_sw : Eio.Switch.t) ~backend ~token validated =
+    ?attestation_session_nonce ?agent_backend_id ~sw:(_sw : Eio.Switch.t)
+    ~backend ~token validated =
   let wf = Validate.Validated.workflow validated in
   let agent ~id ~prompt ~read_only ~agent_type ~model =
     backend.Backend.run_agent ~id ~prompt ~read_only ~agent_type ~model
@@ -132,7 +163,7 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
         go st rest
   and go_step st step =
     match step with
-    | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model } ->
+    | Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model; input } ->
         let read_opt label = function
           | None -> `Ok ""
           | Some p ->
@@ -149,9 +180,70 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
           let parts = List.filter (fun s -> s <> "") [ pc; bc; prompt ] in
           String.concat "\n\n" parts
         in
+        let structured = match input with
+          | None -> Ok (effective_prompt, None)
+          | Some paths ->
+              (match agent_backend_id, attestation_session_nonce with
+              | None, _ -> Error "structured Agent requires runtime agent_backend_id"
+              | _, None -> Error "structured Agent requires a fresh runtime session nonce"
+              | Some backend_id, Some nonce ->
+                  Result.bind (run_input st paths) (fun (canonical, input_digest) ->
+                    let dispatch_id = sha256
+                      (String.concat "\000"
+                         [ nonce; id; string_of_int (List.length st.rev_trace) ]) in
+                    let request = `Assoc
+                      [ ("schema_version", `String "cwr.agent-request.v1");
+                        ("dispatch_id", `String dispatch_id);
+                        ("step_id", `String id);
+                        ("backend_id", `String backend_id);
+                        ("role", match agent_type with None -> `Null | Some r -> `String r);
+                        ("read_only", `Bool read_only);
+                        ("input_paths", `List
+                          (List.map (fun path -> `String path) paths));
+                        ("input_digest", `String input_digest);
+                        ("input", Yojson.Safe.from_string canonical) ] in
+                    Result.map
+                      (fun (_, request_digest) ->
+                        (effective_prompt ^ "\n\nCWR_STRUCTURED_INPUT_JSON\n" ^ canonical,
+                         Some (request, request_digest)))
+                      (canonical_digest request)))
+        in
+        (match structured with
+        | Error reason ->
+            let st = { st with terminal = Some (Aborted reason) } in
+            emit st (Blocked_at { id; reason })
+        | Ok (effective_prompt, request_binding) ->
         let success, output = agent ~id ~prompt:effective_prompt ~read_only ~agent_type ~model in
-        let st = emit st (Agent_ran { id; success; output }) in
+        let receipt_result = match request_binding with
+          | None -> Ok None
+          | Some (request, request_digest) ->
+              Result.bind (canonical_digest output) (fun (_, output_digest) ->
+                let result = `Assoc
+                  [ ("schema_version", `String "cwr.agent-result.v1");
+                    ("dispatch_id", List.assoc "dispatch_id" (match request with `Assoc f -> f | _ -> assert false));
+                    ("step_id", `String id);
+                    ("request_digest", `String request_digest);
+                    ("success", `Bool success);
+                    ("outcome", `String (if success then "success" else "failure"));
+                    ("output_digest", `String output_digest);
+                    ("output", output) ] in
+                Ok (Some (request, result)))
+        in
+        (match receipt_result with
+        | Error reason ->
+            let reason = "structured Agent returned non-canonical output: " ^ reason in
+            let st = emit st (Agent_ran { id; success; output;
+              request_receipt = Option.map fst request_binding;
+              result_receipt = None }) in
+            let st = { st with terminal = Some (Aborted reason) } in
+            emit st (Blocked_at { id; reason })
+        | Ok receipts ->
+        let st = emit st (Agent_ran { id; success; output;
+          request_receipt = Option.map fst receipts;
+          result_receipt = Option.map snd receipts }) in
         let st = bind_output st id output in
+        let st = match receipts with None -> st
+          | Some (request, result) -> bind_receipts st id request result in
         (* An UNSUCCESSFUL agent run is fail-closed by default ([Abort]): it aborts
            the walk (mirroring the schema-mismatch arm). Continuing past a failed
            agent binds the backend's error output, but a commit is still barred —
@@ -185,7 +277,7 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
                     terminal = Some (Aborted reason);
                   }
                   |> fun st -> emit st (Blocked_at { id; reason }))
-          | None -> st)
+          | None -> st)))
     | Gate { id; when_ } -> (
         let verdict = if eval st when_ then Pass else Fail in
         let st = emit st (Gate_evaluated { id; verdict }) in
@@ -282,19 +374,66 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
                   let st = emit st (Blocked_at { id; reason }) in
                   { st with terminal = Some (Aborted reason) })
         end
-    | Commit { id } ->
-        if token_is_wellformed token then begin
-          let digest = token_digest (Option.get token) in
-          let st = emit st (Committed_step { id; token_digest = digest }) in
-          { st with terminal = Some (Committed { id; token_digest = digest }) }
-        end
-        else begin
+    | Commit { id; preflight } ->
+        if not (token_is_wellformed token) then begin
           let reason =
             Printf.sprintf "Commit %S requires a runtime approval token" id
           in
           let st = emit st (Blocked_at { id; reason }) in
           { st with terminal = Some (Blocked reason) }
-        end
+        end else
+          let commit st preflight_receipt preflight_receipt_digest =
+            let digest = token_digest (Option.get token) in
+            let st = emit st (Committed_step { id; token_digest = digest;
+              preflight_receipt; preflight_receipt_digest }) in
+            { st with terminal = Some (Committed { id; token_digest = digest }) }
+          in
+          (match preflight with
+          | None -> commit st None None
+          | Some { cmd; working_dir; timeout_ms; input; stdout_schema } ->
+              let block st reason =
+                let st = emit st (Blocked_at { id; reason }) in
+                { st with terminal = Some (Blocked reason) }
+              in
+              if path_bearing_head cmd then
+                block st (Printf.sprintf
+                  "Commit %S preflight command must be a bare name resolved via PATH"
+                  id)
+              else if not (run_permitted ~run_allowlist cmd) then
+                block st (Printf.sprintf
+                  "Commit %S preflight command %S not permitted (allowlist)"
+                  id (match cmd with hd :: _ -> Filename.basename hd
+                     | [] -> "<empty>"))
+              else
+                (match run_input st input with
+                | Error detail -> block st (Printf.sprintf
+                    "Commit %S preflight input selection failed: %s" id detail)
+                | Ok (canonical, input_digest) ->
+                    let result = backend.Backend.run_command ~id ~argv:cmd
+                      ~working_dir ~timeout_ms ~observe:None
+                      ~stdin_content:(Some canonical) in
+                    let parsed =
+                      if result.exit <> 0 then
+                        Error (Printf.sprintf "process exited %d" result.exit)
+                      else parse_run_stdout stdout_schema result
+                    in
+                    (match parsed with
+                    | Error detail ->
+                        let st = emit st (Commit_preflight_executed {
+                          id; input_digest; parsed = None; result;
+                          receipt = None }) in
+                        block st (Printf.sprintf
+                          "Commit %S preflight rejected: %s" id detail)
+                    | Ok parsed ->
+                        (match commit_preflight_receipt ~id ~input_digest
+                            ~result ~parsed with
+                        | Error detail -> block st (Printf.sprintf
+                            "Commit %S preflight receipt rejected: %s" id detail)
+                        | Ok (receipt, receipt_digest) ->
+                            let st = emit st (Commit_preflight_executed {
+                              id; input_digest; parsed = Some parsed; result;
+                              receipt = Some receipt }) in
+                            commit st (Some receipt) (Some receipt_digest)))))
     | Foreach { over; steps = body } -> (
         match List.assoc_opt over st.ctx with
         | Some (`List items) ->
@@ -604,13 +743,89 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
         go st rest
   and go_step st step =
     match step with
-    | Agent { id; prompt = _; read_only = _; output_schema; on_failure;
-              protocol = _; brief = _; agent_type = _; model = _ } -> (
+    | Agent { id; prompt = _; read_only; output_schema; on_failure;
+              protocol = _; brief = _; agent_type; model = _; input } -> (
         match next () with
-        | Agent_ran { success; output; id = rid } when rid = id -> (
-            let st = emit st (Agent_ran { id; success; output }) in
+        | Agent_ran { success; output; id = rid; request_receipt;
+            result_receipt } when rid = id -> (
+            let validate_request paths request =
+              let nonce = match attestation_session_nonce with
+                | Some nonce -> nonce
+                | None -> raise (Replay_mismatch
+                    "structured Agent replay requires session nonce") in
+              let canonical, input_digest = match run_input st paths with
+                | Ok pair -> pair
+                | Error e -> raise (Replay_mismatch
+                    ("agent input selection diverged: " ^ e)) in
+              let backend_id = match request with
+                | `Assoc fields -> (match List.assoc_opt "backend_id" fields with
+                    | Some (`String value) -> value
+                    | _ -> raise (Replay_mismatch
+                        "agent request backend identity missing"))
+                | _ -> raise (Replay_mismatch
+                    "agent request receipt is not an object") in
+              let dispatch_id = sha256 (String.concat "\000"
+                [ nonce; id; string_of_int (List.length st.rev_trace) ]) in
+              let expected_request = `Assoc
+                [ ("schema_version", `String "cwr.agent-request.v1");
+                  ("dispatch_id", `String dispatch_id);
+                  ("step_id", `String id);
+                  ("backend_id", `String backend_id);
+                  ("role", match agent_type with None -> `Null
+                    | Some r -> `String r);
+                  ("read_only", `Bool read_only);
+                  ("input_paths", `List
+                    (List.map (fun path -> `String path) paths));
+                  ("input_digest", `String input_digest);
+                  ("input", Yojson.Safe.from_string canonical) ] in
+              if expected_request <> request then
+                raise (Replay_mismatch "agent request receipt diverged");
+              let request_digest =
+                snd (Result.get_ok (canonical_digest request)) in
+              (dispatch_id, request_digest)
+            in
+            let receipts = match input, request_receipt, result_receipt with
+              | None, None, None -> `Legacy
+              | Some paths, Some request, Some result ->
+                  let dispatch_id, request_digest =
+                    validate_request paths request in
+                  let output_digest = match canonical_digest output with
+                    | Ok (_, digest) -> digest
+                    | Error _ -> raise (Replay_mismatch
+                        "canonical Agent output is missing its result receipt") in
+                  let expected_result = `Assoc
+                    [ ("schema_version", `String "cwr.agent-result.v1");
+                      ("dispatch_id", `String dispatch_id);
+                      ("step_id", `String id);
+                      ("request_digest", `String request_digest);
+                      ("success", `Bool success);
+                      ("outcome", `String (if success then "success" else "failure"));
+                      ("output_digest", `String output_digest);
+                      ("output", output) ] in
+                  if expected_result <> result then
+                    raise (Replay_mismatch "agent result receipt diverged");
+                  `Complete (request, result)
+              | Some paths, Some request, None ->
+                  ignore (validate_request paths request);
+                  (match canonical_digest output with
+                  | Error _ -> `Noncanonical
+                  | Ok _ -> raise (Replay_mismatch
+                      "agent result receipt missing for canonical output"))
+              | _ -> raise (Replay_mismatch "agent receipt presence mismatch") in
+            let st = emit st (Agent_ran { id; success; output;
+              request_receipt; result_receipt }) in
             let st = bind_output st id output in
-            if not success then begin
+            let st = match receipts with
+              | `Complete (request, result) -> bind_receipts st id request result
+              | `Legacy | `Noncanonical -> st in
+            if receipts = `Noncanonical then
+              (match next () with
+              | Blocked_at { id = bid; reason } when bid = id ->
+                  let st = emit st (Blocked_at { id; reason }) in
+                  { st with terminal = Some (Aborted reason) }
+              | _ -> raise (Replay_mismatch
+                  "non-canonical agent block entry mismatch"))
+            else if not success then begin
               match on_failure with
               | Types.Continue ->
                   (* the recorded run SOFT-failed and continued: no Blocked_at was
@@ -638,11 +853,13 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
                   | Ok () -> st
                   | Error field ->
                       let reason = Printf.sprintf "schema mismatch: %s" field in
-                      (* the recorded run aborted here too; consume its Blocked_at *)
-                      let st =
-                        { st with terminal = Some (Aborted reason) }
-                      in
-                      emit st (Blocked_at { id; reason }))
+                      (match next () with
+                      | Blocked_at { id = bid; reason = recorded }
+                        when bid = id && recorded = reason ->
+                          let st = emit st (Blocked_at { id; reason }) in
+                          { st with terminal = Some (Aborted reason) }
+                      | _ -> raise (Replay_mismatch
+                          "agent schema block entry mismatch")))
               | None -> st)
         | _ -> raise (Replay_mismatch "agent entry mismatch"))
     | Gate { id; when_ } -> (
@@ -723,15 +940,81 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
                 Some
                   (if is_input_failure then Aborted reason else Blocked reason) }
         | _ -> raise (Replay_mismatch "run entry mismatch"))
-    | Commit { id } -> (
-        match next () with
-        | Committed_step { id = rid; token_digest } when rid = id ->
-            let st = emit st (Committed_step { id; token_digest }) in
-            { st with terminal = Some (Committed { id; token_digest }) }
-        | Blocked_at { id = rid; reason } when rid = id ->
-            let st = emit st (Blocked_at { id; reason }) in
-            { st with terminal = Some (Blocked reason) }
-        | _ -> raise (Replay_mismatch "commit entry mismatch"))
+    | Commit { id; preflight } -> (
+        let replay_committed st expected_receipt expected_digest =
+          match next () with
+          | Committed_step { id = rid; token_digest; preflight_receipt;
+              preflight_receipt_digest } when rid = id ->
+              if preflight_receipt <> expected_receipt
+                 || preflight_receipt_digest <> expected_digest then
+                raise (Replay_mismatch "commit preflight binding diverged");
+              let st = emit st (Committed_step { id; token_digest;
+                preflight_receipt; preflight_receipt_digest }) in
+              { st with terminal = Some (Committed { id; token_digest }) }
+          | _ -> raise (Replay_mismatch "commit entry mismatch")
+        in
+        match preflight with
+        | None ->
+            (match next () with
+            | Committed_step { id = rid; token_digest;
+                preflight_receipt = None; preflight_receipt_digest = None }
+              when rid = id ->
+                let st = emit st (Committed_step { id; token_digest;
+                  preflight_receipt = None; preflight_receipt_digest = None }) in
+                { st with terminal = Some (Committed { id; token_digest }) }
+            | Blocked_at { id = rid; reason } when rid = id ->
+                let st = emit st (Blocked_at { id; reason }) in
+                { st with terminal = Some (Blocked reason) }
+            | _ -> raise (Replay_mismatch "legacy commit entry mismatch"))
+        | Some { input; stdout_schema; _ } ->
+            (match next () with
+            | Commit_preflight_executed { id = rid; input_digest; parsed;
+                result; receipt } when rid = id ->
+                let expected_input_digest = match run_input st input with
+                  | Ok (_, digest) -> digest
+                  | Error e -> raise (Replay_mismatch
+                      ("commit preflight input selection diverged: " ^ e)) in
+                if input_digest <> expected_input_digest then
+                  raise (Replay_mismatch
+                    "commit preflight input digest diverged");
+                let recomputed_parsed =
+                  if result.exit <> 0 then Error
+                    (Printf.sprintf "process exited %d" result.exit)
+                  else parse_run_stdout stdout_schema result in
+                let expected_receipt = match recomputed_parsed with
+                  | Error _ -> None
+                  | Ok json ->
+                      if parsed <> Some json then
+                        raise (Replay_mismatch
+                          "commit preflight parsed output diverged");
+                      (match commit_preflight_receipt ~id ~input_digest
+                          ~result ~parsed:json with
+                      | Ok (value, _) -> Some value
+                      | Error e -> raise (Replay_mismatch
+                          ("commit preflight receipt invalid: " ^ e))) in
+                if receipt <> expected_receipt then
+                  raise (Replay_mismatch "commit preflight receipt diverged");
+                if Result.is_error recomputed_parsed && parsed <> None then
+                  raise (Replay_mismatch
+                    "rejected commit preflight unexpectedly has parsed output");
+                let st = emit st (Commit_preflight_executed {
+                  id; input_digest; parsed; result; receipt }) in
+                (match expected_receipt with
+                | None ->
+                    (match next () with
+                    | Blocked_at { id = rid; reason } when rid = id ->
+                        let st = emit st (Blocked_at { id; reason }) in
+                        { st with terminal = Some (Blocked reason) }
+                    | _ -> raise (Replay_mismatch
+                        "commit preflight rejection entry mismatch"))
+                | Some value ->
+                    let digest = snd (Result.get_ok (canonical_digest value)) in
+                    replay_committed st (Some value) (Some digest))
+            | Blocked_at { id = rid; reason } when rid = id ->
+                let st = emit st (Blocked_at { id; reason }) in
+                { st with terminal = Some (Blocked reason) }
+            | _ -> raise (Replay_mismatch
+                "commit preflight entry mismatch")))
     | Foreach { over; steps = body } -> (
         (* Consume Parallel_started is wrong here — consume Foreach markers.
            The global [pending] ref is walked in iteration order:

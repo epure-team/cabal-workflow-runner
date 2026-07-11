@@ -192,6 +192,7 @@ let runtime_workflow output =
             brief = None;
             agent_type = None;
             model = None;
+            input = None;
           };
         Attest
           {
@@ -284,7 +285,8 @@ let test_engine_exports_atomically_and_replay_authenticates () =
         let unsafe_trace = List.map (function
           | Agent_ran { id = "prove"; success; _ } ->
               Agent_ran { id = "prove"; success;
-                output = `Assoc [ ("unsafe", unsafe) ] }
+                output = `Assoc [ ("unsafe", unsafe) ];
+                request_receipt = None; result_receipt = None }
           | entry -> entry) trace in
         Alcotest.(check bool) ("unsafe " ^ label ^ " replay is controlled") true
           (match (try ignore (engine_replay ~attestation_verifier:(verifier s)
@@ -448,7 +450,7 @@ let test_secure_fs_relative_starting_directory () =
 let test_attest_beneath_parallel_is_rejected () =
   let agent = Agent { id = "a"; prompt = "p"; read_only = true;
     output_schema = None; on_failure = Abort; protocol = None; brief = None;
-    agent_type = None; model = None } in
+    agent_type = None; model = None; input = None } in
   let attest = Attest { id = "export"; select = [ "campaign" ];
     replay_domain = "d"; output = "a.json" } in
   let wf = { name = "parallel-attest"; version = Some "1.0";
@@ -554,7 +556,7 @@ let test_repeatable_attest_requires_occurrence_template () =
 let test_attest_rejects_mutable_agent_producer () =
   let mutable_agent = Agent { id = "produce"; prompt = "p"; read_only = false;
     output_schema = None; on_failure = Abort; protocol = None; brief = None;
-    agent_type = None; model = None } in
+    agent_type = None; model = None; input = None } in
   let attest = Attest { id = "export"; select = [ "outputs.produce" ];
     replay_domain = "d"; output = "proof.json" } in
   let wf = { name = "mutable-producer"; version = Some "1";

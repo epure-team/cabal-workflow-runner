@@ -20,6 +20,7 @@ val run :
   ?attestation_signer:Attestation.signer ->
   ?attestation_artifact_root:string ->
   ?attestation_session_nonce:string ->
+  ?agent_backend_id:string ->
   sw:Eio.Switch.t ->
   backend:Backend.t ->
   token:string option ->
@@ -40,7 +41,9 @@ val run :
     - [Agent] -> [backend.run_agent] yields [(success, json)]; the JSON is bound
       into the run context under ["outputs.<id>"] and, if an [output_schema] is
       present, validated fail-closed (a mismatch yields [Aborted "schema
-      mismatch: <field>"]).
+      mismatch: <field>"]). An Agent with [input] must be read-only; its selected
+      predecessor context is canonicalized into the prompt and engine-owned
+      request/result receipts are bound under ["receipts.<id>"].
     - [Gate] -> pure {!Expr.eval}; a [Pass] continues, a [Fail] yields [Blocked]
       (naming the gate id) and ends the run. [Branch] -> pure {!Expr.eval} chooses
       the arm.
@@ -59,7 +62,11 @@ val run :
       (fail-closed). The command runs exactly ONCE (on the live run); replay
       re-feeds the recorded result and NEVER re-executes.
     - [Commit] -> requires a well-formed [token]; absent/ill-formed yields
-      [Blocked]. The token is never stored: only its digest is recorded.
+      [Blocked]. An optional structured preflight then executes once through the
+      runtime Run allowlist, immediately before Commit, and its canonical receipt
+      is bound into the Commit trace entry. Any process/input/schema failure
+      blocks. Replay validates the receipt without execution. The token is never
+      stored: only its digest is recorded.
 
     [run_allowlist] (default [[]]) is the OPERATOR-supplied, RUNTIME-only trust
     control for [Run] steps: an empty list means no [Run] step ever executes

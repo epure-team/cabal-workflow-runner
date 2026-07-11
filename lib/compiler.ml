@@ -228,7 +228,10 @@ let rec compile_steps ctx steps =
 
 and compile_step ctx step =
   match step with
-  | Types.Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model } ->
+  | Types.Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model; input } ->
+      if input <> None then
+        raise (Compile_error
+          "structured Agent input/receipts are engine-only and cannot be represented by the Claude Workflow JS compiler");
       if read_only then emit_comment ctx "[read-only]";
       let var = js_ident id in
       let schema_opt = match output_schema with
@@ -282,7 +285,10 @@ and compile_step ctx step =
       emit ctx (Printf.sprintf
         "if (!(%s)) { throw new Error(\"gate %s failed\"); }"
         (expr_to_js when_) (js_escape_string id))
-  | Types.Commit { id } ->
+  | Types.Commit { id; preflight } ->
+      if preflight <> None then
+        raise (Compile_error
+          "Commit structured preflight is engine-only and cannot be represented by the Claude Workflow JS compiler");
       emit_comment ctx "[CWR commit — token approval mechanism not preserved]";
       emit ctx (Printf.sprintf
         "await agent(\"request human approval\", {label: \"commit_%s\"});"

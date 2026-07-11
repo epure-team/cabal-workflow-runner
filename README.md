@@ -154,6 +154,15 @@ Claude receives `--disallowedTools Bash,Edit,Write,NotebookEdit`; Codex receives
 fallback or dispatch. `scripts/read-only-selftest.sh` exercises exact argv, YAML-ID
 spoof resistance, and zero target mutation with fake CLIs.
 
+A read-only Agent may declare `input` as a non-empty, unique list of dotted paths
+produced earlier on every path. CWR sends the restricted-canonical projection in a
+prompt envelope and records engine-owned request/result receipts under
+`receipts.<agent-id>`. The request binds the session dispatch ID, backend capability,
+role, `read_only=true`, declared selectors, exact selected input and its digest. The
+result binds the request digest, success/outcome, exact output and output digest.
+`Attest.select` may sign either receipt. Structured Agents are rejected beneath
+`Parallel`, and replay reconstructs the receipts rather than trusting ledger fields.
+
 ```sh
 # Print the canonical JSON Schema (draft 2020-12) of the workflow format. Point a
 # workflow generator at this so it emits conformant workflows by construction.
@@ -232,6 +241,23 @@ Both are recorded in `Run_executed`; replay recomputes the selected-input digest
 revalidates the parsed stdout binding, and never starts the child process.
 Structured Runs are rejected anywhere beneath `Parallel`; embedded branch traces do
 not yet support these bindings. Plain unstructured Runs remain valid in Parallel.
+
+### Approval-time Commit preflight
+
+A Commit may include a `preflight` object with required `cmd`, `input`, and
+`stdout_schema`, plus optional `working_dir` (default `.`) and `timeout_ms`.
+The preflight is not a separately schedulable workflow step: after all gates pass,
+CWR first requires the runtime approval token, then executes the allowlisted bare
+command immediately before Commit with the canonical selected input on stdin.
+Nonzero exit, truncated output, invalid JSON/schema, missing input, unsafe command
+path, or missing allowlist authority blocks the Commit. The trusted executable owns
+domain rules such as `ready=true` by returning nonzero when they are not met.
+
+On success CWR records an adjacent engine receipt containing `step_id`,
+`input_digest`, `process_exit`, `output_digest`, and the canonical parsed output.
+The Commit trace entry binds that exact receipt and its digest. Replay recomputes the
+input/output/receipt bindings and never starts the executable. A legacy Commit without
+`preflight` behaves and serializes exactly as before.
 
 **The allowlist is the trust control — it is operator-supplied at RUNTIME and never read
 from the workflow file.** `cmd[0]` **must be a bare command name resolved via `PATH`**: a
