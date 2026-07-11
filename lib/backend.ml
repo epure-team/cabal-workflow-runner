@@ -15,6 +15,15 @@ type t = {
     observe:string list option ->
     stdin_content:string option ->
     Types.run_result;
+  run_pinned_command :
+    id:string ->
+    argv:string list ->
+    working_dir:string ->
+    timeout_ms:int option ->
+    observe:string list option ->
+    stdin_content:string option ->
+    expected_digest:string ->
+    (Types.run_result * Types.executable_identity, string) result;
   run_shell_command : string -> int;
       (** Run a shell command string via [sh -c]; return its exit code.
           The lib never spawns a process; this is injected by [bin/]. *)
@@ -35,11 +44,17 @@ let default_run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_
     Types.run_result =
   { Types.exit = 0; stdout = ""; stderr = ""; truncated = false; files = [] }
 
+let default_run_pinned_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_
+    ~observe:_ ~stdin_content:_ ~expected_digest:_ =
+  Error "pinned command execution is unavailable"
+
 (* By default a [Shell] step command exits 0 (success). Tests that want to
    exercise failure inject a stub that returns non-zero. *)
 let default_run_shell_command _cmd = 0
 
 let stub ?(agent = default_agent) ?(budget = default_budget)
     ?(run_command = default_run_command)
+    ?(run_pinned_command = default_run_pinned_command)
     ?(run_shell_command = default_run_shell_command) () =
-  { run_agent = agent; budget; run_command; run_shell_command }
+  { run_agent = agent; budget; run_command; run_pinned_command;
+    run_shell_command }

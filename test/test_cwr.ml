@@ -753,7 +753,7 @@ let test_run_step_outputs_and_gate () =
               timeout_ms = Some 30000;
               observe = Some [ "out" ];
               input = None;
-              stdout_schema = None;
+              stdout_schema = None; executable_digest = None;
             };
           Gate
             {
@@ -808,7 +808,7 @@ let test_run_step_allowlist () =
               cmd = [ "rm"; "-rf"; "x" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None; input = None; stdout_schema = None;
+              observe = None; input = None; stdout_schema = None; executable_digest = None;
             };
         ];
     }
@@ -901,7 +901,7 @@ let test_run_step_replay_no_reexec () =
               cmd = [ "mkdir"; "out" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None; input = None; stdout_schema = None;
+              observe = None; input = None; stdout_schema = None; executable_digest = None;
             };
           Gate
             {
@@ -963,7 +963,7 @@ let test_run_step_file_diff () =
         cmd = [ "touch"; "f" ];
         working_dir = "scratch";
         timeout_ms = None;
-        observe = None; input = None; stdout_schema = None;
+        observe = None; input = None; stdout_schema = None; executable_digest = None;
       }
   in
   let wf =
@@ -1054,7 +1054,7 @@ let test_run_step_destructive_warning () =
               cmd = [ "rm"; "-rf"; "out" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None; input = None; stdout_schema = None;
+              observe = None; input = None; stdout_schema = None; executable_digest = None;
             };
         ];
     }
@@ -1111,7 +1111,7 @@ let test_run_step_digest_known_answer () =
               cmd = [ "touch"; "out/x" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None; input = None; stdout_schema = None;
+              observe = None; input = None; stdout_schema = None; executable_digest = None;
             };
         ];
     }
@@ -1150,7 +1150,7 @@ let test_run_step_rejects_path_argv0 () =
               cmd = [ cmd0; "out" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None; input = None; stdout_schema = None;
+              observe = None; input = None; stdout_schema = None; executable_digest = None;
             };
         ];
     }
@@ -1249,7 +1249,7 @@ let test_run_step_effect_failure_recorded () =
               cmd = [ "definitely-not-a-real-binary-xyz" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None; input = None; stdout_schema = None;
+              observe = None; input = None; stdout_schema = None; executable_digest = None;
             };
           Gate
             {
@@ -1294,7 +1294,8 @@ let test_run_step_structured_io_and_replay () =
         Run { id = "tool"; cmd = [ "tool" ]; working_dir = "scratch";
               timeout_ms = None; observe = None;
               input = Some [ "seed.z"; "seed.a" ];
-              stdout_schema = Some [ ("ok", Schema.Bool) ] };
+              stdout_schema = Some [ ("ok", Schema.Bool) ];
+              executable_digest = None };
         Gate { id = "parsed";
                when_ = Expr.Eq (Expr.Path [ "outputs"; "tool"; "parsed"; "ok" ],
                                 Expr.Lit (Expr.Bool true)) } ] }
@@ -1344,7 +1345,8 @@ let test_run_step_structured_stdout_fail_closed () =
     { name = "bad-stdout"; version = None;
       steps = [ Run { id = "tool"; cmd = [ "tool" ]; working_dir = "scratch";
                       timeout_ms = None; observe = None; input = None;
-                      stdout_schema = Some [ ("ok", Schema.Bool) ] } ] }
+                      stdout_schema = Some [ ("ok", Schema.Bool) ];
+                      executable_digest = None } ] }
   in
   let v = validate_ok ~floor:[] wf in
   let outcome, trace = engine_run ~backend:(Backend.stub ~run_command ())
@@ -1362,7 +1364,8 @@ let test_run_step_structured_stdout_fail_closed () =
     { name = "float-stdout"; version = None;
       steps = [ Run { id = "tool"; cmd = [ "tool" ]; working_dir = "scratch";
                       timeout_ms = None; observe = None; input = None;
-                      stdout_schema = Some [ ("x", Schema.Any) ] } ] }
+                      stdout_schema = Some [ ("x", Schema.Any) ];
+                      executable_digest = None } ] }
   in
   let float_outcome, _ = engine_run ~backend:float_backend
       ~run_allowlist:[ "tool" ] ~token:None (validate_ok ~floor:[] float_wf) in
@@ -1381,7 +1384,8 @@ let test_run_step_structured_stdout_rejects_truncation () =
     { name = "truncated-stdout"; version = None;
       steps = [ Run { id = "tool"; cmd = [ "tool" ]; working_dir = "scratch";
                       timeout_ms = None; observe = None; input = None;
-                      stdout_schema = Some [ ("ok", Schema.Bool) ] } ] }
+                      stdout_schema = Some [ ("ok", Schema.Bool) ];
+                      executable_digest = None } ] }
   in
   let v = validate_ok ~floor:[] wf in
   let outcome, trace = engine_run ~backend:(Backend.stub ~run_command ())
@@ -1393,6 +1397,57 @@ let test_run_step_structured_stdout_rejects_truncation () =
   | _ -> Alcotest.fail "truncated structured stdout must abort");
   Alcotest.(check outcome_testable) "truncated rejection replays" outcome
     (engine_replay ~trace v)
+
+let test_run_step_pinned_executable_receipt () =
+  let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
+  let calls = ref 0 in
+  let run_pinned_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_
+      ~observe:_ ~stdin_content:_ ~expected_digest =
+    incr calls;
+    if expected_digest <> digest then Error "unexpected pin"
+    else Ok ({ exit = 0; stdout = {|{"ok":true}|}; stderr = "";
+      truncated = false; files = [] }, { path = "/trusted/tool"; digest }) in
+  let raw = Printf.sprintf
+    {|{"name":"pinned-run","steps":[{"kind":"run","id":"tool","cmd":["tool"],"working_dir":".","stdout_schema":{"ok":"bool"},"executable_digest":"%s"}]}|}
+    digest in
+  let wf = match Workflow_json.of_string raw with Ok value -> value
+    | Error detail -> Alcotest.failf "pinned Run parse failed: %s" detail in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run
+    ~backend:(Backend.stub ~run_pinned_command ())
+    ~run_allowlist:[ "tool" ] ~token:None v in
+  Alcotest.(check outcome_testable) "pinned Run completes"
+    Completed_no_commit outcome;
+  Alcotest.(check int) "pinned effect executes once" 1 !calls;
+  (match trace with
+  | [ Run_executed { executable = Some identity; parsed = Some _; _ } ] ->
+      Alcotest.(check string) "executable path bound" "/trusted/tool"
+        identity.path;
+      Alcotest.(check string) "executable digest bound" digest identity.digest
+  | _ -> Alcotest.fail "pinned Run identity missing from trace");
+  Alcotest.(check outcome_testable) "pinned Run replay" outcome
+    (engine_replay ~trace v);
+  Alcotest.(check int) "pinned replay does not execute" 1 !calls;
+  let tampered = List.map (function
+    | Run_executed ({ executable = Some identity; _ } as entry) ->
+        Run_executed { entry with executable = Some { identity with
+          digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } }
+    | entry -> entry) trace in
+  let rejected = try ignore (engine_replay ~trace:tampered v); false
+    with Engine.Replay_mismatch _ -> true in
+  Alcotest.(check bool) "pinned identity tamper rejected" true rejected;
+  let mismatched_backend = Backend.stub ~run_pinned_command:(fun ~id:_
+      ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_
+      ~expected_digest:_ -> Ok ({ exit = 0; stdout = {|{"ok":true}|};
+        stderr = ""; truncated = false; files = [] },
+        { path = "/other/tool";
+          digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" })) () in
+  let blocked, blocked_trace = engine_run ~backend:mismatched_backend
+    ~run_allowlist:[ "tool" ] ~token:None v in
+  (match blocked with Blocked _ -> ()
+   | _ -> Alcotest.fail "mismatched executable identity must block");
+  Alcotest.(check bool) "mismatch emits no Run execution" false
+    (List.exists (function Run_executed _ -> true | _ -> false) blocked_trace)
 
 let test_run_step_structured_parser_lint_compiler () =
   let raw = {|{"name":"s","steps":[{"kind":"run","id":"r","cmd":["tool"],"working_dir":".","input":["outputs.missing.x"],"stdout_schema":{"ok":"bool"}}]}|} in
@@ -2188,7 +2243,7 @@ let parser_known_keys =
     ("branch", [ "kind"; "when"; "then"; "else" ]);
     ("loop", [ "kind"; "until"; "governors"; "body" ]);
     ("run", [ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe";
-              "input"; "stdout_schema" ]);
+              "input"; "stdout_schema"; "executable_digest" ]);
     ("commit", [ "kind"; "id"; "preflight" ]);
     ("parallel", [ "kind"; "branches" ]);
     ("foreach", [ "kind"; "over"; "steps" ]);
@@ -2558,6 +2613,8 @@ let test_ledger_roundtrip_all_variants () =
           id = "mk";
           input_digest = Some "sha256:feedface";
           parsed = Some (`Assoc [ ("ok", `Bool true) ]);
+          executable = Some { path = "/trusted/tool";
+            digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
           result =
             {
               exit = 0;
@@ -2652,7 +2709,7 @@ let test_ledger_persist_then_replay_from_file () =
               cmd = [ "mkdir"; "out" ];
               working_dir = "scratch";
               timeout_ms = None;
-              observe = None; input = None; stdout_schema = None;
+              observe = None; input = None; stdout_schema = None; executable_digest = None;
             };
           Gate
             {
@@ -3144,7 +3201,8 @@ let test_compiler_run_step () =
       steps =
         [ Run
             { id = "mk"; cmd = [ "mkdir"; "-p"; "out" ];
-              working_dir = "scratch"; timeout_ms = None; observe = None; input = None; stdout_schema = None } ] }
+              working_dir = "scratch"; timeout_ms = None; observe = None;
+              input = None; stdout_schema = None; executable_digest = None } ] }
   in
   let js, notes = Compiler.compile_workflow wf in
   (* Run step must produce the [CWR run: cmd=... comment *)
@@ -3817,7 +3875,7 @@ let test_lint_structured_run_in_parallel () =
   let structured =
     Run { id = "structured"; cmd = [ "tool" ]; working_dir = ".";
           timeout_ms = None; observe = None; input = Some [ "seed" ];
-          stdout_schema = None }
+          stdout_schema = None; executable_digest = None }
   in
   let wf =
     { name = "structured-parallel"; version = None;
@@ -3828,7 +3886,7 @@ let test_lint_structured_run_in_parallel () =
                    else_ = [] } ];
         [ Run { id = "plain"; cmd = [ "tool" ]; working_dir = ".";
                 timeout_ms = None; observe = None; input = None;
-                stdout_schema = None } ] ] } ] }
+                stdout_schema = None; executable_digest = None } ] ] } ] }
   in
   let diags = Lint.check wf in
   Alcotest.(check bool) "nested structured Run rejected under Parallel" true
@@ -4536,6 +4594,9 @@ let () =
           Alcotest.test_case
             "structured stdout rejects truncation live and replay" `Quick
             test_run_step_structured_stdout_rejects_truncation;
+          Alcotest.test_case
+            "pinned executable identity binds and replays" `Quick
+            test_run_step_pinned_executable_receipt;
           Alcotest.test_case
             "structured parser/lint/compiler contracts" `Quick
             test_run_step_structured_parser_lint_compiler;

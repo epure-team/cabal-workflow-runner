@@ -1,4 +1,7 @@
 val read_regular : string -> (string, string) result
+val read_unaliased_regular : string -> (string, string) result
+(* Reads exact bytes through an O_NOFOLLOW descriptor and rejects files with
+   more than one hard link. Intended for executable/content identity pins. *)
 val write_atomic_noreplace : root:string -> relative:string -> content:string ->
   ([ `Written | `Published_uncertain ], string) result
 type lock_identity = { device : string; inode : string }

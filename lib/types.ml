@@ -84,6 +84,7 @@ type step =
       observe : string list option;
       input : string list option;
       stdout_schema : Schema.t option;
+      executable_digest : string option;
     }
   | Commit of { id : string; preflight : commit_preflight option }
   | Parallel of { branches : step list list }
@@ -151,6 +152,11 @@ type run_result = {
   files : file_change list;
 }
 
+type executable_identity = {
+  path : string;
+  digest : string;
+}
+
 let string_of_file_change_kind = function
   | Created -> "created"
   | Modified -> "modified"
@@ -199,6 +205,7 @@ type trace_entry =
       input_digest : string option;
       parsed : Yojson.Safe.t option;
       result : run_result;
+      executable : executable_identity option;
     }
       (** A [Run] step's command executed once; the full result is recorded so
           replay re-binds it WITHOUT re-executing the command. *)

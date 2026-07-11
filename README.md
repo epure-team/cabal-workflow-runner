@@ -211,7 +211,8 @@ context:
 { "kind": "run", "id": "mk", "cmd": ["mkdir", "-p", "out"],
   "working_dir": "scratch", "timeout_ms": 30000, "observe": ["out"],
   "input": ["outputs.plan.commands"],
-  "stdout_schema": { "ok": "bool", "summary": "string" } }
+  "stdout_schema": { "ok": "bool", "summary": "string" },
+  "executable_digest": "sha256:<64 lowercase hex characters>" }
 ```
 
 - **`cmd`** — a non-empty argv array, executed **without a shell** (no implicit
@@ -227,6 +228,14 @@ context:
   agent `output_schema`. When present, stdout must be a restricted-canonical JSON
   object satisfying the schema or the run aborts fail-closed. A `truncated=true`
   result is always rejected before parsing, even when its captured prefix is valid JSON.
+- **`executable_digest`** — optional SHA-256 identity pin for the command head.
+  CWR resolves the bare name through the runtime `PATH`, securely reads a
+  single-link non-symlink executable, checks its exact bytes before dispatch,
+  and executes a private snapshot of those bytes. A missing executable or pin
+  mismatch blocks the step before the command runs. Omitting this field retains
+  the legacy Run behavior. For scripts, the pin authenticates the script bytes;
+  it does not implicitly authenticate the shebang interpreter or files loaded
+  by the script.
 
 The result is bound under `outputs.<id>` as
 `{ "exit", "stdout", "stderr", "truncated", "files":[{ "path","change","size","digest" }] }`,
@@ -237,8 +246,11 @@ guarantee.
 
 When structured I/O is requested, that object additionally contains
 `input_digest` (`sha256:<hex>`) and/or `parsed` (the validated stdout object).
+When `executable_digest` is present, it also contains
+`executable={"path":<resolved absolute path>,"digest":<sha256 pin>}`.
 Both are recorded in `Run_executed`; replay recomputes the selected-input digest,
-revalidates the parsed stdout binding, and never starts the child process.
+revalidates the parsed stdout and executable-identity bindings, and never starts
+the child process.
 Structured Runs are rejected anywhere beneath `Parallel`; embedded branch traces do
 not yet support these bindings. Plain unstructured Runs remain valid in Parallel.
 

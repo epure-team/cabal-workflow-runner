@@ -198,6 +198,12 @@ CASES = [
                                      "cmd": ["echo"]}])),
     ("run timeout_ms=0", wf([{"kind": "run", "id": "r", "cmd": ["echo"],
                               "working_dir": "s", "timeout_ms": 0}])),
+    ("run executable digest", wf([{"kind": "run", "id": "r", "cmd": ["echo"],
+                                    "working_dir": "s",
+                                    "executable_digest": "sha256:" + "a" * 64}])),
+    ("run bad executable digest", wf([{"kind": "run", "id": "r", "cmd": ["echo"],
+                                        "working_dir": "s",
+                                        "executable_digest": "sha256:nope"}])),
     # parallel step
     ("parallel ok (2 branches)", wf([parallel([[A("a")], [A("b")]])])),
     ("parallel ok (3 branches)", wf([parallel([[A("a")], [A("b")], [A("c")]])])),

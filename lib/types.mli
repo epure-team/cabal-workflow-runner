@@ -130,6 +130,9 @@ type step =
       stdout_schema : Schema.t option;
           (** If present, stdout must be a restricted-canonical JSON object
               satisfying this schema; the parsed object is recorded and bound. *)
+      executable_digest : string option;
+          (** Optional lowercase SHA-256 pin for the securely resolved command
+              head. Its resolved path and verified digest are trace-bound. *)
     }
       (** Run an observable shell command via an INJECTED effect
           ([Backend.run_command]); records the full {!run_result} into the trace
@@ -235,6 +238,11 @@ type run_result = {
   files : file_change list;
 }
 
+type executable_identity = {
+  path : string;
+  digest : string;
+}
+
 val string_of_file_change_kind : file_change_kind -> string
 
 val json_of_file_change : file_change -> Yojson.Safe.t
@@ -270,11 +278,13 @@ type trace_entry =
       input_digest : string option;
       parsed : Yojson.Safe.t option;
       result : run_result;
+      executable : executable_identity option;
     }
       (** A {!Run} step's command executed once; the full result is recorded so
           {!Engine.replay} re-binds it WITHOUT re-executing. [input_digest]
           binds the selected canonical stdin and [parsed] binds validated
-          structured stdout; both are absent for a legacy unstructured Run. *)
+          structured stdout. [executable] binds the resolved path and exact
+          digest for a pinned Run. *)
   | Commit_preflight_executed of {
       id : string;
       input_digest : string;

@@ -41,7 +41,19 @@ type t = {
           restricted-canonical context projection when structured input is
           configured. The engine calls it at most ONCE per run step (on a
           live run, and only after the allowlist check passes); {!Engine.replay}
-          NEVER calls it (it re-feeds the recorded result). *)
+      NEVER calls it (it re-feeds the recorded result). *)
+  run_pinned_command :
+    id:string ->
+    argv:string list ->
+    working_dir:string ->
+    timeout_ms:int option ->
+    observe:string list option ->
+    stdin_content:string option ->
+    expected_digest:string ->
+    (Types.run_result * Types.executable_identity, string) result;
+      (** Resolve a bare command securely, authenticate its exact executable
+          bytes against [expected_digest], execute an immutable snapshot of
+          those bytes, and return the identity bound to the result. *)
   run_shell_command : string -> int;
       (** Execute a shell command string via [sh -c] and return its exit code.
           Used by [Shell] and [Evidence] steps. The lib never spawns a process;
@@ -65,6 +77,15 @@ val stub :
      observe:string list option ->
      stdin_content:string option ->
      Types.run_result) ->
+  ?run_pinned_command:
+    (id:string ->
+     argv:string list ->
+     working_dir:string ->
+     timeout_ms:int option ->
+     observe:string list option ->
+     stdin_content:string option ->
+     expected_digest:string ->
+     (Types.run_result * Types.executable_identity, string) result) ->
   ?run_shell_command:(string -> int) ->
   unit ->
   t

@@ -74,9 +74,12 @@ static int open_parent_at(int rootfd, const char *relative, char **name_out) {
   return fd;
 }
 
-static char *read_fd_all(int fd, size_t *len_out) {
+static char *read_fd_all_checked(int fd, size_t *len_out, int single_link) {
   struct stat st; char *buf; size_t off = 0; ssize_t n;
-  if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { errno = EINVAL; fail_errno("regular file required"); }
+  if (fstat(fd, &st) || !S_ISREG(st.st_mode) || (single_link && st.st_nlink != 1)) {
+    errno = EINVAL;
+    fail_errno(single_link ? "unaliased regular file required" : "regular file required");
+  }
   if (st.st_size < 0 || st.st_size > 64 * 1024 * 1024) { errno = EFBIG; fail_errno("file too large"); }
   buf = malloc((size_t)st.st_size + 1); if (!buf) fail_errno("malloc");
   while (off < (size_t)st.st_size) {
@@ -86,6 +89,10 @@ static char *read_fd_all(int fd, size_t *len_out) {
     off += (size_t)n;
   }
   buf[off] = 0; *len_out = off; return buf;
+}
+
+static char *read_fd_all(int fd, size_t *len_out) {
+  return read_fd_all_checked(fd, len_out, 0);
 }
 
 CAMLprim value cwr_secure_read_regular(value vpath) {
@@ -100,6 +107,21 @@ CAMLprim value cwr_secure_read_regular(value vpath) {
   fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) { close(parent); free(copy); fail_errno("openat regular file"); }
   buf = read_fd_all(fd, &len); close(fd); close(parent); free(copy);
+  out = caml_alloc_initialized_string(len, buf); free(buf); CAMLreturn(out);
+}
+
+CAMLprim value cwr_secure_read_unaliased_regular(value vpath) {
+  CAMLparam1(vpath); CAMLlocal1(out);
+  const char *path = String_val(vpath); char *copy = strdup(path), *slash, *name;
+  int parent, fd; size_t len; char *buf;
+  if (!copy) fail_errno("strdup");
+  slash = strrchr(copy, '/');
+  if (slash) { *slash = 0; name = slash + 1; parent = open_dir_chain(*copy ? copy : "/"); }
+  else { name = copy; parent = open_dir_chain("."); }
+  if (unsafe_component(name)) { close(parent); free(copy); errno = EINVAL; fail_errno("unsafe filename"); }
+  fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) { close(parent); free(copy); fail_errno("openat unaliased regular file"); }
+  buf = read_fd_all_checked(fd, &len, 1); close(fd); close(parent); free(copy);
   out = caml_alloc_initialized_string(len, buf); free(buf); CAMLreturn(out);
 }
 

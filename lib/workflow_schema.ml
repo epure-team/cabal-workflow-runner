@@ -303,6 +303,8 @@ let step_def : Yojson.Safe.t =
                 ("uniqueItems", `Bool true);
               ] );
           ("stdout_schema", ref_ "output_schema");
+          ("executable_digest", obj [ ("type", s "string");
+            ("pattern", s "^sha256:[0-9a-f]{64}$") ]);
         ]
   in
   let commit =

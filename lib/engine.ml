@@ -97,7 +97,11 @@ let commit_preflight_input st paths lock_identity =
       Result.map (fun canonical -> (canonical, sha256 canonical))
         (Canonical_json.to_string (`Assoc selected)))
 
-let run_output_json ~input_digest ~parsed result =
+let executable_json (identity : executable_identity) =
+  `Assoc [ ("path", `String identity.path);
+           ("digest", `String identity.digest) ]
+
+let run_output_json ~input_digest ~parsed ~executable result =
   match json_of_run_result result with
   | `Assoc fields ->
       `Assoc
@@ -105,6 +109,8 @@ let run_output_json ~input_digest ~parsed result =
         @ (match input_digest with
           | None -> []
           | Some digest -> [ ("input_digest", `String digest) ])
+        @ (match executable with None -> []
+          | Some identity -> [ ("executable", executable_json identity) ])
         @ match parsed with None -> [] | Some json -> [ ("parsed", json) ])
   | json -> json
 
@@ -318,7 +324,8 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
         let chosen = match verdict with Pass -> then_ | Fail -> else_ in
         go st chosen
     | Loop { body; until; governors } -> run_loop st body until governors
-    | Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema } ->
+    | Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema;
+            executable_digest } ->
         (* Fail-closed allowlist gate. The allowlist is operator-supplied at
            runtime; if the binary is not permitted, the step is Blocked WITHOUT
            executing — mirroring the gate/commit Fail arms (emit Blocked_at,
@@ -366,10 +373,23 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
           | Ok (stdin_content, input_digest) ->
               (* Execute the injected effect exactly ONCE, record the full result,
                  and bind it into ctx. Replay re-feeds this without re-executing. *)
-              let result =
-                backend.Backend.run_command ~id ~argv:cmd ~working_dir ~timeout_ms
-                  ~observe ~stdin_content
-              in
+              let execution = match executable_digest with
+                | None -> Ok (backend.Backend.run_command ~id ~argv:cmd
+                    ~working_dir ~timeout_ms ~observe ~stdin_content, None)
+                | Some expected ->
+                    Result.bind (backend.Backend.run_pinned_command ~id ~argv:cmd
+                      ~working_dir ~timeout_ms ~observe ~stdin_content
+                      ~expected_digest:expected) (fun (result, identity) ->
+                        if identity.digest <> expected then
+                          Error "pinned executable identity digest mismatch"
+                        else Ok (result, Some identity)) in
+              match execution with
+              | Error detail ->
+                  let reason = Printf.sprintf
+                    "run %S pinned executable rejected: %s" id detail in
+                  let st = emit st (Blocked_at { id; reason }) in
+                  { st with terminal = Some (Blocked reason) }
+              | Ok (result, executable) ->
               let parsed_result =
                 match stdout_schema with
                 | None -> Ok None
@@ -380,15 +400,16 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
               (match parsed_result with
               | Ok parsed ->
                   let st =
-                    emit st (Run_executed { id; input_digest; parsed; result })
+                    emit st (Run_executed { id; input_digest; parsed; result;
+                      executable })
                   in
                   bind_output st id
-                    (run_output_json ~input_digest ~parsed result)
+                    (run_output_json ~input_digest ~parsed ~executable result)
               | Error detail ->
                   let st =
                     emit st
                       (Run_executed
-                         { id; input_digest; parsed = None; result })
+                         { id; input_digest; parsed = None; result; executable })
                   in
                   let reason =
                     Printf.sprintf "run %S structured stdout rejected: %s" id
@@ -960,12 +981,18 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
     | Loop { body; until; governors } ->
         replay_loop st body until governors
     | Run { id; cmd = _; working_dir = _; timeout_ms = _; observe = _;
-            input; stdout_schema } -> (
+            input; stdout_schema; executable_digest } -> (
         (* NEVER re-execute: re-feed the recorded result (or reproduce the
            recorded allowlist-Blocked). The allowlist is NOT consulted on replay
            (nothing executes), mirroring the Agent_ran replay arm. *)
         match next () with
-        | Run_executed { id = rid; input_digest; parsed; result } when rid = id ->
+        | Run_executed { id = rid; input_digest; parsed; result; executable }
+          when rid = id ->
+            (match executable_digest, executable with
+            | None, None -> ()
+            | Some expected, Some identity when identity.digest = expected -> ()
+            | _ -> raise (Replay_mismatch
+                "run executable identity diverged"));
             let expected_digest =
               match input with
               | None -> None
@@ -976,13 +1003,16 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
             in
             if expected_digest <> input_digest then
               raise (Replay_mismatch "run input digest diverged");
-            let st = emit st (Run_executed { id; input_digest; parsed; result }) in
+            let st = emit st (Run_executed { id; input_digest; parsed; result;
+              executable }) in
             (match stdout_schema, parsed with
-            | None, None -> bind_output st id (run_output_json ~input_digest ~parsed result)
+            | None, None -> bind_output st id
+                (run_output_json ~input_digest ~parsed ~executable result)
             | Some schema, Some json ->
                 (match parse_run_stdout schema result with
                 | Ok recomputed when recomputed = json ->
-                    bind_output st id (run_output_json ~input_digest ~parsed result)
+                    bind_output st id
+                      (run_output_json ~input_digest ~parsed ~executable result)
                 | _ -> raise (Replay_mismatch "run parsed stdout diverged"))
             | Some schema, None ->
                 (match parse_run_stdout schema result with

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.19.0
+
+**Digest-pinned `Run` executables.** A `run` step may declare
+`executable_digest` (`sha256:<hex>`). CWR resolves the bare command through the
+operator's `PATH`, opens it with `O_NOFOLLOW`, requires a single-link regular
+executable, hashes the exact descriptor bytes, and fails before dispatch on a
+pin mismatch. The verified bytes execute from a private read/execute-only
+snapshot rather than by reopening the mutable origin path.
+
+The resolved absolute path and digest are bound into `outputs.<id>.executable`,
+the `Run_executed` trace/ledger entry, and replay validation. Legacy Runs that
+omit the field retain their existing backend and serialization behavior. The
+native-to-JavaScript compiler refuses pinned Runs because that target cannot
+preserve the verified-execution contract. Parser/schema parity and a CLI
+self-test cover pin mismatch, origin replacement, identity recording, and
+snapshot execution.
+
 ## v0.18.1
 
 **Commit preflight linearization lock.** An optional `preflight.lock_file`,

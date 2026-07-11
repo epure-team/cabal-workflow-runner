@@ -19,6 +19,53 @@ open Cabal_workflow_runner
 (* Cap captured stdout/stderr at 64 KiB; set [truncated] when a cap is hit. *)
 let output_cap = 64 * 1024
 
+let sha256 bytes =
+  "sha256:" ^ Digestif.SHA256.(to_hex (digest_string bytes))
+
+let path_entries () =
+  match Sys.getenv_opt "PATH" with
+  | None -> []
+  | Some value -> String.split_on_char ':' value
+
+let absolute_candidate directory name =
+  let directory = if directory = "" then Sys.getcwd () else directory in
+  let directory = if Filename.is_relative directory
+    then Filename.concat (Sys.getcwd ()) directory else directory in
+  Filename.concat directory name
+
+let resolve_pinned_executable name expected_digest =
+  let rec find = function
+    | [] -> Error (Printf.sprintf "command %S was not found on PATH" name)
+    | directory :: rest ->
+        let candidate = absolute_candidate directory name in
+        match Secure_fs.read_unaliased_regular candidate with
+        | Error _ -> find rest
+        | Ok bytes ->
+            let executable = try Unix.access candidate [ Unix.X_OK ]; true
+              with Unix.Unix_error _ -> false in
+            if not executable then find rest
+            else
+              let digest = sha256 bytes in
+              if digest <> expected_digest then Error (Printf.sprintf
+                "resolved executable digest mismatch for %s" candidate)
+              else Ok (candidate, bytes, digest)
+  in
+  find (path_entries ())
+
+let with_executable_snapshot ~origin ~bytes f =
+  let directory = Filename.temp_dir "cwr-pinned-run-" "" in
+  Unix.chmod directory 0o700;
+  let path = Filename.concat directory (Filename.basename origin) in
+  Fun.protect
+    ~finally:(fun () ->
+      (try Sys.remove path with Sys_error _ -> ());
+      (try Unix.rmdir directory with Unix.Unix_error _ -> ()))
+    (fun () ->
+      Out_channel.with_open_bin path (fun channel ->
+        Out_channel.output_string channel bytes);
+      Unix.chmod path 0o500;
+      f path)
+
 (* Documented exit codes the runner SYNTHESISES when the effect cannot produce a
    real exit code, so the outcome is still RECORDED + replayable (never a crash):
    - 124 timeout (already produced from [Backend_types.Timeout] below);
@@ -96,7 +143,10 @@ let diff (before : (string, int * string) Hashtbl.t)
           { Types.path; change = Types.Deleted; size = 0; digest = "" }
           :: !changes)
     before;
-  List.sort (fun a b -> compare a.Types.path b.Types.path) !changes
+  List.sort
+    (fun (a : Types.file_change) (b : Types.file_change) ->
+      compare a.Types.path b.Types.path)
+    !changes
 
 (* ---- the injected run_command -------------------------------------------- *)
 
@@ -160,6 +210,7 @@ let make ~sw ~env ~base :
         truncated = true;
         files = (try files_now () with _ -> []);
       }
+
   | exn ->
       (* Spawn failure (command not found) or any other effect error: record a
          well-formed non-zero result carrying a short message, never crash. *)
@@ -172,3 +223,20 @@ let make ~sw ~env ~base :
         truncated = false;
         files = (try files_now () with _ -> []);
       }
+
+let make_pinned ~sw ~env ~base =
+  let run = make ~sw ~env ~base in
+  fun ~id ~argv ~working_dir ~timeout_ms ~observe ~stdin_content
+      ~expected_digest ->
+    match argv with
+    | [] -> Error "pinned command argv is empty"
+    | name :: args ->
+        Result.bind (resolve_pinned_executable name expected_digest)
+          (fun (path, bytes, digest) ->
+            with_executable_snapshot ~origin:path ~bytes (fun snapshot ->
+              let env_arg = "CWR_PINNED_EXECUTABLE_ORIGIN_DIR="
+                ^ Filename.dirname path in
+              let pinned_argv = [ "/usr/bin/env"; env_arg; snapshot ] @ args in
+              let result = run ~id ~argv:pinned_argv ~working_dir ~timeout_ms
+                ~observe ~stdin_content in
+              Ok (result, { Types.path; digest })))

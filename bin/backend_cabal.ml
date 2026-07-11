@@ -239,6 +239,7 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
   (* The Run-step effect: process execution + a before/after directory snapshot,
      implemented in [Runner] (bin-side). The lib never spawns a process. *)
   let run_command = Runner.make ~sw ~env ~base:working_dir in
+  let run_pinned_command = Runner.make_pinned ~sw ~env ~base:working_dir in
   (* Shell-step effect: run a command string via [sh -c] and return the exit
      code. Fail-safe: any spawn exception returns 127. *)
   let run_shell_command cmd =
@@ -252,4 +253,5 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
       | _ -> pr.Cabal.Backend_process.exit_code
     with _ -> 127
   in
-  { Cabal_workflow_runner.Backend.run_agent; budget; run_command; run_shell_command }
+  { Cabal_workflow_runner.Backend.run_agent; budget; run_command;
+    run_pinned_command; run_shell_command }

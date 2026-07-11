@@ -25,6 +25,9 @@ jobs:
       - name: Test
         run: opam exec -- dune runtest
 
+      - name: Pinned Run integration self-test
+        run: scripts/pinned-run-selftest.sh
+
   parity:
     runs-on: ubuntu-latest
     steps:

@@ -130,6 +130,13 @@ let req_safe_artifact_path key json =
   then err "field %S must be a normalized non-empty relative path" key;
   p
 
+let valid_sha256 value =
+  String.length value = 71
+  && String.sub value 0 7 = "sha256:"
+  && String.for_all
+       (function '0' .. '9' | 'a' .. 'f' -> true | _ -> false)
+       (String.sub value 7 64)
+
 let reserved_commit_lock_path path =
   path = "cwr.commit_lock"
   || (String.length path > String.length "cwr.commit_lock"
@@ -344,11 +351,16 @@ let rec step_of_json json =
             observe = opt_string_list "observe" json;
             input = opt_nonempty_unique_paths "input" json;
             stdout_schema = opt_schema "stdout_schema" json;
+            executable_digest = (match member_opt "executable_digest" json with
+              | None -> None
+              | Some (`String value) when valid_sha256 value -> Some value
+              | Some _ -> err "field %S must be a lowercase sha256 digest"
+                  "executable_digest");
           }
       in
       reject_unknown_keys ~what:"run step"
         ~known:[ "kind"; "id"; "cmd"; "working_dir"; "timeout_ms"; "observe";
-                 "input"; "stdout_schema" ]
+                 "input"; "stdout_schema"; "executable_digest" ]
         json;
       s
   | "commit" ->
@@ -580,7 +592,8 @@ let rec step_to_json = function
             ("governors", `List (List.map governor_to_json governors));
             ("body", `List (List.map step_to_json body));
           ])
-  | Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema } ->
+  | Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema;
+          executable_digest } ->
       `Assoc
         ([
            ("kind", `String "run");
@@ -597,9 +610,12 @@ let rec step_to_json = function
           | None -> []
           | Some paths ->
               [ ("input", `List (List.map (fun s -> `String s) paths)) ])
-        @ match stdout_schema with
+        @ (match stdout_schema with
           | None -> []
           | Some schema -> [ ("stdout_schema", schema_to_json schema) ])
+        @ match executable_digest with
+          | None -> []
+          | Some digest -> [ ("executable_digest", `String digest) ])
   | Commit { id; preflight } ->
       `Assoc
         ([ ("kind", `String "commit"); ("id", `String id) ]

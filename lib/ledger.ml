@@ -60,12 +60,16 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
   | Loop_stopped { iterations; reason } ->
       tagged "loop_stopped"
         [ ("iterations", `Int iterations); ("reason", `String reason) ]
-  | Run_executed { id; input_digest; parsed; result } ->
+  | Run_executed { id; input_digest; parsed; result; executable } ->
       tagged "run_executed"
         ([ ("id", `String id); ("result", run_result_to_json result) ]
         @ (match input_digest with
           | None -> []
           | Some digest -> [ ("input_digest", `String digest) ])
+        @ (match executable with None -> []
+          | Some identity -> [ ("executable", `Assoc
+              [ ("path", `String identity.path);
+                ("digest", `String identity.digest) ]) ])
         @ match parsed with None -> [] | Some json -> [ ("parsed", json) ])
   | Commit_preflight_executed { id; input_digest; parsed; result; receipt;
       lock_file; lock_identity; lock_identity_valid } ->
@@ -263,11 +267,18 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
           reason = dec_string "reason" json;
         }
   | "run_executed" ->
+      let executable = match dec_opt_json "executable" json with
+        | None -> None
+        | Some value -> Some {
+            path = dec_string "path" value;
+            digest = dec_string "digest" value;
+          } in
       Run_executed {
         id = dec_string "id" json;
         input_digest = dec_opt_string "input_digest" json;
         parsed = dec_opt_json "parsed" json;
         result = dec_run_result json;
+        executable;
       }
   | "commit_preflight_executed" ->
       Commit_preflight_executed {
