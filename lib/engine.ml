@@ -76,6 +76,27 @@ let run_input st paths =
           (canonical, digest))
         (Canonical_json.to_string (`Assoc selected)))
 
+let commit_lock_json path (identity : Secure_fs.lock_identity) =
+  `Assoc [ ("path", `String path); ("held", `Bool true);
+           ("device", `String identity.device);
+           ("inode", `String identity.inode) ]
+
+let reserved_commit_lock_path path =
+  path = "cwr.commit_lock"
+  || (String.length path > String.length "cwr.commit_lock"
+      && String.sub path 0 (String.length "cwr.commit_lock" + 1)
+         = "cwr.commit_lock.")
+
+let commit_preflight_input st paths lock_identity =
+  if List.exists reserved_commit_lock_path paths then
+    Error "reserved engine path cwr.commit_lock cannot be selected"
+  else Result.bind (Attestation.select_context st.ctx paths) (fun selected ->
+      let selected = match lock_identity with
+        | None -> selected
+        | Some marker -> ("cwr.commit_lock", marker) :: selected in
+      Result.map (fun canonical -> (canonical, sha256 canonical))
+        (Canonical_json.to_string (`Assoc selected)))
+
 let run_output_json ~input_digest ~parsed result =
   match json_of_run_result result with
   | `Assoc fields ->
@@ -101,15 +122,17 @@ let parse_run_stdout schema (result : run_result) =
                (Schema.validate schema normalized)))
   | _ -> Error "stdout must be a JSON object"
 
-let commit_preflight_receipt ~id ~input_digest ~result ~parsed =
+let commit_preflight_receipt ~id ~input_digest ~result ~parsed ~lock_identity =
   Result.bind (canonical_digest parsed) (fun (_, output_digest) ->
       let receipt =
         `Assoc
-          [ ("step_id", `String id);
+          ([ ("step_id", `String id);
             ("input_digest", `String input_digest);
             ("process_exit", `Int result.exit);
             ("output_digest", `String output_digest);
             ("parsed", parsed) ]
+          @ match lock_identity with None -> []
+            | Some marker -> [ ("commit_lock", marker) ])
       in
       Result.map (fun (_, digest) -> (receipt, digest))
         (canonical_digest receipt))
@@ -390,7 +413,8 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
           in
           (match preflight with
           | None -> commit st None None
-          | Some { cmd; working_dir; timeout_ms; input; stdout_schema } ->
+          | Some { cmd; working_dir; timeout_ms; input; stdout_schema;
+                   lock_file } ->
               let block st reason =
                 let st = emit st (Blocked_at { id; reason }) in
                 { st with terminal = Some (Blocked reason) }
@@ -405,7 +429,8 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
                   id (match cmd with hd :: _ -> Filename.basename hd
                      | [] -> "<empty>"))
               else
-                (match run_input st input with
+                let execute lock_marker lock_identity =
+                (match commit_preflight_input st input lock_marker with
                 | Error detail -> block st (Printf.sprintf
                     "Commit %S preflight input selection failed: %s" id detail)
                 | Ok (canonical, input_digest) ->
@@ -421,19 +446,62 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
                     | Error detail ->
                         let st = emit st (Commit_preflight_executed {
                           id; input_digest; parsed = None; result;
-                          receipt = None }) in
+                          receipt = None; lock_file;
+                          lock_identity = lock_marker;
+                          lock_identity_valid = None }) in
                         block st (Printf.sprintf
                           "Commit %S preflight rejected: %s" id detail)
                     | Ok parsed ->
+                        let identity_still_matches = match lock_file,
+                            lock_identity with
+                          | None, None -> Ok true
+                          | Some path, Some identity ->
+                              Secure_fs.lock_identity_matches
+                                ~root:working_dir ~relative:path identity
+                          | _ -> Ok false in
+                        (match identity_still_matches with
+                        | Error detail ->
+                            let st = emit st (Commit_preflight_executed {
+                              id; input_digest; parsed = Some parsed; result;
+                              receipt = None; lock_file;
+                              lock_identity = lock_marker;
+                              lock_identity_valid = Some false }) in
+                            block st (Printf.sprintf
+                              "Commit %S preflight lock identity check failed: %s"
+                              id detail)
+                        | Ok false ->
+                            let st = emit st (Commit_preflight_executed {
+                              id; input_digest; parsed = Some parsed; result;
+                              receipt = None; lock_file;
+                              lock_identity = lock_marker;
+                              lock_identity_valid = Some false }) in
+                            block st (Printf.sprintf
+                              "Commit %S preflight lock inode changed" id)
+                        | Ok true ->
                         (match commit_preflight_receipt ~id ~input_digest
-                            ~result ~parsed with
+                            ~result ~parsed ~lock_identity:lock_marker with
                         | Error detail -> block st (Printf.sprintf
                             "Commit %S preflight receipt rejected: %s" id detail)
                         | Ok (receipt, receipt_digest) ->
                             let st = emit st (Commit_preflight_executed {
                               id; input_digest; parsed = Some parsed; result;
-                              receipt = Some receipt }) in
+                              receipt = Some receipt; lock_file;
+                              lock_identity = lock_marker;
+                              lock_identity_valid = Option.map (fun _ -> true)
+                                lock_marker }) in
                             commit st (Some receipt) (Some receipt_digest)))))
+                in
+                match lock_file with
+                | None -> execute None None
+                | Some path ->
+                    (match Secure_fs.with_exclusive_lock ~root:working_dir
+                        ~relative:path (fun identity ->
+                          let marker = commit_lock_json path identity in
+                          execute (Some marker) (Some identity)) with
+                    | Ok st -> st
+                    | Error detail -> block st (Printf.sprintf
+                        "Commit %S preflight lock acquisition failed: %s"
+                        id detail)))
     | Foreach { over; steps = body } -> (
         match List.assoc_opt over st.ctx with
         | Some (`List items) ->
@@ -966,11 +1034,34 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
                 let st = emit st (Blocked_at { id; reason }) in
                 { st with terminal = Some (Blocked reason) }
             | _ -> raise (Replay_mismatch "legacy commit entry mismatch"))
-        | Some { input; stdout_schema; _ } ->
+        | Some { input; stdout_schema; lock_file; _ } ->
             (match next () with
             | Commit_preflight_executed { id = rid; input_digest; parsed;
-                result; receipt } when rid = id ->
-                let expected_input_digest = match run_input st input with
+                result; receipt; lock_file = recorded_lock_file;
+                lock_identity; lock_identity_valid } when rid = id ->
+                if recorded_lock_file <> lock_file then
+                  raise (Replay_mismatch
+                    "commit preflight lock declaration diverged");
+                let validated_lock_marker = match lock_file, lock_identity with
+                  | None, None -> None
+                  | Some path, Some (`Assoc fields as marker) ->
+                      let device = match List.assoc_opt "device" fields with
+                        | Some (`String value) -> value
+                        | _ -> raise (Replay_mismatch
+                            "commit preflight lock device missing") in
+                      let inode = match List.assoc_opt "inode" fields with
+                        | Some (`String value) -> value
+                        | _ -> raise (Replay_mismatch
+                            "commit preflight lock inode missing") in
+                      let expected = commit_lock_json path
+                        { Secure_fs.device = device; inode } in
+                      if marker <> expected then raise (Replay_mismatch
+                        "commit preflight lock marker diverged");
+                      Some marker
+                  | _ -> raise (Replay_mismatch
+                      "commit preflight lock marker presence diverged") in
+                let expected_input_digest = match
+                    commit_preflight_input st input validated_lock_marker with
                   | Ok (_, digest) -> digest
                   | Error e -> raise (Replay_mismatch
                       ("commit preflight input selection diverged: " ^ e)) in
@@ -981,14 +1072,24 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
                   if result.exit <> 0 then Error
                     (Printf.sprintf "process exited %d" result.exit)
                   else parse_run_stdout stdout_schema result in
-                let expected_receipt = match recomputed_parsed with
-                  | Error _ -> None
-                  | Ok json ->
+                let receipt_permitted = match lock_file, lock_identity_valid with
+                  | None, None -> true
+                  | Some _, Some true -> true
+                  | Some _, Some false -> false
+                  | Some _, None when Result.is_error recomputed_parsed -> false
+                  | _ -> raise (Replay_mismatch
+                      "commit preflight lock validation verdict diverged") in
+                let expected_receipt = match recomputed_parsed,
+                    receipt_permitted with
+                  | Error _, _ -> None
+                  | Ok _, false -> None
+                  | Ok json, true ->
                       if parsed <> Some json then
                         raise (Replay_mismatch
                           "commit preflight parsed output diverged");
                       (match commit_preflight_receipt ~id ~input_digest
-                          ~result ~parsed:json with
+                          ~result ~parsed:json
+                          ~lock_identity:validated_lock_marker with
                       | Ok (value, _) -> Some value
                       | Error e -> raise (Replay_mismatch
                           ("commit preflight receipt invalid: " ^ e))) in
@@ -998,7 +1099,9 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
                   raise (Replay_mismatch
                     "rejected commit preflight unexpectedly has parsed output");
                 let st = emit st (Commit_preflight_executed {
-                  id; input_digest; parsed; result; receipt }) in
+                  id; input_digest; parsed; result; receipt;
+                  lock_file; lock_identity = validated_lock_marker;
+                  lock_identity_valid }) in
                 (match expected_receipt with
                 | None ->
                     (match next () with

@@ -259,6 +259,26 @@ The Commit trace entry binds that exact receipt and its digest. Replay recompute
 input/output/receipt bindings and never starts the executable. A legacy Commit without
 `preflight` behaves and serializes exactly as before.
 
+For state shared with concurrent writers, `preflight.lock_file` names the
+normalized lock path relative to `working_dir` (for campaign state, the
+canonical value is `.campaign-state/.manifest-write.lock`). CWR securely
+opens/creates a single-link regular non-symlink file, takes an exclusive BSD
+`flock` without waiting, and holds the verified FD from before input selection
+through validated receipt construction and adjacent `Committed_step` emission.
+A busy or unsafe lock blocks without dispatch. The path is re-opened and its
+device/inode rechecked before Commit, so removal or replacement cannot silently
+move the lock to another inode.
+
+The parent-held lock is represented in preflight stdin by the reserved flat key
+`cwr.commit_lock` with `{path,held:true,device,inode}`; device and inode are digit
+strings. It is included in the input digest and receipt, and lets a cooperating
+preflight validator verify the exact live inode and avoid deadlocking by
+reacquiring the same lock. Workflow selectors may not use that reserved path.
+The validated terminal receipt is the Commit **linearization point**: its
+`target_digest`/evidence digests identify the immutable committed subject.
+Mutation after lock release may change live files but cannot change what the
+receipt and Commit authorized.
+
 **The allowlist is the trust control — it is operator-supplied at RUNTIME and never read
 from the workflow file.** `cmd[0]` **must be a bare command name resolved via `PATH`**: a
 `cmd[0]` containing a `/` (an absolute or relative path) is **`Blocked`** before the

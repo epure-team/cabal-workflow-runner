@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.18.1
+
+**Commit preflight linearization lock.** An optional `preflight.lock_file`,
+relative to the preflight working directory, lets CWR hold the same BSD
+`flock(2)` used by campaign writers from before input selection through process
+execution, receipt validation, and adjacent `Committed_step` emission. CWR
+opens/creates the lock by descriptor traversal with `O_NOFOLLOW`, requires a
+single-link regular file, fails immediately when busy, and rechecks the live
+device/inode before Commit.
+
+While holding the lock, CWR injects the reserved canonical input
+`cwr.commit_lock={path,held:true,device,inode}` (digit-string identity) and binds
+it into the input digest, preflight receipt, trace, and replay. User selectors
+cannot collide with that namespace. Symlink, hardlink, traversal, busy-lock,
+removal, and inode-replacement cases fail closed without Commit. The successful
+validated receipt is the Commit linearization point and authorizes its immutable
+target/evidence digest, not later mutable worktree bytes.
+
 ## v0.18.0
 
 **Engine-owned decision receipts and approval-time preflight.** A read-only

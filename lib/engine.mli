@@ -68,6 +68,12 @@ val run :
       blocks. Replay validates the receipt without execution. The token is never
       stored: only its digest is recorded.
 
+      When [preflight.lock_file] is present, the engine securely acquires that
+      BSD advisory lock beneath the preflight working directory without waiting,
+      injects its verified path/device/inode marker into canonical stdin, and
+      holds the FD through receipt validation and Commit emission. Replay checks
+      the recorded marker and post-command identity verdict but never locks.
+
     [run_allowlist] (default [[]]) is the OPERATOR-supplied, RUNTIME-only trust
     control for [Run] steps: an empty list means no [Run] step ever executes
     (fail-closed/off), ["*"] permits all binaries, and any other list permits a

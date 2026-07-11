@@ -8,9 +8,9 @@
 
 - `rtk opam exec --switch=/home/mathias/dev/cabal -- dune build @all` — **PASS**.
 - `rtk opam exec --switch=/home/mathias/dev/cabal -- dune test` — **PASS**:
-  120/120 core tests and 21/21 attestation tests.
+  123/123 core tests and 21/21 attestation tests.
 - `rtk opam exec --switch=/home/mathias/dev/cabal -- python3 scripts/parity_check.py`
-  — **PASS**, 0 divergences across 86 parser/schema/profile cases.
+  — **PASS**, 0 divergences across 89 parser/schema/profile cases.
 - `rtk opam exec --switch=/home/mathias/dev/cabal -- bash scripts/attestation-selftest.sh`
   — **PASS** (native export, pinned verification, replay, substitution and
   unsafe-value negatives).
@@ -38,4 +38,6 @@
   no-execution, and binding-tamper rejection;
 - legacy Agent and Commit traces, compiler refusal for unsupported structured
   features, and full ledger serialization round-trip.
-
+- real BSD-flock Commit linearization, reserved inode marker binding, immediate
+  busy-lock failure, symlink/hardlink/traversal controls, removal/replacement
+  rejection, lock release after both outcomes, and replay-tamper rejection.

@@ -130,6 +130,12 @@ let req_safe_artifact_path key json =
   then err "field %S must be a normalized non-empty relative path" key;
   p
 
+let reserved_commit_lock_path path =
+  path = "cwr.commit_lock"
+  || (String.length path > String.length "cwr.commit_lock"
+      && String.sub path 0 (String.length "cwr.commit_lock" + 1)
+         = "cwr.commit_lock.")
+
 let req_nonempty_string key json =
   let s = req_string key json in
   if String.trim s = "" then err "field %S must be non-empty" key;
@@ -353,18 +359,24 @@ let rec step_of_json json =
             let input = match opt_nonempty_unique_paths "input" value with
               | Some paths -> paths
               | None -> err "missing required field %S" "input" in
+            if List.exists reserved_commit_lock_path input then
+              err "field %S must not select reserved engine path cwr.commit_lock"
+                "input";
             let stdout_schema = match opt_schema "stdout_schema" value with
               | Some schema -> schema
               | None -> err "missing required field %S" "stdout_schema" in
             reject_unknown_keys ~what:"commit preflight"
               ~known:[ "cmd"; "input"; "stdout_schema"; "working_dir";
-                       "timeout_ms" ] value;
+                       "timeout_ms"; "lock_file" ] value;
             Some {
               cmd = req_string_nonempty_list "cmd" value;
               input;
               stdout_schema;
               working_dir = opt_relative_path "working_dir" ~default:"." value;
               timeout_ms = opt_bounded_int "timeout_ms" value;
+              lock_file = (match member_opt "lock_file" value with
+                | None -> None
+                | Some _ -> Some (req_safe_artifact_path "lock_file" value));
             }
         | Some _ -> err "field %S must be an object" "preflight"
       in
@@ -593,7 +605,8 @@ let rec step_to_json = function
         ([ ("kind", `String "commit"); ("id", `String id) ]
         @ match preflight with
           | None -> []
-          | Some { cmd; working_dir; timeout_ms; input; stdout_schema } ->
+          | Some { cmd; working_dir; timeout_ms; input; stdout_schema;
+                   lock_file } ->
               [ ("preflight", `Assoc
                   ([ ("cmd", `List (List.map (fun s -> `String s) cmd));
                      ("input", `List (List.map (fun s -> `String s) input));
@@ -601,7 +614,9 @@ let rec step_to_json = function
                   @ (if working_dir = "." then []
                      else [ ("working_dir", `String working_dir) ])
                   @ match timeout_ms with None -> []
-                    | Some n -> [ ("timeout_ms", `Int n) ])) ])
+                    | Some n -> [ ("timeout_ms", `Int n) ]
+                  @ match lock_file with None -> []
+                    | Some path -> [ ("lock_file", `String path) ])) ])
   | Parallel { branches } ->
       `Assoc
         [

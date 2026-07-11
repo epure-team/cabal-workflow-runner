@@ -368,6 +368,25 @@ and never executes the command. Domain predicates are enforced by the trusted co
 exiting nonzero, not hard-coded into CWR. Absent `preflight`, legacy behavior is
 unchanged.
 
+Optional `lock_file` is a normalized path relative to the preflight
+`working_dir`. The engine securely opens/creates a single-link regular file with
+descriptor-relative traversal and `O_NOFOLLOW`, acquires `flock(LOCK_EX|LOCK_NB)`,
+and holds that FD before selecting input until after either the receipt-bound
+`Committed_step` or the terminal blocked record. Busy, symlink, hardlink,
+traversal, removal, and inode replacement fail closed. Before Commit the engine
+reopens the declared path and requires the same device/inode.
+
+While held, CWR injects reserved selected input
+`"cwr.commit_lock":{"path":...,"held":true,"device":"...","inode":"..."}`.
+The digit-string identity and declaration are covered by the canonical input
+digest, receipt digest, ledger, and replay; user input selectors cannot collide
+with the reserved namespace. Replay does not acquire a live lock: it validates
+the recorded declaration, marker, input digest, explicit post-command identity
+verdict, receipt, and Commit binding. A successful validated receipt under this
+lock is the Commit linearization point. The receipt's immutable `target_digest`
+and evidence digests are the authorized subject; mutable worktree bytes after
+lock release are not.
+
 ### 2.2 `Validate.workflow ~floor_gates wf` is fail-closed
 
 It returns `Error reason` (rejecting the workflow before any execution) when:

@@ -3,13 +3,16 @@
 #include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
+#include <caml/threads.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -146,4 +149,69 @@ CAMLprim value cwr_secure_write_atomic(value vroot, value vrel, value vcontent) 
     free(name); close(parent); close(rootfd); CAMLreturn(Val_int(1));
   }
   free(name); close(parent); close(rootfd); CAMLreturn(Val_int(0));
+}
+
+CAMLprim value cwr_secure_lock_acquire(value vroot, value vrel) {
+  CAMLparam2(vroot, vrel); CAMLlocal3(out, vdev, vino);
+  const char *root = String_val(vroot), *rel = String_val(vrel);
+  int rootfd = -1, parent = -1, fd = -1, rc, saved;
+  char *name = NULL;
+  struct stat st;
+  rootfd = open_dir_chain(root);
+  parent = open_parent_at(rootfd, rel, &name);
+  fd = openat(parent, name,
+      O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    saved = errno; free(name); close(parent); close(rootfd); errno = saved;
+    fail_errno("openat preflight lock");
+  }
+  if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+    saved = errno ? errno : EINVAL;
+    close(fd); free(name); close(parent); close(rootfd); errno = saved;
+    fail_errno("regular preflight lock required");
+  }
+  do { rc = flock(fd, LOCK_EX | LOCK_NB); } while (rc < 0 && errno == EINTR);
+  if (rc < 0) {
+    saved = errno; close(fd); free(name); close(parent); close(rootfd);
+    errno = saved; fail_errno("acquire preflight lock");
+  }
+  free(name); close(parent); close(rootfd);
+  char devbuf[32], inobuf[32];
+  snprintf(devbuf, sizeof(devbuf), "%" PRIuMAX, (uintmax_t)st.st_dev);
+  snprintf(inobuf, sizeof(inobuf), "%" PRIuMAX, (uintmax_t)st.st_ino);
+  vdev = caml_copy_string(devbuf); vino = caml_copy_string(inobuf);
+  out = caml_alloc_tuple(3);
+  Store_field(out, 0, Val_int(fd));
+  Store_field(out, 1, vdev);
+  Store_field(out, 2, vino);
+  CAMLreturn(out);
+}
+
+CAMLprim value cwr_secure_lock_release(value vfd) {
+  CAMLparam1(vfd);
+  int fd = Int_val(vfd);
+  if (flock(fd, LOCK_UN)) fail_errno("unlock preflight lock");
+  if (close(fd)) fail_errno("release preflight lock");
+  CAMLreturn(Val_unit);
+}
+
+CAMLprim value cwr_secure_lock_identity_matches(value vroot, value vrel,
+    value vdev, value vino) {
+  CAMLparam4(vroot, vrel, vdev, vino);
+  const char *root = String_val(vroot), *rel = String_val(vrel);
+  int rootfd = -1, parent = -1, fd = -1, matches = 0;
+  char *name = NULL, devbuf[32], inobuf[32];
+  struct stat st;
+  rootfd = open_dir_chain(root);
+  parent = open_parent_at(rootfd, rel, &name);
+  fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd >= 0 && !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_nlink == 1) {
+    snprintf(devbuf, sizeof(devbuf), "%" PRIuMAX, (uintmax_t)st.st_dev);
+    snprintf(inobuf, sizeof(inobuf), "%" PRIuMAX, (uintmax_t)st.st_ino);
+    matches = !strcmp(devbuf, String_val(vdev)) &&
+              !strcmp(inobuf, String_val(vino));
+  }
+  if (fd >= 0) close(fd);
+  free(name); close(parent); close(rootfd);
+  CAMLreturn(Val_bool(matches));
 }

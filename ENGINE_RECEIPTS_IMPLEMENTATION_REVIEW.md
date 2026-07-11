@@ -6,6 +6,18 @@ request/result receipts, Attest/lint/replay integration, and optional
 approval-time Commit preflight  
 **Verdict:** **GO**
 
+## v0.18.1 boundary-review closure
+
+The follow-up adds optional `Commit.preflight.lock_file` using the campaign
+writer's actual BSD `flock(2)` namespace. The engine securely opens a
+single-link regular lock file, fails immediately on contention, injects and
+digest-binds the reserved device/inode marker, records the post-command identity
+verdict, and holds the FD through Commit emission. Real shell-flock contention,
+symlink/hardlink/traversal, busy lock, removal/replacement, release after success
+and failure, replay tamper, and immutable target-digest binding are covered.
+The successful receipt is explicitly the linearization point. **Verdict remains
+GO.**
+
 ## Contract reviewed
 
 1. A legacy Agent or Commit keeps its prior JSON encoding, runtime behavior, and
@@ -76,4 +88,3 @@ preflight executable is also trusted for domain-specific predicates (for
 example, returning nonzero when `ready` is false); CWR deliberately enforces the
 generic process/schema/receipt contract rather than hard-coding application
 semantics.
-

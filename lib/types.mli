@@ -39,6 +39,10 @@ type commit_preflight = {
   timeout_ms : int option;
   input : string list;
   stdout_schema : Schema.t;
+  lock_file : string option;
+      (** Optional normalized path relative to [working_dir]. The engine holds
+          the verified BSD advisory lock across input selection, execution,
+          receipt validation, and Commit emission. *)
 }
 (** What to do when an [Agent] step's run is UNSUCCESSFUL.
 
@@ -277,6 +281,11 @@ type trace_entry =
       parsed : Yojson.Safe.t option;
       result : run_result;
       receipt : Yojson.Safe.t option;
+      lock_file : string option;
+      lock_identity : Yojson.Safe.t option;
+      lock_identity_valid : bool option;
+      (** Recorded post-command identity verdict; replay consumes this instead
+          of consulting mutable current filesystem state. *)
     }
       (** Engine-owned observation of the optional Commit preflight. Replay
           validates this entry without re-executing its command. *)

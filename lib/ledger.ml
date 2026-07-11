@@ -67,12 +67,19 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
           | None -> []
           | Some digest -> [ ("input_digest", `String digest) ])
         @ match parsed with None -> [] | Some json -> [ ("parsed", json) ])
-  | Commit_preflight_executed { id; input_digest; parsed; result; receipt } ->
+  | Commit_preflight_executed { id; input_digest; parsed; result; receipt;
+      lock_file; lock_identity; lock_identity_valid } ->
       tagged "commit_preflight_executed"
         ([ ("id", `String id); ("input_digest", `String input_digest);
            ("result", run_result_to_json result) ]
         @ (match parsed with None -> [] | Some json -> [ ("parsed", json) ])
-        @ match receipt with None -> [] | Some json -> [ ("receipt", json) ])
+        @ (match receipt with None -> [] | Some json -> [ ("receipt", json) ])
+        @ (match lock_file with None -> []
+          | Some path -> [ ("lock_file", `String path) ])
+        @ (match lock_identity with None -> []
+          | Some json -> [ ("lock_identity", json) ])
+        @ match lock_identity_valid with None -> []
+          | Some value -> [ ("lock_identity_valid", `Bool value) ])
   | Committed_step { id; token_digest; preflight_receipt;
       preflight_receipt_digest } ->
       tagged "committed_step"
@@ -164,6 +171,15 @@ let dec_opt_string key json =
       | None -> None
       | Some (`String value) -> Some value
       | Some _ -> err "field %S must be a string" key)
+  | _ -> err "entry must be a JSON object"
+
+let dec_opt_bool key json =
+  match json with
+  | `Assoc fields -> (
+      match List.assoc_opt key fields with
+      | None -> None
+      | Some (`Bool value) -> Some value
+      | Some _ -> err "field %S must be a bool" key)
   | _ -> err "entry must be a JSON object"
 
 let dec_opt_json key json =
@@ -260,6 +276,9 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
         parsed = dec_opt_json "parsed" json;
         result = dec_run_result json;
         receipt = dec_opt_json "receipt" json;
+        lock_file = dec_opt_string "lock_file" json;
+        lock_identity = dec_opt_json "lock_identity" json;
+        lock_identity_valid = dec_opt_bool "lock_identity_valid" json;
       }
   | "committed_step" ->
       Committed_step

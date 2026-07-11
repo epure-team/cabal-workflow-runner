@@ -316,13 +316,17 @@ let step_def : Yojson.Safe.t =
                                   ("minItems", `Int 1) ]);
                   ("input", obj [ ("type", s "array");
                                     ("items", obj [ ("type", s "string");
-                                                    ("pattern", s ".*\\S.*") ]);
+                                      ("pattern", s ".*\\S.*");
+                                      ("not", obj [ ("pattern",
+                                        s "^cwr\\.commit_lock(?:\\.|$)") ]) ]);
                                     ("minItems", `Int 1);
                                     ("uniqueItems", `Bool true) ]);
                   ("stdout_schema", ref_ "output_schema");
                   ("working_dir", obj [ ("type", s "string");
                                          ("pattern", s "^(?!/)(?!(.*/)?\\.\\.(/|$)).+$") ]);
-                  ("timeout_ms", bounded_int) ] ) ]
+                  ("timeout_ms", bounded_int);
+                  ("lock_file", obj [ ("type", s "string");
+                    ("pattern", s "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\).+$") ]) ] ) ]
   in
   let parallel =
     closed_object_with

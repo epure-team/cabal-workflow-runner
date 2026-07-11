@@ -2577,7 +2577,8 @@ let test_ledger_roundtrip_all_variants () =
         parsed = Some (`Assoc [ ("ready", `Bool true) ]);
         result = { exit = 0; stdout = {|{"ready":true}|}; stderr = "";
           truncated = false; files = [] };
-        receipt = Some (`Assoc [ ("step_id", `String "publish") ]) };
+        receipt = Some (`Assoc [ ("step_id", `String "publish") ]);
+        lock_file = None; lock_identity = None; lock_identity_valid = None };
       Committed_step { id = "publish"; token_digest = "cafebabe";
         preflight_receipt = Some (`Assoc [ ("step_id", `String "publish") ]);
         preflight_receipt_digest = Some "sha256:receipt" };
@@ -4067,14 +4068,16 @@ let test_structured_agent_receipts_and_replay () =
        d.code = "structured-input-missing-predecessor")
        (Lint.check dangling))
 
-let commit_preflight_workflow ?(cmd = [ "preflight" ]) () =
+let commit_preflight_workflow ?(cmd = [ "preflight" ])
+    ?(working_dir = "work") ?lock_file
+    ?(stdout_schema = [ ("ready", Schema.Bool); ("tx", Schema.String) ]) () =
   { name = "commit-preflight"; version = None;
     steps =
       [ Gate { id = "approved-data"; when_ = Expr.Lit (Expr.Bool true) };
         Commit { id = "publish";
-          preflight = Some { cmd; working_dir = "work";
+          preflight = Some { cmd; working_dir;
             timeout_ms = Some 2500; input = [ "transaction" ];
-            stdout_schema = [ ("ready", Schema.Bool); ("tx", Schema.String) ] } } ] }
+            stdout_schema; lock_file } } ] }
 
 let test_commit_preflight_approval_receipt_and_replay () =
   let calls = ref 0 and seen = ref None in
@@ -4154,6 +4157,232 @@ let test_commit_preflight_fail_closed () =
   (match path_block with Blocked _ -> () | _ -> Alcotest.fail "path head");
   Alcotest.(check int) "blocked preflights never dispatch" 0 !calls
 
+let write_test_file path content =
+  Out_channel.with_open_bin path (fun oc -> Out_channel.output_string oc content)
+
+let read_test_file path =
+  In_channel.with_open_bin path In_channel.input_all
+
+let with_lock_test_tree f =
+  let root = Printf.sprintf "_build/cwr-lock-%d-%d"
+    (Unix.getpid ()) (Random.bits ()) in
+  let state = Filename.concat root ".campaign-state" in
+  Unix.mkdir root 0o700; Unix.mkdir state 0o700;
+  Fun.protect ~finally:(fun () ->
+    let remove path = try Sys.remove path with Sys_error _ -> () in
+    List.iter remove
+      [ Filename.concat state ".manifest-write.lock.old";
+        Filename.concat state ".manifest-write.lock";
+        Filename.concat root "hardlink-source";
+        Filename.concat root "target";
+        Filename.concat root "busy" ];
+    (try Unix.rmdir state with Unix.Unix_error _ -> ());
+    (try Unix.rmdir root with Unix.Unix_error _ -> ()))
+    (fun () -> f root state)
+
+let digits_only value =
+  String.length value > 0
+  && String.for_all (function '0' .. '9' -> true | _ -> false) value
+
+let test_commit_preflight_lock_linearizes () =
+  with_lock_test_tree (fun root _state ->
+    let lock_rel = ".campaign-state/.manifest-write.lock" in
+    let lock_path = Filename.concat root lock_rel in
+    let target = Filename.concat root "target" in
+    write_test_file target "before";
+    let writer_pid = ref None and seen_marker = ref None in
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_
+        ~stdin_content =
+      let input = match stdin_content with Some raw -> Yojson.Safe.from_string raw
+        | None -> Alcotest.fail "locked preflight stdin missing" in
+      let marker = match input with `Assoc fields ->
+        List.assoc_opt "cwr.commit_lock" fields
+        | _ -> None in
+      seen_marker := marker;
+      let pid = Unix.create_process "/usr/bin/flock"
+        [| "/usr/bin/flock"; lock_path; "/bin/sh"; "-c";
+           "printf mutated > \"$1\""; "writer"; target |]
+        Unix.stdin Unix.stdout Unix.stderr in
+      writer_pid := Some pid;
+      Unix.sleepf 0.05;
+      Alcotest.(check string) "cooperating writer blocked during preflight"
+        "before" (read_test_file target);
+      (match Unix.waitpid [ Unix.WNOHANG ] pid with
+      | 0, _ -> ()
+      | _ -> Alcotest.fail "flock writer escaped before Commit linearization");
+      { exit = 0;
+        stdout = {|{"ready":true,"target_digest":"sha256:subject"}|};
+        stderr = ""; truncated = false; files = [] }
+    in
+    let wf = commit_preflight_workflow ~working_dir:root ~lock_file:lock_rel
+      ~stdout_schema:[ ("ready", Schema.Bool);
+                       ("target_digest", Schema.String) ] () in
+    let v = validate_ok ~floor:[ "approved-data" ] wf in
+    let initial_ctx =
+      [ ("transaction", `Assoc [ ("id", `String "abc") ]) ] in
+    let outcome, trace = engine_run ~backend:(Backend.stub ~run_command ())
+      ~run_allowlist:[ "preflight" ] ~initial_ctx ~token:(Some "approve") v in
+    (match outcome with Committed _ -> ()
+     | _ -> Alcotest.fail "locked preflight should commit");
+    (match !writer_pid with Some pid -> ignore (Unix.waitpid [] pid)
+     | None -> Alcotest.fail "writer was not launched");
+    Alcotest.(check string) "writer proceeds only after engine releases lock"
+      "mutated" (read_test_file target);
+    (match !seen_marker with
+    | Some (`Assoc fields) ->
+        Alcotest.(check (option string)) "canonical lock path marker"
+          (Some lock_rel)
+          (match List.assoc_opt "path" fields with Some (`String s) -> Some s
+           | _ -> None);
+        Alcotest.(check bool) "held marker" true
+          (List.assoc_opt "held" fields = Some (`Bool true));
+        List.iter (fun key -> match List.assoc_opt key fields with
+          | Some (`String value) ->
+              Alcotest.(check bool) (key ^ " is a digit string") true
+                (digits_only value)
+          | _ -> Alcotest.failf "%s marker missing" key) [ "device"; "inode" ]
+    | _ -> Alcotest.fail "engine lock marker missing");
+    (match trace with
+    | [ Gate_evaluated _;
+        Commit_preflight_executed { lock_file = Some path;
+          lock_identity = Some marker; receipt = Some (`Assoc receipt); _ };
+        Committed_step { preflight_receipt = Some (`Assoc bound); _ } ] ->
+        Alcotest.(check string) "trace lock declaration" lock_rel path;
+        Alcotest.(check bool) "receipt binds exact lock marker" true
+          (List.assoc_opt "commit_lock" receipt = Some marker);
+        Alcotest.(check bool) "Commit binds target digest receipt" true
+          (List.assoc_opt "parsed" bound = Some (`Assoc
+             [ ("ready", `Bool true);
+               ("target_digest", `String "sha256:subject") ]))
+    | _ -> Alcotest.fail "locked preflight trace binding missing");
+    Alcotest.(check outcome_testable) "locked preflight replay" outcome
+      (engine_replay ~initial_ctx ~trace v);
+    let tampered = List.map (function
+      | Commit_preflight_executed ({ lock_identity = Some (`Assoc fields); _ }
+          as entry) ->
+          Commit_preflight_executed { entry with lock_identity = Some (`Assoc
+            (("inode", `String "0") :: List.remove_assoc "inode" fields)) }
+      | entry -> entry) trace in
+    let rejected = try ignore (engine_replay ~initial_ctx ~trace:tampered v);
+        false with Engine.Replay_mismatch _ -> true in
+    Alcotest.(check bool) "lock marker tamper rejected" true rejected)
+
+let test_commit_preflight_lock_fail_closed () =
+  with_lock_test_tree (fun root _state ->
+    let lock_rel = ".campaign-state/.manifest-write.lock" in
+    let lock_path = Filename.concat root lock_rel in
+    let calls = ref 0 in
+    let backend = Backend.stub ~run_command:(fun ~id:_ ~argv:_ ~working_dir:_
+      ~timeout_ms:_ ~observe:_ ~stdin_content:_ -> incr calls;
+      { exit = 0; stdout = {|{"ready":true,"tx":"abc"}|}; stderr = "";
+        truncated = false; files = [] }) () in
+    let run wf = engine_run ~backend ~run_allowlist:[ "preflight" ]
+      ~initial_ctx:[ ("transaction", `Assoc []) ] ~token:(Some "approve")
+      (validate_ok ~floor:[ "approved-data" ] wf) in
+    Unix.symlink "elsewhere" lock_path;
+    let symlinked, _ = run (commit_preflight_workflow ~working_dir:root
+      ~lock_file:lock_rel ()) in
+    (match symlinked with Blocked _ -> ()
+     | _ -> Alcotest.fail "symlink lock must block");
+    Sys.remove lock_path;
+    Unix.mkdir lock_path 0o700;
+    let nonregular, _ = run (commit_preflight_workflow ~working_dir:root
+      ~lock_file:lock_rel ()) in
+    (match nonregular with Blocked _ -> ()
+     | _ -> Alcotest.fail "non-regular lock must block");
+    Unix.rmdir lock_path;
+    let hardlink_source = Filename.concat root "hardlink-source" in
+    write_test_file hardlink_source "";
+    Unix.link hardlink_source lock_path;
+    let hardlinked, _ = run (commit_preflight_workflow ~working_dir:root
+      ~lock_file:lock_rel ()) in
+    (match hardlinked with Blocked _ -> ()
+     | _ -> Alcotest.fail "multiply-linked lock must block");
+    Sys.remove lock_path;
+    Sys.remove hardlink_source;
+    write_test_file lock_path "";
+    let busy_marker = Filename.concat root "busy" in
+    let holder = Unix.create_process "/usr/bin/flock"
+      [| "/usr/bin/flock"; lock_path; "/bin/sh"; "-c";
+         "touch \"$1\"; sleep 0.5"; "holder"; busy_marker |]
+      Unix.stdin Unix.stdout Unix.stderr in
+    let rec wait_marker n =
+      if Sys.file_exists busy_marker then ()
+      else if n = 0 then Alcotest.fail "flock holder did not acquire"
+      else (Unix.sleepf 0.01; wait_marker (n - 1)) in
+    wait_marker 50;
+    let busy, _ = run (commit_preflight_workflow ~working_dir:root
+      ~lock_file:lock_rel ()) in
+    (match busy with Blocked _ -> ()
+     | _ -> Alcotest.fail "busy lock must block without waiting");
+    ignore (Unix.waitpid [] holder);
+    Alcotest.(check int) "lock failures never dispatch command" 0 !calls;
+    let failing_backend = Backend.stub ~run_command:(fun ~id:_ ~argv:_
+      ~working_dir:_ ~timeout_ms:_ ~observe:_ ~stdin_content:_ ->
+      { exit = 9; stdout = "{}"; stderr = ""; truncated = false; files = [] }) () in
+    let failed, _ = engine_run ~backend:failing_backend
+      ~run_allowlist:[ "preflight" ]
+      ~initial_ctx:[ ("transaction", `Assoc []) ] ~token:(Some "approve")
+      (validate_ok ~floor:[ "approved-data" ]
+        (commit_preflight_workflow ~working_dir:root ~lock_file:lock_rel ())) in
+    (match failed with Blocked _ -> ()
+     | _ -> Alcotest.fail "failing locked preflight must block");
+    let acquired_after_failure = match Secure_fs.with_exclusive_lock ~root
+      ~relative:lock_rel (fun _ -> true) with Ok true -> true | _ -> false in
+    Alcotest.(check bool) "lock released after blocked preflight" true
+      acquired_after_failure)
+
+let test_commit_preflight_lock_inode_swap () =
+  with_lock_test_tree (fun root _state ->
+    let lock_rel = ".campaign-state/.manifest-write.lock" in
+    let lock_path = Filename.concat root lock_rel in
+    let old_path = lock_path ^ ".old" in
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_
+        ~stdin_content:_ =
+      Sys.rename lock_path old_path;
+      write_test_file lock_path "replacement";
+      { exit = 0; stdout = {|{"ready":true,"tx":"abc"}|}; stderr = "";
+        truncated = false; files = [] } in
+    let wf = commit_preflight_workflow ~working_dir:root
+      ~lock_file:lock_rel () in
+    let outcome, trace = engine_run
+      ~backend:(Backend.stub ~run_command ()) ~run_allowlist:[ "preflight" ]
+      ~initial_ctx:[ ("transaction", `Assoc []) ] ~token:(Some "approve")
+      (validate_ok ~floor:[ "approved-data" ] wf) in
+    (match outcome with Blocked reason ->
+       Alcotest.(check bool) "inode swap reason" true
+         (contains_substring reason "inode changed")
+     | _ -> Alcotest.fail "lock inode swap must block Commit");
+    Alcotest.(check bool) "inode swap emits no Commit" false
+      (List.exists (function Committed_step _ -> true | _ -> false) trace);
+    Alcotest.(check outcome_testable) "inode swap rejection replays" outcome
+      (engine_replay ~initial_ctx:[ ("transaction", `Assoc []) ] ~trace
+        (validate_ok ~floor:[ "approved-data" ] wf)));
+  with_lock_test_tree (fun root _state ->
+    let lock_rel = ".campaign-state/.manifest-write.lock" in
+    let lock_path = Filename.concat root lock_rel in
+    let run_command ~id:_ ~argv:_ ~working_dir:_ ~timeout_ms:_ ~observe:_
+        ~stdin_content:_ =
+      Sys.remove lock_path;
+      { exit = 0; stdout = {|{"ready":true,"tx":"abc"}|}; stderr = "";
+        truncated = false; files = [] } in
+    let wf = commit_preflight_workflow ~working_dir:root
+      ~lock_file:lock_rel () in
+    let initial_ctx = [ ("transaction", `Assoc []) ] in
+    let outcome, trace = engine_run ~backend:(Backend.stub ~run_command ())
+      ~run_allowlist:[ "preflight" ] ~initial_ctx ~token:(Some "approve")
+      (validate_ok ~floor:[ "approved-data" ] wf) in
+    (match outcome with Blocked _ -> ()
+     | _ -> Alcotest.fail "removed lock path must block Commit");
+    (match trace with
+    | [ Gate_evaluated _;
+        Commit_preflight_executed { lock_identity_valid = Some false;
+          receipt = None; _ }; Blocked_at _ ] -> ()
+    | _ -> Alcotest.fail "lock removal must retain result and failed verdict");
+    Alcotest.(check outcome_testable) "lock removal rejection replays" outcome
+      (engine_replay ~initial_ctx ~trace
+        (validate_ok ~floor:[ "approved-data" ] wf)))
+
 let test_commit_preflight_parse_lint_compiler () =
   let raw = {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["transaction"],"stdout_schema":{"ready":"bool"}}}]}|} in
   let wf = match Workflow_json.of_string raw with
@@ -4167,7 +4396,9 @@ let test_commit_preflight_parse_lint_compiler () =
   List.iter (fun bad -> match Workflow_json.of_string bad with
     | Error _ -> () | Ok _ -> Alcotest.fail "invalid preflight accepted")
     [ {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":[],"stdout_schema":{"ready":"bool"}}}]}|};
-      {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["x"],"stdout_schema":{"ready":"bool"},"observe":["."]}}]}|} ]
+      {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["x"],"stdout_schema":{"ready":"bool"},"observe":["."]}}]}|};
+      {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["x"],"stdout_schema":{"ready":"bool"},"lock_file":"../escape"}}]}|};
+      {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["cwr.commit_lock"],"stdout_schema":{"ready":"bool"},"lock_file":".campaign-state/.manifest-write.lock"}}]}|} ]
 
 let () =
   let test_agent_structured_input_parses_and_roundtrips () =
@@ -4319,6 +4550,15 @@ let () =
           Alcotest.test_case
             "Commit preflight fail-closes exit/truncation/schema/authority"
             `Quick test_commit_preflight_fail_closed;
+          Alcotest.test_case
+            "Commit preflight lock linearizes receipt and blocks writer"
+            `Quick test_commit_preflight_lock_linearizes;
+          Alcotest.test_case
+            "Commit preflight lock fail-closes filesystem/contention"
+            `Quick test_commit_preflight_lock_fail_closed;
+          Alcotest.test_case
+            "Commit preflight lock inode swap blocks Commit"
+            `Quick test_commit_preflight_lock_inode_swap;
           Alcotest.test_case
             "Commit preflight parser/lint/compiler contract"
             `Quick test_commit_preflight_parse_lint_compiler;

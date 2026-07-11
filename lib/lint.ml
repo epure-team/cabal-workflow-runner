@@ -478,6 +478,15 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
       Option.iter
         (fun ({ input; _ } : commit_preflight) ->
           List.iter (fun path ->
+            if path = "cwr.commit_lock"
+               || (String.length path > String.length "cwr.commit_lock"
+                   && String.sub path 0
+                        (String.length "cwr.commit_lock" + 1)
+                      = "cwr.commit_lock.") then
+              acc := { severity = Error;
+                code = "reserved-commit-lock-selector";
+                message = "Commit preflight input must not select reserved engine path cwr.commit_lock";
+                loc } :: !acc;
             check_selected_predecessor ~loc ~produced acc path;
             check_expr_refs ~loc ~produced ~warned_missing acc
               (Expr.Path (String.split_on_char '.' path))) input)

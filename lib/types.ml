@@ -53,6 +53,7 @@ type commit_preflight = {
   timeout_ms : int option;
   input : string list;
   stdout_schema : Schema.t;
+  lock_file : string option;
 }
 
 type step =
@@ -207,6 +208,9 @@ type trace_entry =
       parsed : Yojson.Safe.t option;
       result : run_result;
       receipt : Yojson.Safe.t option;
+      lock_file : string option;
+      lock_identity : Yojson.Safe.t option;
+      lock_identity_valid : bool option;
     }
   | Committed_step of {
       id : string;
