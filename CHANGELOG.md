@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+**`proof-carrying-change` example workflow.** A first assembly of cwr with
+[arch-index](https://github.com/epure-team/arch-index): gates an agent-authored code
+change on arch-index's change-impact and architecture-fitness-function verdicts
+(`arch-impact`/`arch-rules --format json`) via five floor gates
+(`g-computed`/`g-sound`/`g-no-new-findings`/`g-rules-pass`/`g-independent`), a governed
+correction loop, and an independent reviewer agent that is additive to the tooled gates,
+never a substitute for them. See `examples/proof-carrying-change.workflow.json` and
+`docs/proof-carrying-change.md`. `test/test_pcc.ml` adds eight backend-stubbed scenarios
+(T1–T8) covering the nominal path, a persistent-findings governor stop, arch-impact's
+sound-refusal path, an un-⊤-marked index, reviewer rejection, a missing approval token, a
+float rejected on structured Run stdout, and ledger replay of a `Blocked` outcome.
+
 ## v0.19.0
 
 **Run-start approval ledger identity.** `run --ledger` now initializes its
