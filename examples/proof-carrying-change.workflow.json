@@ -43,13 +43,13 @@
                               "failing": "int" } },
 
         { "kind": "agent", "id": "fixer", "read_only": false,
-          "prompt": "outputs.impact and outputs.rules in the run context carry this iteration's verdicts — findings on touched lines and failing/vacuous/not-computed rule counts. Fix what they name (or, if outputs.impact.parsed.computed is false, the index carries no decision analysis and no amount of code fixing will change that — say so and stop). Report progressed=true iff you changed something material since the last iteration, done=true iff you believe every gate below will now pass.",
+          "prompt": "outputs.impact and outputs.rules in the run context carry this iteration's verdicts — findings on touched lines and failing/vacuous/not-computed rule counts. Fix what they name (or, if outputs.impact.parsed.verdict is 'refused', the index carries no decision analysis and no amount of code fixing will change that — say so and stop). Report progressed=true iff you changed something material since the last iteration, done=true iff you believe every gate below will now pass.",
           "output_schema": { "progressed": "bool", "done": "bool" } }
       ] },
 
     { "kind": "gate", "id": "g-computed",
       "when": { "and": [
-        { "eq": [ { "path": "outputs.impact.parsed.computed" }, { "lit": true } ] },
+        { "eq": [ { "path": "outputs.impact.parsed.verdict" }, { "lit": "pass" } ] },
         { "eq": [ { "path": "outputs.rules.parsed.computed" },  { "lit": true } ] } ] } },
 
     { "kind": "gate", "id": "g-sound",

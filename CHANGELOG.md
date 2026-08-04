@@ -9,10 +9,24 @@ change on arch-index's change-impact and architecture-fitness-function verdicts
 (`g-computed`/`g-sound`/`g-no-new-findings`/`g-rules-pass`/`g-independent`), a governed
 correction loop, and an independent reviewer agent that is additive to the tooled gates,
 never a substitute for them. See `examples/proof-carrying-change.workflow.json` and
-`docs/proof-carrying-change.md`. `test/test_pcc.ml` adds eight backend-stubbed scenarios
-(T1–T8) covering the nominal path, a persistent-findings governor stop, arch-impact's
-sound-refusal path, an un-⊤-marked index, reviewer rejection, a missing approval token, a
-float rejected on structured Run stdout, and ledger replay of a `Blocked` outcome.
+`docs/proof-carrying-change.md`. `test/test_pcc.ml` covers the nominal path, a
+persistent-findings governor stop, arch-impact's sound-refusal path, an un-⊤-marked index,
+reviewer rejection, a missing approval token, a float rejected on structured Run stdout,
+and ledger replay of a `Blocked` outcome.
+
+**Round-1 review fix.** `g-computed` originally gated on `outputs.impact.parsed.computed`,
+which is `true` on every path that prints a JSON object — including a
+`--fail-on-new-findings` sound refusal, since arch-impact prints its object before running
+the refusal check. A refused run reached the reviewer/`Commit` past four "passing" gates,
+undetected because the test meant to catch it (`T3`) stubbed a `computed:false` root that
+the real tool cannot produce. Fixed: `g-computed` now reads `outputs.impact.parsed.verdict
+== "pass"`, which covers `"fail"` and `"refused"` alike. `T3` rewritten to arch-impact's
+real refusal shape (confirmed red against the old predicate, green after the fix); `T2`
+updated to the gate it now actually hits; a new `T2b` exercises `g-no-new-findings` as the
+belt-and-braces check it always was meant to be, on a synthetic inconsistent stub the real
+tool cannot produce; a new structural test mutates the workflow file to remove each of the
+five floor gates in turn and confirms `Validate.workflow` fails for every one, naming the
+gate — replacing an unverified doc claim with an automated check.
 
 ## v0.19.0
 
