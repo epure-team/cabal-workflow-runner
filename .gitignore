@@ -1,6 +1,7 @@
 _build/
 _opam/
 *.install
+.pcc/
 .claude/
 .harness/
 .roster*

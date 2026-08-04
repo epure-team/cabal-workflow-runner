@@ -14,7 +14,7 @@
 (test
  (name test_pcc)
  (modules test_pcc)
- (libraries cabal_workflow_runner alcotest eio eio_main)
+ (libraries cabal_workflow_runner alcotest eio eio_main unix)
  (deps
   (glob_files %{project_root}/examples/*.json)))
 

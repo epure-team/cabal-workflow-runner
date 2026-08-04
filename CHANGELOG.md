@@ -28,6 +28,39 @@ tool cannot produce; a new structural test mutates the workflow file to remove e
 five floor gates in turn and confirms `Validate.workflow` fails for every one, naming the
 gate — replacing an unverified doc claim with an automated check.
 
+**Round-2 review fix (BLOCKER + 2 MAJOR + minors).** An independent blind-context adversarial
+review found the floor gates read `outputs.impact`/`outputs.rules` — the loop's LAST in-loop
+iteration, bound BEFORE that same iteration's `fixer` step made its final edit. The gates
+certified a tree state one edit older than what actually got committed; neither `reviewer`
+(reads only the gates' own trusted dossier) nor `pcc-preflight` (`dune test`) closed the gap.
+Fixed by adding a post-loop re-verification pass — `reindex-final`/`impact-final`/
+`rules-final`, run once after the loop exits regardless of which governor stopped it — and
+pointing every floor gate and `reviewer`'s `input` at its outputs instead. New regression test
+`T-late-regression` (in-loop clean, fixer declares done anyway, post-loop dirty) confirmed
+red (`Committed`, the bug) against the pre-fix gate wiring and green (`Blocked`) after;
+`T-converge-iter-3` covers genuine multi-iteration convergence with per-call-varying stubs.
+
+Same review found `author`/`fixer` were prompted to read run-context values
+(`ctx.task`, `outputs.impact`/`outputs.rules`) they never actually received: cwr's only
+context channel into a prompt is structured `input`, which requires `read_only:true` — a
+write-access agent can never declare it. Fixed via the engine's other channel: `brief`, a
+file path re-read fresh on every Agent invocation. `author`'s `brief` is `.pcc/task.md`
+(operator-supplied, replacing the broken `--ctx` claim); `fixer`'s is `.pcc/dossier.md`,
+written every loop iteration by a new `dossier` Run step (`pcc-dossier`, a fourth `pcc-*`
+convention binary) from the same `arch-impact`/`arch-rules --format md` the JSON steps just
+ran, against the same tree.
+
+Also: `arch-rules` invocations now pin `--on-unknown fail --on-possible fail --on-vacuous
+fail --on-not-computed fail` explicitly — arch-index's own defaults (`--on-unknown warn` in
+particular) are argued for human PRs, not adversarial agent gating, and left unpinned this
+gate's real strictness lived in another repo's unversioned runtime defaults. Dead
+`pcc-baseline` step removed (nothing ever consumed its output — `arch-impact`'s own
+`new_findings` was already diff-scoped). `docs/proof-carrying-change.md` gained a threat-model
+section for `read_only:false` agents (mitigable via unused `executable_digest`, host
+responsibility, and structural limits, honestly separated) and three new test scenarios
+(`T-rules-fail`, `T-preflight-fails`, plus the two above) exercising floor gates and failure
+paths the first cut never touched.
+
 ## v0.19.0
 
 **Run-start approval ledger identity.** `run --ledger` now initializes its
