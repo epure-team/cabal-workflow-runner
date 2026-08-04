@@ -22,11 +22,29 @@ cannot forget a gate, because a forgotten gate is a validation error, not a sile
 
 | gate |`when` | fails when |
 |---|---|---|
-| `g-computed` | `outputs.impact.parsed.computed == true` AND `outputs.rules.parsed.computed == true` | either tool never produced a real analysis (a `Run`'s result is bound to the context **regardless of its exit code** — see "Why `computed` is not belt-and-braces" below — so this is the primary defense, not a redundant one) |
+| `g-computed` | `outputs.impact.parsed.verdict == "pass"` AND `outputs.rules.parsed.computed == true` | `arch-impact`'s verdict is anything other than a clean pass — `"fail"` (a finding on a touched line) **or** `"refused"` (no decision analysis, exit 3) — or `arch-rules` never ran a real analysis. Gates on `verdict`, not `computed`: see "Why `g-computed` reads `verdict`, not `computed`" below — a round-1 review finding, not the original design |
 | `g-sound` | `outputs.impact.parsed.contract_ok == true` | the index is not ⊤-marked, so the closed-cone claim behind the impact numbers is not trustworthy |
-| `g-no-new-findings` | `outputs.impact.parsed.new_findings == 0` | the diff touches a line that already carries a dead-logic/dead-block finding |
+| `g-no-new-findings` | `outputs.impact.parsed.new_findings == 0` | belt-and-braces alongside `g-computed`'s `verdict` check — arch-impact's real code cannot actually produce `verdict:"pass"` with `new_findings > 0` (both derive from the same finding list), so on today's arch-impact this gate is structurally never the one that fires; it stays as a named, independently-computed check against a future regression in either field, at zero cost (see `test/test_pcc.ml`'s `T2b` for the synthetic scenario that proves it still catches a divergence) |
 | `g-rules-pass` | `outputs.rules.parsed.failing == 0` | an architecture fitness rule fails — and `failing` already counts `VACUOUS` and `NOT_COMPUTED` verdicts as failing by arch-index's own default policy, so this workflow does not have to re-encode that judgment |
 | `g-independent` | `outputs.reviewer.verdict == "approved"` | the independent reviewer agent — reading only the dossier, never the repo — did not approve |
+
+### The exit-code / `verdict` tripartition, and how a `Run` step sees it
+
+`arch-impact` has three outcomes: exit 0 (`verdict:"pass"`), exit 1 (`verdict:"fail"` — a finding
+on a touched line), exit 3 (`verdict:"refused"` — `--fail-on-new-findings` requested but this
+index carries no decision analysis, so "clean" would be a lie about data that was never
+computed). `arch-rules` only ever produces `"pass"`/`"fail"` — it has no process-level refusal;
+an un-⊤-marked or data-less index degrades *individual rules* to `UNKNOWN_NO_CONTRACT`/
+`NOT_COMPUTED` instead (see arch-index's `docs/fitness-functions.md`). Exit 2 (malformed input or
+infrastructure error) never reaches this workflow as a considered verdict at all — see cwr's own
+tripartition below.
+
+| arch-impact exit | `verdict` | this workflow's `g-computed` |
+|---|---|---|
+| 0 | `"pass"` | passes (assuming `g-rules-pass`/rules side is also clean) |
+| 1 | `"fail"` | blocks |
+| 3 | `"refused"` | blocks — same gate, same treatment as `"fail"`, never read as a pass |
+| 2 | *(no JSON printed)* | the `Run` step itself aborts on an unparseable/empty stdout — see below, this never reaches a gate at all |
 
 Every `when` follows the "UNKNOWN ≠ NO" discipline: each predicate requires the **positive
 presence** of a computed value (`eq [...; {"lit":true}]` or `eq [...; {"lit":0}]`), never the
@@ -34,7 +52,7 @@ absence of a problem. A missing path evaluates `false` in cwr's total `Expr.eval
 property — a missing key never raises, it just makes the predicate false), so a bug that silently
 drops a field fails the gate instead of silently passing it.
 
-## Why `computed` is not belt-and-braces
+## Why `g-computed` reads `verdict`, not `computed`
 
 A naive reading of `Run { stdout_schema }` might assume a nonzero exit code fails the step. It does
 not: `lib/engine.ml`'s `Run` handling never inspects `result.exit` before binding the parsed
@@ -43,13 +61,26 @@ and pass/fail is entirely a downstream `Gate`'s job. (Contrast `Commit`'s `prefl
 fail-close on a nonzero exit — a different, stricter contract for the one step that can file.)
 
 This matters concretely for `arch-impact`: its `--fail-on-new-findings` sound-refusal path prints
-its full JSON object (with `computed:false`) **and then** exits 3 — the print happens before the
-refusal check. So a refused run is *not* rejected by cwr's Run machinery; it reaches the context
-exactly like a clean run does, and `g-computed` is the only thing standing between a refusal and
-`g-independent`/`Commit`. Dropping `g-computed` would not just be redundant-but-safe — it would be
-a real hole (verified: `test/test_pcc.ml`'s "T3" scenario, and a mutation check that removes the
-gate from the workflow file and confirms every scenario then fails at the validator, before the
-engine ever runs).
+its **full JSON object first** — with root **`computed:true`**, same as any clean run; only the
+nested `findings.computed` goes `false` — and only *then* exits 3. So a refused run is not
+rejected by cwr's `Run` machinery; it reaches the context exactly like a clean run does, and a
+gate reading root `computed` alone would pass it straight through: `computed:true` is on **every**
+path that prints an object at all, refusal included. `outputs.impact.parsed.verdict` is the field
+that actually distinguishes `"pass"` from `"refused"`, so `g-computed` gates on it instead.
+
+**This was a real bug in the first cut of this workflow**, caught in round-1 review: `g-computed`
+originally read `outputs.impact.parsed.computed == true`, which a real refusal always satisfies —
+the gate that was supposed to be the one thing standing between a refusal and `Commit` did not
+actually stand there. The test that was meant to catch it (`T3`) did not, because its stub
+encoded the wrong shape (`computed:false` at the root — a form the real tool cannot produce) and
+so never exercised the actual bug. Fixed by reading `verdict` instead — which the `test/test_pcc.ml`
+`T3` scenario now builds from arch-index's real refusal shape (`computed:true`,
+`verdict:"refused"`, `findings.computed:false`) and confirms blocks at `g-computed`, and which
+`test_each_floor_gate_is_load_bearing` confirms *structurally*: it mutates the workflow file to
+remove each of the five floor gates in turn (including `g-computed`) and asserts
+`Validate.workflow` fails, naming the missing gate, for every one of them — an automated,
+in-suite version of the manual check done during review, not just a claim about what the
+validator would do.
 
 ## The `pcc-*` convention
 
@@ -95,22 +126,40 @@ this workflow file, same as the live-agent dispatch phase (EP-05) is out of scop
 
 ## Testing without a backend or an LLM
 
-`test/test_pcc.ml` runs eight scenarios (T1–T8) entirely against `Backend.stub` — no cabal, no
-LLM, no real subprocess — exercising only the engine's interpretation of the workflow file against
-hand-written JSON that matches arch-index's documented contract:
+`test/test_pcc.ml` runs against `Backend.stub` — no cabal, no LLM, no real subprocess —
+exercising only the engine's interpretation of the workflow file against hand-written JSON that
+matches arch-index's documented contract. Two workflow-structure tests, plus nine scenarios
+(T1–T8 and T2b):
 
 | # | scenario | expected outcome |
 |---|---|---|
+| — | the real workflow file lints/validates against the five floor gates | `Ok` |
+| — | each floor gate is load-bearing | mutating the workflow to remove any one of the five fails `Validate.workflow`, naming the missing gate — the automated version of the round-1 review's manual check |
 | T1 | nominal: tools clean, fixer converges on iteration 1, reviewer approves, token supplied | `Committed`; ledger round-trips; replay executes zero subprocesses |
-| T2 | `new_findings > 0` on every iteration, fixer never converges | the loop stops on its `Max_iters` governor, then `Blocked` at `g-no-new-findings` by name |
-| T3 | index carries no decision analysis (`arch-impact` refuses, `computed:false`) | `Blocked` at `g-computed` specifically — not a crash, not confused with the exit-3 refusal itself |
+| T2 | `new_findings > 0` on every iteration (`verdict:"fail"`), fixer never converges | the loop stops on its `Max_iters` governor, then `Blocked` at `g-computed` — `verdict != "pass"` catches it before `g-no-new-findings` gets a turn |
+| T2b | a *synthetic* inconsistent stub: `verdict:"pass"` but `new_findings:1` (real arch-impact cannot produce this — both fields derive from the same finding list) | `g-computed` passes (verdict says pass), `g-no-new-findings` still blocks — proves the belt-and-braces gate catches what the verdict check, by construction, cannot |
+| T3 | index carries no decision analysis — `arch-impact` refuses, real shape (`computed:true`, `verdict:"refused"`, `findings.computed:false`) | `Blocked` at `g-computed` specifically — not a crash, not confused with a clean run (this is the scenario that exposed the round-1 bug once its stub was corrected to the real shape) |
 | T4 | index not ⊤-marked (`contract_ok:false`) | `Blocked` at `g-sound` |
 | T5 | every tooled gate passes, reviewer rejects | `Blocked` at `g-independent` |
 | T6 | everything approved, no runtime token supplied | `Blocked` at the `Commit` step itself |
-| T7 | a stub prints a float where the schema declares `int` | `Aborted`, never a silent pass (see the code comment in `test_pcc.ml` for the exact rejection path — it is stricter than SPEC.md's attestation-only float caveat suggests: `parse_run_stdout` rejects floats/`Intlit` unconditionally, on every structured `Run`/preflight stdout, whether or not the workflow has an `Attest` step) |
-| T8 | replaying a `Blocked` run (T2) from a serialised ledger | byte-identical outcome, zero subprocesses executed on replay |
+| T7 | a stub prints a float where the schema declares `int` | `Aborted`, never a silent pass — `parse_run_stdout` rejects floats/`Intlit` unconditionally, on every structured `Run`/preflight stdout, with or without an `Attest` step in the workflow |
+| T8 | replaying a `Blocked` run (T2's shape) from a serialised ledger | the same terminal outcome reproduced, zero subprocesses executed on replay |
 
 Run them with `dune test`, or standalone with `dune exec test/test_pcc.exe`.
+
+**A note on "byte-identical" replay.** The actual byte-identical guarantee is `Engine.replay`
+succeeding at all — it raises `Replay_mismatch` on any structural divergence from the recorded
+trace (an entry out of order, ill-typed, or left over after the walk completes). T1/T8's
+`outcome_testable` assertions are a coarser, additional check that the terminal outcome *string*
+also matches; they're worth having, but don't call them "the proof" — the absence of an exception
+already is one.
+
+**A caveat on `Run` stdout size.** `stdout_schema`-validated stdout is capped at 64 KiB
+(`lib/engine.ml`'s runner truncation); a very large diff could in principle push `arch-impact`'s
+JSON (whose lists are unbounded — see arch-index's `docs/change-impact.md`) past that cap. The
+failure mode is explicit, not silent: `parse_run_stdout` errors `"stdout was truncated"` and the
+`Run` step `Aborted`s, same as any other structured-stdout rejection — it does not read as a
+pass. Worth knowing about before pointing this workflow at a repo with unusually large diffs.
 
 ## What this is not
 

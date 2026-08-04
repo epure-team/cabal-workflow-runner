@@ -18,6 +18,16 @@ let floor_gates =
 let pcc_allowlist =
   [ "pcc-index"; "pcc-baseline"; "arch-impact"; "arch-rules"; "pcc-preflight" ]
 
+let read_file path =
+  let ic = open_in_bin path in
+  let n = in_channel_length ic in
+  let s = really_input_string ic n in
+  close_in ic ; s
+
+let raw_workflow_json () =
+  Yojson.Safe.from_string
+    (read_file (project_path "examples/proof-carrying-change.workflow.json"))
+
 let load_workflow () =
   match Workflow_json.of_file (project_path "examples/proof-carrying-change.workflow.json") with
   | Ok wf -> wf
@@ -63,10 +73,24 @@ let index_ok functions =
 let baseline_ok findings =
   `Assoc [ ("computed", jbool true); ("findings", jint findings) ]
 
-let impact_json ~computed ~contract_ok ~verdict ~new_findings =
+(* The real arch-impact ALWAYS prints root "computed":true when it prints an object at all — the
+   whole object, including a --fail-on-new-findings refusal, is assembled and printed BEFORE the
+   refusal check runs (bin/arch_impact/arch_impact.ml: the JSON block precedes the
+   --fail-on-new-findings block). So root `computed` can never distinguish a refusal from a clean
+   run; only `verdict` (and, for the refusal specifically, `findings.computed`) can. This helper
+   makes that impossible to get wrong by construction: there is no `~computed` parameter to set to
+   `false` by mistake — see the workflow's g-computed fix (F1, WR-02 round-1 review) for what this
+   cost when a test stub encoded the wrong shape. *)
+let impact_json ?(findings_computed = true) ~contract_ok ~verdict ~new_findings () =
   `Assoc
-    [ ("computed", jbool computed); ("contract_ok", jbool contract_ok);
-      ("verdict", jstr verdict); ("new_findings", jint new_findings) ]
+    [ ("computed", jbool true); ("contract_ok", jbool contract_ok);
+      ("verdict", jstr verdict); ("new_findings", jint new_findings);
+      ("findings",
+       `Assoc
+         [ ("computed", jbool findings_computed);
+           ("reason",
+            if findings_computed then `Null
+            else jstr "no decision analysis in this index — absence of data, not absence of findings") ]) ]
 
 let rules_json ~computed ~contract_ok ~verdict ~failing =
   `Assoc
@@ -110,6 +134,28 @@ let backend ?fixer_seq ?reviewer ?author ?agent_calls ?run_calls run_table =
     ~run_command:(run_command_stub ?calls:run_calls run_table)
     ()
 
+(* Removes the top-level gate step with the given id from the workflow's raw JSON, so
+   test_floor_gate_is_load_bearing can confirm the validator actually depends on it — rather than
+   asserting a claim about the validator's behavior without exercising it. *)
+let workflow_json_without_gate ~id =
+  match raw_workflow_json () with
+  | `Assoc fields ->
+      let steps =
+        match List.assoc "steps" fields with `List l -> l | _ -> assert false
+      in
+      let is_target = function
+        | `Assoc step_fields ->
+            List.assoc_opt "kind" step_fields = Some (`String "gate")
+            && List.assoc_opt "id" step_fields = Some (`String id)
+        | _ -> false
+      in
+      let steps' = List.filter (fun s -> not (is_target s)) steps in
+      Alcotest.(check bool)
+        (Printf.sprintf "gate %S was present to remove" id)
+        true (List.length steps' = List.length steps - 1) ;
+      `Assoc (List.map (fun (k, v) -> if k = "steps" then (k, `List steps') else (k, v)) fields)
+  | _ -> Alcotest.fail "workflow root is not a JSON object"
+
 let has_blocked_at ~id trace =
   List.exists (function Blocked_at { id = rid; _ } -> rid = id | _ -> false) trace
 
@@ -131,7 +177,7 @@ let test_t1_nominal () =
     [ ("index", run_result_of (index_ok 42)); ("baseline", run_result_of (baseline_ok 0));
       ("reindex", run_result_of (index_ok 42));
       ("impact",
-       run_result_of (impact_json ~computed:true ~contract_ok:true ~verdict:"pass" ~new_findings:0));
+       run_result_of (impact_json ~contract_ok:true ~verdict:"pass" ~new_findings:0 ()));
       ("rules",
        run_result_of (rules_json ~computed:true ~contract_ok:true ~verdict:"pass" ~failing:0));
       ("submit", run_result_of (preflight_ok 12)) ]
@@ -148,20 +194,32 @@ let test_t1_nominal () =
   | Error e -> Alcotest.failf "T1: ledger did not round-trip: %s" e
   | Ok replay_trace ->
       let before_index = Option.value ~default:0 (Hashtbl.find_opt run_calls "index") in
+      (* The byte-identical guarantee is Engine.replay succeeding at all — it raises
+         Replay_mismatch on any structural divergence (a trace entry out of order, ill-typed, or
+         left over after the walk completes). This outcome_testable check is a coarser,
+         additional confirmation that the terminal outcome STRING also matches; it does not by
+         itself prove byte-identity (two structurally different traces could share an outcome
+         string), so don't read its name as the whole proof. *)
       let replayed = engine_replay ~trace:replay_trace (validated ()) in
-      Alcotest.(check outcome_testable) "T1: replay is byte-identical" outcome replayed;
+      Alcotest.(check outcome_testable) "T1: replay reproduces the same terminal outcome" outcome
+        replayed;
       Alcotest.(check int) "T1: replay executed NO subprocess" before_index
         (Option.value ~default:0 (Hashtbl.find_opt run_calls "index"))
 
 (* ---- T2: new_findings > 0 on every iteration — the fixer never converges, the loop stops on
-   its max_iters governor, and g-no-new-findings blocks (named explicitly, not a crash) ---- *)
+   its max_iters governor, and g-computed blocks (round-1 review fix, F1: a non-"pass" verdict —
+   "fail" here, "refused" in T3 — is exactly what g-computed's impact.parsed.verdict conjunct now
+   catches; g-no-new-findings never gets a turn to fire on THIS scenario, because g-computed is
+   strictly upstream of it and arch-impact's own verdict already reflects new_findings > 0 given
+   the workflow's fixed --fail-on-new-findings invocation. See test_t2b below for a scenario that
+   actually exercises g-no-new-findings as a distinct defense.) ---- *)
 
 let test_t2_findings_persist () =
   let table =
     [ ("index", run_result_of (index_ok 10)); ("baseline", run_result_of (baseline_ok 0));
       ("reindex", run_result_of (index_ok 10));
       ("impact",
-       run_result_of (impact_json ~computed:true ~contract_ok:true ~verdict:"fail" ~new_findings:1));
+       run_result_of (impact_json ~contract_ok:true ~verdict:"fail" ~new_findings:1 ()));
       ("rules",
        run_result_of (rules_json ~computed:true ~contract_ok:true ~verdict:"pass" ~failing:0)) ]
   in
@@ -174,14 +232,43 @@ let test_t2_findings_persist () =
   (match outcome with
   | Blocked _ -> ()
   | o -> Alcotest.failf "T2: expected Blocked, got %s" (Types.string_of_outcome o));
-  Alcotest.(check bool) "T2: blocked at g-no-new-findings, not some other gate" true
-    (has_blocked_at ~id:"g-no-new-findings" trace);
-  Alcotest.(check bool) "T2: g-computed and g-sound were NOT the block point" false
-    (has_blocked_at ~id:"g-computed" trace || has_blocked_at ~id:"g-sound" trace);
+  Alcotest.(check bool) "T2: blocked at g-computed (verdict != pass), not some other gate" true
+    (has_blocked_at ~id:"g-computed" trace);
+  Alcotest.(check bool) "T2: g-sound was NOT the block point" false (has_blocked_at ~id:"g-sound" trace);
   Alcotest.(check bool) "T2: the loop ran to its Max_iters governor, not once"
     true
     (4 <= Option.value ~default:0 (Hashtbl.find_opt agent_calls "fixer"));
   Alcotest.(check bool) "T2: reviewer/commit never reached" false (ran_agent "reviewer" trace)
+
+(* ---- T2b: defense-in-depth for g-no-new-findings. arch-impact's real code cannot actually
+   produce a "pass" verdict alongside new_findings > 0 — the two are computed from the same `decs`
+   list (see arch_impact.ml) — so this scenario is deliberately SYNTHETIC: it feeds the engine an
+   inconsistent stub (a hypothetical arch-impact regression, or a tampered/forged Run result) to
+   prove g-no-new-findings still catches what g-computed's verdict check would, by construction,
+   miss. This is the concrete justification for keeping BOTH gates (round-1 review's option (a)),
+   rather than "readability" alone. ---- *)
+
+let test_t2b_belt_and_braces_no_new_findings () =
+  let table =
+    [ ("index", run_result_of (index_ok 10)); ("baseline", run_result_of (baseline_ok 0));
+      ("reindex", run_result_of (index_ok 10));
+      (* verdict LIES "pass", but new_findings says otherwise — not a real arch-impact output. *)
+      ("impact",
+       run_result_of (impact_json ~contract_ok:true ~verdict:"pass" ~new_findings:1 ()));
+      ("rules",
+       run_result_of (rules_json ~computed:true ~contract_ok:true ~verdict:"pass" ~failing:0)) ]
+  in
+  let fixer_seq = [ `Assoc [ ("progressed", jbool false); ("done", jbool true) ] ] in
+  let b = backend ~fixer_seq table in
+  let outcome, trace = engine_run ~backend:b ~token:(Some "tok") (validated ()) in
+  (match outcome with
+  | Blocked _ -> ()
+  | o -> Alcotest.failf "T2b: expected Blocked, got %s" (Types.string_of_outcome o));
+  Alcotest.(check bool) "T2b: g-computed passed (verdict says pass — that's the point)" false
+    (has_blocked_at ~id:"g-computed" trace);
+  Alcotest.(check bool) "T2b: g-no-new-findings caught what verdict alone would have missed" true
+    (has_blocked_at ~id:"g-no-new-findings" trace);
+  Alcotest.(check bool) "T2b: reviewer/commit never reached" false (ran_agent "reviewer" trace)
 
 (* ---- T3: index carries no decision analysis — arch-impact refuses (computed:false); Blocked
    on g-computed specifically, never a crash, never a silent pass ---- *)
@@ -195,7 +282,7 @@ let test_t3_no_decision_analysis () =
          Gate is the only line of defense). *)
       ("impact",
        run_result_of ~exit:3
-         (impact_json ~computed:false ~contract_ok:true ~verdict:"refused" ~new_findings:0));
+         (impact_json ~findings_computed:false ~contract_ok:true ~verdict:"refused" ~new_findings:0 ()));
       ("rules",
        run_result_of (rules_json ~computed:true ~contract_ok:true ~verdict:"pass" ~failing:0)) ]
   in
@@ -224,7 +311,7 @@ let test_t4_not_sound () =
       ("reindex", run_result_of (index_ok 5));
       ("impact",
        run_result_of
-         (impact_json ~computed:true ~contract_ok:false ~verdict:"pass" ~new_findings:0));
+         (impact_json ~contract_ok:false ~verdict:"pass" ~new_findings:0 ()));
       ("rules",
        run_result_of (rules_json ~computed:true ~contract_ok:false ~verdict:"pass" ~failing:0)) ]
   in
@@ -244,7 +331,7 @@ let test_t5_reviewer_rejects () =
     [ ("index", run_result_of (index_ok 5)); ("baseline", run_result_of (baseline_ok 0));
       ("reindex", run_result_of (index_ok 5));
       ("impact",
-       run_result_of (impact_json ~computed:true ~contract_ok:true ~verdict:"pass" ~new_findings:0));
+       run_result_of (impact_json ~contract_ok:true ~verdict:"pass" ~new_findings:0 ()));
       ("rules",
        run_result_of (rules_json ~computed:true ~contract_ok:true ~verdict:"pass" ~failing:0)) ]
   in
@@ -267,7 +354,7 @@ let test_t6_no_token () =
     [ ("index", run_result_of (index_ok 5)); ("baseline", run_result_of (baseline_ok 0));
       ("reindex", run_result_of (index_ok 5));
       ("impact",
-       run_result_of (impact_json ~computed:true ~contract_ok:true ~verdict:"pass" ~new_findings:0));
+       run_result_of (impact_json ~contract_ok:true ~verdict:"pass" ~new_findings:0 ()));
       ("rules",
        run_result_of (rules_json ~computed:true ~contract_ok:true ~verdict:"pass" ~failing:0));
       ("submit", run_result_of (preflight_ok 12)) ]
@@ -283,16 +370,10 @@ let test_t6_no_token () =
     (has_blocked_at ~id:"g-independent" trace)
 
 (* ---- T7: pcc-index prints a float where the schema declares int — the run aborts, never a
-   silent green. [VÉRIFIER] (see final report): cwr's Run-stdout path rejects floats/Intlit
-   UNCONDITIONALLY via Canonical_json.to_string inside parse_run_stdout (engine.ml ~line 124),
-   before the declared Schema.validate type check ever runs — this is stronger than SPEC.md §
-   "Authenticated export trust boundary" implies ("Floats and Intlit are rejected only for
-   attestation-bearing workflows..."), which describes a DIFFERENT, additional restriction on
-   Attest's own selected/signed values. A workflow with no Attest step still gets this rejection
-   on every structured Run/Commit-preflight stdout. Confirmed empirically: the actual Aborted
-   reason is "... $.functions: floats are not canonical; use an integer", not a
-   "schema mismatch: functions" — arch-index's own float-free JSON contract (arch-index PR
-   feat(json): machine-output contract) was the right call independent of this. ---- *)
+   silent green. cwr's Run-stdout path rejects floats/Intlit unconditionally, via
+   Canonical_json.to_string inside parse_run_stdout (engine.ml, ahead of Schema.validate) — for
+   every structured Run/preflight, with or without an Attest step in the workflow. The Aborted
+   reason names the field and says "not canonical", not "schema mismatch". ---- *)
 
 let test_t7_float_in_json () =
   let bad_index : run_result =
@@ -322,7 +403,7 @@ let test_t8_replay_t2_from_ledger () =
     [ ("index", run_result_of (index_ok 10)); ("baseline", run_result_of (baseline_ok 0));
       ("reindex", run_result_of (index_ok 10));
       ("impact",
-       run_result_of (impact_json ~computed:true ~contract_ok:true ~verdict:"fail" ~new_findings:1));
+       run_result_of (impact_json ~contract_ok:true ~verdict:"fail" ~new_findings:1 ()));
       ("rules",
        run_result_of (rules_json ~computed:true ~contract_ok:true ~verdict:"pass" ~failing:0)) ]
   in
@@ -336,22 +417,51 @@ let test_t8_replay_t2_from_ledger () =
   | Error e -> Alcotest.failf "T8: ledger did not round-trip: %s" e
   | Ok replay_trace ->
       let before = Option.value ~default:0 (Hashtbl.find_opt run_calls "impact") in
+      (* See T1's comment: Replay_mismatch-free consumption is the byte-identical proof; this is
+         the coarser terminal-outcome-string confirmation on top of it. *)
       let replayed = engine_replay ~trace:replay_trace (validated ()) in
-      Alcotest.(check outcome_testable) "T8: replay of a Blocked run is byte-identical" outcome
+      Alcotest.(check outcome_testable) "T8: replay reproduces the same terminal outcome" outcome
         replayed;
       Alcotest.(check int) "T8: replay executed NO subprocess" before
         (Option.value ~default:0 (Hashtbl.find_opt run_calls "impact"))
+
+(* Each of the five floor gates is load-bearing: removing ANY one of them from the workflow file
+   must make Validate.workflow fail (naming the missing gate), never silently accept a Commit
+   path that skips it. This is the automated form of the manual "remove a gate, watch every
+   scenario fail at validation" check done during round-1 review — implemented as a real test
+   rather than left as an unverified claim in the docs. *)
+let test_each_floor_gate_is_load_bearing () =
+  List.iter
+    (fun id ->
+      let mutated = workflow_json_without_gate ~id in
+      match Workflow_json.of_json mutated with
+      | Error e ->
+          Alcotest.failf "removing gate %S should still leave a PARSEABLE workflow: %s" id e
+      | Ok wf -> (
+          match Validate.workflow ~floor_gates wf with
+          | Ok _ ->
+              Alcotest.failf
+                "removing floor gate %S must fail validation, not silently validate" id
+          | Error msg ->
+              Alcotest.(check bool)
+                (Printf.sprintf "validation error for a missing %S names it" id)
+                true (contains_substring msg id)))
+    floor_gates
 
 let () =
   Alcotest.run "proof-carrying-change"
     [ ( "workflow",
         [ Alcotest.test_case "lints/validates against the 5 floor gates" `Quick (fun () ->
-              ignore (validated ())) ] );
+              ignore (validated ()));
+          Alcotest.test_case "each floor gate is load-bearing (removing it fails validation)"
+            `Quick test_each_floor_gate_is_load_bearing ] );
       ( "scenarios",
         [ Alcotest.test_case "T1 nominal path -> Committed, replay byte-identical" `Quick
             test_t1_nominal;
-          Alcotest.test_case "T2 persistent findings -> governor stop, Blocked g-no-new-findings"
+          Alcotest.test_case "T2 persistent findings -> governor stop, Blocked g-computed"
             `Quick test_t2_findings_persist;
+          Alcotest.test_case "T2b belt-and-braces: g-no-new-findings catches what verdict misses"
+            `Quick test_t2b_belt_and_braces_no_new_findings;
           Alcotest.test_case "T3 no decision analysis -> Blocked g-computed, not a crash" `Quick
             test_t3_no_decision_analysis;
           Alcotest.test_case "T4 not ⊤-marked -> Blocked g-sound" `Quick test_t4_not_sound;
