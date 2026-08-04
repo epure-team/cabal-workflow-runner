@@ -30,6 +30,11 @@ a loop that hits the ceiling replays byte-identically. See [`SPEC.md`](SPEC.md) 
 
 The project is **domain-neutral**. [`examples/bounty.workflow.json`](examples/bounty.workflow.json)
 is just one illustration — the bounty pipeline expressed as a single workflow file.
+[`examples/proof-carrying-change.workflow.json`](examples/proof-carrying-change.workflow.json) is
+another: it gates an agent-authored code change on
+[arch-index](https://github.com/epure-team/arch-index)'s change-impact and fitness-function
+verdicts rather than on an LLM's opinion of its own diff. See
+[`docs/proof-carrying-change.md`](docs/proof-carrying-change.md).
 
 - **Library** `cabal_workflow_runner` (`lib/`): types, fail-closed validator,
   deterministic engine + replay, backend abstraction, JSON loader, and native
