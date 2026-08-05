@@ -167,7 +167,7 @@ names the target repo provides on `PATH` (and the operator allowlists at runtime
 
 | binary | contract | arch-index's implementation |
 |---|---|---|
-| `pcc-index --db <path>` | prints `{"computed":bool,"functions":int,"contract_ok":bool}` | wraps arch-index's own indexing pipeline + `arch-query stats` |
+| `pcc-index --db <path>` | prints `{"computed":bool,"functions":int,"contract_ok":bool}` | runs `arch_callgraph_ocaml` (CMT path) + `decision-lint --db` into the DB, reads `functions` via a direct `sqlite3` count query, and reads `contract_ok` back from `arch-impact --format json` rather than recomputing it |
 | `pcc-dossier --db <path> --repo <dir> --diff <range> --rules <path> --out <path>` | writes a human-readable Markdown dossier to `--out`; exit 0 regardless of the underlying verdicts (it informs, it does not gate — `impact-final`/`rules-final` are what gate) | runs `arch-impact ... --format md` and `arch-rules ... --format md` against the same DB/args and concatenates them |
 | `pcc-preflight` | prints `{"ok":bool,"tests":int}`; **the exit code is the only thing cwr's `Commit` actually reads** — `ok`/`tests` are for a human reading the ledger, not evaluated as a boolean gate (round-2 review, F7; `parse_run_stdout` only checks presence/type against the schema, and `Commit`'s preflight handling blocks on `result.exit <> 0`, never on the *value* of `ok`) | `dune build && dune test` plus the selftest suite, mirroring `.github/workflows/ci.yml`; **must** exit nonzero on any test failure for this contract to mean anything |
 

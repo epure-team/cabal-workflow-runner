@@ -66,13 +66,20 @@ jobs:
     outputs:
       available: ${{ steps.check.outputs.available }}
     steps:
+      # Checks BOTH that the repo is reachable AND that its main branch actually has scripts/pcc/
+      # on it — not just `git ls-remote` reachability. The two repos are developed in lockstep
+      # (this integration test needs arch-index's pcc-* binaries, which land in a companion PR);
+      # without this, the window between "cwr's PR is open" and "arch-index's pcc-* PR has
+      # merged" reads as a hard pcc-integration job failure, indistinguishable from an actual
+      # wiring regression. Treating "reachable but doesn't have this yet" as the same loud,
+      # honest skip as "unreachable" keeps that ordinary merge-order window from looking red.
       - id: check
         run: |
-          if git ls-remote https://github.com/epure-team/arch-index.git >/dev/null 2>&1; then
+          if curl -sf -o /dev/null "https://raw.githubusercontent.com/epure-team/arch-index/main/scripts/pcc/pcc-index"; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=pcc-integration NOT run::epure-team/arch-index could not be reached, so the proof-carrying-change real-subprocess integration test (test/test_pcc_integration.ml) was skipped entirely. A green CI run here is NOT evidence that the real integration still works."
+            echo "::warning title=pcc-integration NOT run::epure-team/arch-index's main branch is either unreachable or does not (yet) have scripts/pcc/pcc-index on it, so the proof-carrying-change real-subprocess integration test (test/test_pcc_integration.ml) was skipped entirely. A green CI run here is NOT evidence that the real integration still works — and if arch-index's pcc-* PR simply hasn't merged to main yet, this is expected, not a regression."
           fi
 
   pcc-integration:
@@ -113,12 +120,19 @@ jobs:
       # gate above read as "everything's fine" while pcc-integration silently tests nothing —
       # exactly the "green without data" shape this whole milestone exists to rule out. Assert
       # every binary the fixture run actually needs, before spending any time on it.
+      # arch-index/arch-impact and arch-index/arch-rules are TRACKED wrapper scripts (mode
+      # 100755 in git) — they exist and pass `test -x` right after checkout regardless of
+      # whether `dune build` produced anything, so testing them alone would not catch a build
+      # that silently failed or produced nothing. Assert the underlying `_build/` binaries they
+      # wrap, not just the wrappers; pcc-index/pcc-dossier/pcc-preflight ARE the tracked
+      # artifact (plain shell, nothing to build), so testing them directly is the real check.
       - name: Assert arch-index's pcc-* tools were actually built
         run: |
-          for f in arch-index/arch-impact arch-index/arch-rules \
+          for f in arch-index/_build/default/bin/arch_impact/arch_impact.exe \
+                   arch-index/_build/default/bin/arch_rules/arch_rules.exe \
+                   arch-index/_build/default/poc/decision-lint/bin/decision_lint.exe \
                    arch-index/scripts/pcc/pcc-index arch-index/scripts/pcc/pcc-dossier \
-                   arch-index/scripts/pcc/pcc-preflight \
-                   arch-index/_build/default/poc/decision-lint/bin/decision_lint.exe; do
+                   arch-index/scripts/pcc/pcc-preflight; do
             test -x "$f" || { echo "::error::$f is missing or not executable"; exit 1; }
           done
 
