@@ -5,11 +5,13 @@
    a REAL run_command: pcc-index / pcc-dossier / pcc-preflight / arch-impact / arch-rules run as
    actual subprocesses against a real git+dune fixture, via the same process-execution path
    `cwr run` uses in production (Cwr_runner.Runner.make — see bin/dune). Only run_agent stays
-   simulated (table-driven, no LLM/cabal) — but "author"/"fixer" genuinely WRITE to the fixture's
-   files on disk, so the next real arch-impact/arch-rules call sees exactly what a real agent's
-   edit would produce. An agent stub that only returns {"done":true} without touching the
-   filesystem would not exercise this seam at all (see docs/proof-carrying-change.md and this
-   milestone's JALON3-rapport.md, "the wrong path").
+   simulated (table-driven, no LLM/cabal) — but "author" genuinely WRITES to the fixture's files
+   on disk before returning its structured summary, so the next real arch-impact/arch-rules call
+   sees exactly what a real agent's edit would produce ("fixer" stays pure JSON in every scenario
+   here: none of IT1/IT2/IT3 need it to make a further edit — IT1/IT3 converge on iteration 1,
+   IT2's fixer never converges by design). An agent stub that only returns {"done":true} without
+   touching the filesystem would not exercise this seam at all (see docs/proof-carrying-change.md
+   and this milestone's JALON3-rapport.md, "the wrong path").
 
    REQUIRES a SIBLING arch-index checkout, built (`dune build`), with both its repo root and
    scripts/pcc/ prepended to PATH — see this repo's "pcc-integration" CI job for the exact setup.
