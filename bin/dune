@@ -1,7 +1,16 @@
+; Split out as its own library (rather than a bin/-local module) so a test binary can build a
+; REAL run_command the same way `cwr run` does, instead of re-implementing process execution +
+; the directory-snapshot diff. See test/test_pcc_integration.ml.
+(library
+ (name cwr_runner)
+ (modules runner)
+ (libraries cabal_workflow_runner cabal eio digestif unix))
+
 (executable
  (name main)
+ (modules main compiler backend_cabal)
  (public_name cabal-workflow-runner)
- (libraries cabal_workflow_runner cabal eio_main cmdliner yojson unix))
+ (libraries cabal_workflow_runner cwr_runner cabal eio_main cmdliner yojson unix))
 
 ; --profile static: fully static binary via musl (Linux only).
 ; Not applied by default so macOS builds are unaffected.

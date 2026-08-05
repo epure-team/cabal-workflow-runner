@@ -237,9 +237,11 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
     | Some result -> structured_output result
   in
   (* The Run-step effect: process execution + a before/after directory snapshot,
-     implemented in [Runner] (bin-side). The lib never spawns a process. *)
-  let run_command = Runner.make ~sw ~env ~base:working_dir in
-  let run_pinned_command = Runner.make_pinned ~sw ~env ~base:working_dir in
+     implemented in [Cwr_runner.Runner] (its own library, so a test binary can build the same
+     REAL run_command without linking cabal's LLM dispatch). The main lib never spawns a
+     process. *)
+  let run_command = Cwr_runner.Runner.make ~sw ~env ~base:working_dir in
+  let run_pinned_command = Cwr_runner.Runner.make_pinned ~sw ~env ~base:working_dir in
   (* Shell-step effect: run a command string via [sh -c] and return the exit
      code. Fail-safe: any spawn exception returns 127. *)
   let run_shell_command cmd =

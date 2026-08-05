@@ -1,3 +1,9 @@
+; fixtures/pcc-repo LOOKS like a dune project (it has its own dune-project/dune files) but is
+; pure DATA: test_pcc_integration.ml copies it to a fresh tmp dir per scenario and runs `git
+; init`/`dune build` there itself. Without this, dune would happily build/test it in place as
+; part of THIS project's own default @runtest, which is not what a fixture is for.
+(data_only_dirs fixtures)
+
 (test
  (name test_cwr)
  (modules test_cwr)
@@ -17,6 +23,24 @@
  (libraries cabal_workflow_runner alcotest eio eio_main unix)
  (deps
   (glob_files %{project_root}/examples/*.json)))
+
+; Real-subprocess integration test (Jalon 3, Workstream B) — see test_pcc_integration.ml's own
+; header comment. A plain `executable`, NOT a `test` stanza, specifically so it is never attached
+; to the default @runtest alias: it requires a sibling arch-index checkout on PATH, which the
+; ordinary `dune test`/`dune runtest` environment does not have. The (rule) below gives it its
+; OWN alias instead — run explicitly with `dune build @pcc-integration` (see the
+; "pcc-integration" CI job).
+(executable
+ (name test_pcc_integration)
+ (modules test_pcc_integration)
+ (libraries cabal_workflow_runner cwr_runner alcotest eio eio_main unix))
+
+(rule
+ (alias pcc-integration)
+ (deps
+  (glob_files %{project_root}/examples/*.json)
+  (source_tree fixtures))
+ (action (run %{exe:test_pcc_integration.exe})))
 
 (rule
  (alias runtest)

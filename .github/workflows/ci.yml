@@ -54,3 +54,87 @@ jobs:
 
       - name: Schema <-> parser parity check
         run: python3 scripts/parity_check.py
+
+  # test/test_pcc_integration.ml (Jalon 3, Workstream B) runs the REAL proof-carrying-change
+  # workflow — real pcc-index/pcc-dossier/pcc-preflight/arch-impact/arch-rules subprocesses —
+  # against a fixture repo, which needs a whole SEPARATE public repo (epure-team/arch-index)
+  # built alongside this one. Mirrors arch-index's own mcp/mcp-credentials pattern: decide up
+  # front whether the dependency is reachable and say so LOUDLY when it is not, rather than let
+  # a network hiccup either fail the whole CI run or (worse) silently skip with a green check.
+  arch-index-availability:
+    runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+      - id: check
+        run: |
+          if git ls-remote https://github.com/epure-team/arch-index.git >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=pcc-integration NOT run::epure-team/arch-index could not be reached, so the proof-carrying-change real-subprocess integration test (test/test_pcc_integration.ml) was skipped entirely. A green CI run here is NOT evidence that the real integration still works."
+          fi
+
+  pcc-integration:
+    needs: arch-index-availability
+    if: needs.arch-index-availability.outputs.available == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cabal-workflow-runner
+        uses: actions/checkout@v4
+        with:
+          path: cwr
+
+      - name: Checkout arch-index
+        uses: actions/checkout@v4
+        with:
+          repository: epure-team/arch-index
+          path: arch-index
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.3"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Pin the public cabal library and install deps for BOTH repos (one shared switch)
+        run: |
+          opam pin add -n cabal https://github.com/epure-team/cabal.git
+          opam install ./arch-index --deps-only --yes
+          opam install ./cwr --deps-only --with-test --yes
+
+      - name: Build arch-index (pcc-*, arch-impact/arch-rules, decision-lint, producers)
+        working-directory: arch-index
+        run: opam exec -- dune build
+
+      # A false enabled_if or a build that quietly produced nothing would let the availability
+      # gate above read as "everything's fine" while pcc-integration silently tests nothing —
+      # exactly the "green without data" shape this whole milestone exists to rule out. Assert
+      # every binary the fixture run actually needs, before spending any time on it.
+      - name: Assert arch-index's pcc-* tools were actually built
+        run: |
+          for f in arch-index/arch-impact arch-index/arch-rules \
+                   arch-index/scripts/pcc/pcc-index arch-index/scripts/pcc/pcc-dossier \
+                   arch-index/scripts/pcc/pcc-preflight \
+                   arch-index/_build/default/poc/decision-lint/bin/decision_lint.exe; do
+            test -x "$f" || { echo "::error::$f is missing or not executable"; exit 1; }
+          done
+
+      - name: Build cabal-workflow-runner
+        working-directory: cwr
+        run: opam exec -- dune build
+
+      - name: Put arch-index's tools on PATH
+        run: |
+          echo "${{ github.workspace }}/arch-index" >> "$GITHUB_PATH"
+          echo "${{ github.workspace }}/arch-index/scripts/pcc" >> "$GITHUB_PATH"
+
+      # test_pcc_integration.ml self-checks the same tools on PATH and exits nonzero with a loud
+      # "PCC-INTEGRATION-SKIP" message if any are missing (see the test file's own header) — so a
+      # wiring bug in the steps above surfaces as a hard, visible failure HERE, not as a silent
+      # 0-tests-run pass.
+      - name: Run the real-subprocess proof-carrying-change integration test
+        working-directory: cwr
+        run: opam exec -- dune build @pcc-integration
