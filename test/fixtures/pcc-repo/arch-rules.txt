@@ -1,0 +1,2 @@
+rule "ui must not reach db"
+  forbid reach from file:src/ui.ml to file:src/db.ml
