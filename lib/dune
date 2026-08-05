@@ -1,5 +1,6 @@
 (library
  (name cabal_workflow_runner)
+ (public_name cabal_workflow_runner)
  (foreign_stubs
   (language c)
   (names secure_fs_stubs)
