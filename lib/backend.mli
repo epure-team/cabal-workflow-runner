@@ -15,12 +15,23 @@ type t = {
     read_only:bool ->
     agent_type:string option ->
     model:string option ->
+    output_schema:Types.Schema.t option ->
     bool * Yojson.Safe.t;
       (** Run agent work; returns [(success, structured_json)]. [agent_type]
           is an optional routing hint (e.g. ["code-reviewer"]) forwarded to the
           backend so it can select a specialised adapter. [model] is an optional
           per-step model override (e.g. ["claude-fable-5"]); when [None] the
-          backend's default applies (e.g. its global [CWR_MODEL]). *)
+          backend's default applies (e.g. its global [CWR_MODEL]).
+
+          [output_schema] is the step's declared output spec, forwarded so a
+          backend can constrain its model natively (see
+          {!Types.Schema.to_json_schema}). It is passed in the engine's own
+          vocabulary rather than pre-serialised, so a backend with a richer
+          native mechanism can read the structure instead of re-parsing JSON.
+          Forwarding it is a {b guide only}: the engine still applies
+          {!Types.Schema.validate} to the returned JSON, so a backend may ignore
+          this argument entirely. [None] means the step declared no schema, and
+          the backend must then constrain nothing. *)
   budget : unit -> int;
       (** Remaining budget. A [Budget] governor stops the loop once this is
           [<= 0]. Embedder-supplied; a decrementing stub lets tests force loop
@@ -67,6 +78,7 @@ val stub :
           read_only:bool ->
           agent_type:string option ->
           model:string option ->
+          output_schema:Types.Schema.t option ->
           bool * Yojson.Safe.t) ->
   ?budget:(unit -> int) ->
   ?run_command:

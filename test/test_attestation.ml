@@ -208,7 +208,7 @@ let test_engine_exports_atomically_and_replay_authenticates () =
   with_temp_dir (fun root ->
       let s = signer () in
       let seen_prompt = ref "" in
-      let agent ~id:_ ~prompt ~read_only:_ ~agent_type:_ ~model:_ =
+      let agent ~id:_ ~prompt ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
         seen_prompt := prompt;
         (true, `Assoc [ ("finding", `String "F-1"); ("valid", `Bool true) ])
       in
@@ -631,7 +631,7 @@ let test_unsafe_selected_values_fail_as_controlled_outcomes () =
     with_temp_dir (fun root ->
       let wf = runtime_workflow "proof.json" in
       let validated = validated ~required:["export"] wf in
-      let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+      let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
         true, `Assoc [ ("unsafe", unsafe) ] in
       let outcome, trace = engine_run ~attestation_signer:(signer ())
         ~attestation_artifact_root:root ~attestation_session_nonce:"s"

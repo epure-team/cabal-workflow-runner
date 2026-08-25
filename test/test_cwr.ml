@@ -48,7 +48,7 @@ let outcome_testable =
 
 (* An agent backend that returns a fixed JSON output per id. *)
 let json_backend table =
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     match List.assoc_opt id table with
     | Some j -> (true, j)
     | None -> (true, `Assoc [])
@@ -275,7 +275,7 @@ let test_failed_agent_fails_closed () =
     }
   in
   (* a backend whose agent returns success=false with an error object *)
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     (false, `Assoc [ ("error", `String "boom") ])
   in
   let backend = Backend.stub ~agent () in
@@ -313,7 +313,7 @@ let test_soft_fail_agent_continues () =
     }
   in
   (* "a" fails, "b" succeeds *)
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     if id = "a" then (false, `Assoc [ ("error", `String "boom") ])
     else (true, `Assoc [ ("ok", `Bool true) ])
   in
@@ -459,7 +459,7 @@ let test_loop_budget_terminates () =
      read=2, iter2 read=1, iter3 read=0 -> stop. So 4 iterations? We design the
      stub so the Nth reading is the one that is <=0. *)
   let agent_count = ref 0 in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_count;
     (true, `Assoc [ ("id", `String id) ])
   in
@@ -504,7 +504,7 @@ let test_loop_fixpoint_terminates () =
      from the start => stops after 2 iterations. Budget is default (unbounded).
      until never holds. *)
   let agent_count = ref 0 in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_count;
     (true, `Assoc [ ("progressed", `Bool false) ])
   in
@@ -562,7 +562,7 @@ let stepping_clock instants =
         x
 
 let deadline_agent counter =
-  fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ->
+  fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ ->
     incr counter;
     (true, `Assoc [ ("id", `String id) ])
 
@@ -582,6 +582,95 @@ let deadline_loop_wf name governors =
           };
       ];
   }
+
+(* ---- agent output_schema forwarded to the backend as a native constraint ----
+
+   Before this, a step's [output_schema] was only ever checked AFTER the fact:
+   nothing asked the model for JSON, so a prose answer failed the parse and the
+   step died with "no parseable structured JSON". The schema now also travels to
+   the backend, WITHOUT the a-posteriori check being relaxed. *)
+
+let schema_agent seen =
+  fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema ->
+    seen := !seen @ [ (id, output_schema) ];
+    (true, `Assoc [ ("ok", `Bool true) ])
+
+let two_agent_wf =
+  {
+    name = "output-schema";
+    version = None;
+    steps =
+      [
+        Agent { id = "with"; prompt = "p"; read_only = true;
+                output_schema = Some [ ("ok", Schema.Bool) ];
+                on_failure = Types.Abort; protocol = None; brief = None;
+                agent_type = None; model = None; input = None };
+        Agent { id = "without"; prompt = "p"; read_only = true;
+                output_schema = None;
+                on_failure = Types.Abort; protocol = None; brief = None;
+                agent_type = None; model = None; input = None };
+      ];
+  }
+
+let schema_json_of = function
+  | None -> "none"
+  | Some s -> Yojson.Safe.to_string ~std:true (Schema.to_json_schema s)
+
+(* The translation itself. One exact-string assertion covers every arm of the
+   mapping at once, which is also what makes it catch an accidental "$schema"
+   key or a flipped additionalProperties. *)
+let test_to_json_schema_translation () =
+  let schema =
+    [ ("a", Schema.String); ("b", Schema.Int); ("c", Schema.Number);
+      ("d", Schema.Bool); ("e", Schema.Enum [ "x"; "y" ]); ("f", Schema.Any) ]
+  in
+  let actual = Yojson.Safe.to_string ~std:true (Schema.to_json_schema schema) in
+  let expected =
+    {|{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"},"c":{"type":"number"},"d":{"type":"boolean"},"e":{"type":"string","enum":["x","y"]},"f":{}},"required":["a","b","c","d","e","f"],"additionalProperties":true}|}
+  in
+  Alcotest.(check string) "JSON Schema translation" expected actual;
+  (* Named separately because it is a decision, not a consequence: the dialect
+     belongs to the transport, so the object must not pin one. *)
+  Alcotest.(check bool) "no $schema key" false
+    (contains_substring actual "$schema");
+  (* [Any] is PRESENT-but-untyped for [validate], so it must stay required. *)
+  Alcotest.(check bool) "Any stays required" true
+    (contains_substring actual {|"f"]|})
+
+(* Polarity 1: a step that declares a schema forwards it.
+   Polarity 2: a step that declares none forwards [None] — asserted in the SAME
+   test so a plumbing bug that hard-wires one of the two cannot pass. *)
+let test_output_schema_forwarded_both_polarities () =
+  let seen = ref [] in
+  let backend = Backend.stub ~agent:(schema_agent seen) () in
+  let v = validate_ok ~floor:[] two_agent_wf in
+  let _outcome, _trace = engine_run ~backend ~token:None v in
+  let got = List.map (fun (id, s) -> (id, schema_json_of s)) !seen in
+  Alcotest.(check (list (pair string string)))
+    "each step forwards exactly its own declared schema"
+    [ ("with",
+       {|{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":true}|});
+      ("without", "none") ]
+    got
+
+(* Belt and braces: a backend that IGNORES the constraint and answers with the
+   wrong type is still caught. The native schema is a guide; [Schema.validate]
+   remains the guarantee. *)
+let test_posteriori_validation_still_applies () =
+  let ignoring_agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_
+      ~output_schema:_ =
+    (true, `Assoc [ ("ok", `String "not a bool") ])
+  in
+  let backend = Backend.stub ~agent:ignoring_agent () in
+  let v = validate_ok ~floor:[] two_agent_wf in
+  let outcome, _ = engine_run ~backend ~token:None v in
+  match outcome with
+  | Aborted reason ->
+      Alcotest.(check string) "abort names the offending field"
+        "schema mismatch: ok" reason
+  | o ->
+      Alcotest.failf "expected Aborted when the backend ignores the schema, got %s"
+        (Types.string_of_outcome o)
 
 let loop_stop trace =
   List.find_map
@@ -739,7 +828,7 @@ let test_deadline_governor_json_roundtrip () =
    [max_loop_iters] with reason "ceiling". *)
 let test_loop_ceiling_budget_constant () =
   let agent_count = ref 0 in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_count;
     (true, `Assoc [ ("id", `String id) ])
   in
@@ -781,7 +870,7 @@ let test_loop_ceiling_budget_constant () =
    Fixpoint; the ceiling stops it anyway. *)
 let test_loop_ceiling_fixpoint_always_progresses () =
   let agent_count = ref 0 in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_count;
     (true, `Assoc [ ("progressed", `Bool true) ])
   in
@@ -826,7 +915,7 @@ let test_loop_ceiling_fixpoint_always_progresses () =
 
 let test_replay_with_loop () =
   (* governed loop (budget) + structured agents + an expression-gated commit. *)
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     match id with
     | "assess" -> (true, `Assoc [ ("severity", `String "high") ])
     | _ -> (true, `Assoc [ ("progressed", `Bool false) ])
@@ -2882,7 +2971,7 @@ let test_ledger_roundtrip_all_variants () =
 let test_ledger_persist_then_replay_from_file () =
   let agent_calls = ref 0 in
   let cmd_calls = ref 0 in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_calls;
     match id with
     | "assess" -> (true, `Assoc [ ("severity", `String "high") ])
@@ -3052,7 +3141,7 @@ let test_foreach_3_elements () =
         ];
     }
   in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     (true, `Assoc [])
   in
   let backend = Backend.stub ~agent () in
@@ -3211,7 +3300,7 @@ let test_parallel_two_branches_succeed () =
     }
   in
   let agent_calls = ref 0 in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_calls;
     (true, `Assoc [])
   in
@@ -3255,7 +3344,7 @@ let test_parallel_one_branch_aborts () =
         ];
     }
   in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     match id with
     | "bad" -> (false, `Assoc [])
     | _ -> (true, `Assoc [])
@@ -3293,7 +3382,7 @@ let test_parallel_replay_success () =
         ];
     }
   in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc []) in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ = (true, `Assoc []) in
   let backend = Backend.stub ~agent () in
   let v = validate_ok ~floor:[] wf in
   let outcome, trace = engine_run ~backend ~token:None v in
@@ -3981,7 +4070,7 @@ let test_foreach_iterates () =
                                             on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
   let calls = ref 0 in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr calls;
     (true, `Assoc [])
   in
@@ -4013,7 +4102,7 @@ let test_foreach_empty_array () =
                                             on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
   let called = ref false in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = called := true; (true, `Assoc []) in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ = called := true; (true, `Assoc []) in
   let backend = Backend.stub ~agent () in
   let v = validate_ok ~floor:[] wf in
   let outcome, _trace =
@@ -4034,7 +4123,7 @@ let test_foreach_replay_iteration () =
                                             output_schema = None;
                                             on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc [("x", `Int 1)]) in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ = (true, `Assoc [("x", `Int 1)]) in
   let backend = Backend.stub ~agent () in
   let v = validate_ok ~floor:[] wf in
   let outcome, trace =
@@ -4149,7 +4238,7 @@ let test_parallel_branch_output_merge () =
               [ Agent { id = "r2"; prompt = "p"; read_only = true;
                         output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] ] } ] }
   in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     (true, `Assoc [("result", `String id)])
   in
   let backend = Backend.stub ~agent () in
@@ -4181,7 +4270,7 @@ let test_foreach_disk_replay () =
                                              output_schema = None;
                                              on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc []) in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ = (true, `Assoc []) in
   let backend = Backend.stub ~agent () in
   let v = validate_ok ~floor:[] wf in
   let initial_ctx = [("items", `List [`String "x"; `String "y"])] in
@@ -4228,7 +4317,7 @@ let test_foreach_disk_replay () =
 
 let test_structured_agent_receipts_and_replay () =
   let seen_prompt = ref "" in
-  let agent ~id ~prompt ~read_only ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt ~read_only ~agent_type:_ ~model:_ ~output_schema:_ =
     if id = "proof" then (true, `Assoc [ ("value", `Int 7) ])
     else begin
       seen_prompt := prompt;
@@ -4305,7 +4394,7 @@ let test_structured_agent_receipts_and_replay () =
     with Engine.Replay_mismatch _ -> true in
   Alcotest.(check bool) "tampered predecessor membership rejected" true
     path_rejected;
-  let noncanonical_agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let noncanonical_agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     if id = "proof" then (true, `Assoc [ ("value", `Int 7) ])
     else (true, `Assoc [ ("score", `Float 1.5) ]) in
   let bad_outcome, bad_trace = engine_run
@@ -4680,7 +4769,7 @@ let test_spawn_parse_run_replay_and_reject () =
     | Ok wf -> wf | Error e -> Alcotest.failf "spawn parse failed: %s" e in
   Alcotest.(check bool) "spawn round-trip" true
     (contains_substring (Yojson.Safe.to_string (Workflow_json.to_json wf)) "spawn");
-  let backend = Backend.stub ~agent:(fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ->
+  let backend = Backend.stub ~agent:(fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ ->
     true, `Assoc [ ("id", `String id) ]) () in
   let validated = validate_ok ~floor:[] wf in
   let outcome, trace = engine_run ~backend ~token:None validated in
@@ -4777,6 +4866,15 @@ let () =
           Alcotest.test_case
             "ceiling stops Fixpoint-only loop that always progresses" `Quick
             test_loop_ceiling_fixpoint_always_progresses;
+        ] );
+      ( "agent-output-schema",
+        [
+          Alcotest.test_case "Schema.t translates to JSON Schema" `Quick
+            test_to_json_schema_translation;
+          Alcotest.test_case "schema forwarded, both polarities" `Quick
+            test_output_schema_forwarded_both_polarities;
+          Alcotest.test_case "a-posteriori validation still applies" `Quick
+            test_posteriori_validation_still_applies;
         ] );
       ( "validate-fail-closed",
         [

@@ -183,8 +183,9 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
     ?(now = Unix.gettimeofday) ~sw:(_sw : Eio.Switch.t) ~backend ~token
     validated =
   let wf = Validate.Validated.workflow validated in
-  let agent ~id ~prompt ~read_only ~agent_type ~model =
+  let agent ~id ~prompt ~read_only ~agent_type ~model ~output_schema =
     backend.Backend.run_agent ~id ~prompt ~read_only ~agent_type ~model
+      ~output_schema
   in
   let eval st e = Expr.eval ~ctx:(ctx_for st) e in
   let rec go st steps =
@@ -245,7 +246,14 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
             let st = { st with terminal = Some (Aborted reason) } in
             emit st (Blocked_at { id; reason })
         | Ok (effective_prompt, request_binding) ->
-        let success, output = agent ~id ~prompt:effective_prompt ~read_only ~agent_type ~model in
+        (* The step's declared schema goes to the backend as a native constraint
+           (a guide), and is STILL validated below on the way back (the
+           guarantee). Belt and braces: a backend may ignore --json-schema, or
+           have no such mechanism at all. *)
+        let success, output =
+          agent ~id ~prompt:effective_prompt ~read_only ~agent_type ~model
+            ~output_schema
+        in
         let receipt_result = match request_binding with
           | None -> Ok None
           | Some (request, request_digest) ->

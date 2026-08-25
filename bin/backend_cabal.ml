@@ -195,7 +195,7 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
     | Some m when String.trim m <> "" -> Some (String.trim m)
     | _ -> None
   in
-  let run_agent ~id ~prompt ~read_only ~agent_type ~model =
+  let run_agent ~id ~prompt ~read_only ~agent_type ~model ~output_schema =
     (* Per-step model override wins over the global CWR_MODEL default. A blank
        per-step value falls back to the default rather than pinning "". *)
     let model =
@@ -209,8 +209,18 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
       | Some _ -> None
       | None -> None
     in
+    (* Constrain the model natively when the step declared a schema. cabal
+       forwards this as the CLI's --json-schema, which the CLI itself enforces
+       (see Cabal.Claude_code: native_json_schema_output). Without it the step's
+       output_schema was only ever checked AFTER the fact, so nothing asked the
+       model for JSON in the first place and a prose answer failed the parse.
+       [None] when the step declared no schema: constrain nothing, as before. *)
+    let json_schema =
+      Option.map Cabal_workflow_runner.Types.Schema.to_json_schema output_schema
+    in
     let spec =
       Backend_types.make_task_spec ~prompt ~working_dir ~read_only ?model
+        ?json_schema
         ~expected_outputs:
           [ Backend_types.Files_changed; Backend_types.Structured_report ]
         ()
