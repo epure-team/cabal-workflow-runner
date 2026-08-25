@@ -57,12 +57,13 @@ let json_backend table =
 
 (* Wrap Engine.run in an Eio context (required after ~sw threading). *)
 let engine_run ?max_loop_iters ?run_allowlist ?initial_ctx
-    ?attestation_session_nonce ?agent_backend_id ~backend ~token validated =
+    ?attestation_session_nonce ?agent_backend_id ?deadline ?now ~backend ~token
+    validated =
   Eio_main.run (fun _env ->
     Eio.Switch.run (fun sw ->
       Engine.run ?max_loop_iters ?run_allowlist ?initial_ctx
-        ?attestation_session_nonce ?agent_backend_id ~sw ~backend ~token
-        validated))
+        ?attestation_session_nonce ?agent_backend_id ?deadline ?now ~sw
+        ~backend ~token validated))
 
 (* Wrap Engine.replay in an Eio context. *)
 let engine_replay ?max_loop_iters ?initial_ctx ?attestation_session_nonce
@@ -545,6 +546,192 @@ let test_loop_fixpoint_terminates () =
     Completed_no_commit outcome
 
 (* ---- v0.5 Fix 1: the unconditional engine iteration ceiling ---- *)
+
+(* ---- Deadline governor ------------------------------------------------- *)
+
+(* An injected clock: each call yields the next instant. The seam exists so a
+   test can REACH a deadline without sleeping — a deadline test that passes only
+   because the deadline was never reached proves nothing. *)
+let stepping_clock instants =
+  let r = ref instants in
+  fun () ->
+    match !r with
+    | [] -> infinity
+    | x :: tl ->
+        r := tl;
+        x
+
+let deadline_agent counter =
+  fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ->
+    incr counter;
+    (true, `Assoc [ ("id", `String id) ])
+
+(* A Deadline-ONLY loop whose until never holds: only the clock can stop it. *)
+let deadline_loop_wf name governors =
+  {
+    name;
+    version = None;
+    steps =
+      [
+        Loop
+          {
+            body =
+              [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
+            until = Some (Expr.Lit (Expr.Bool false));
+            governors;
+          };
+      ];
+  }
+
+let loop_stop trace =
+  List.find_map
+    (function
+      | Loop_stopped { iterations; reason } -> Some (iterations, reason)
+      | _ -> None)
+    trace
+
+let deadline_reads trace =
+  List.filter_map
+    (function Deadline_read { expired } -> Some expired | _ -> None)
+    trace
+
+(* Polarity 1: the deadline IS reached => the loop stops, reason "deadline". *)
+let test_loop_deadline_fires () =
+  let count = ref 0 in
+  let backend = Backend.stub ~agent:(deadline_agent count) () in
+  let v = validate_ok ~floor:[] (deadline_loop_wf "deadline-loop" [ Deadline ]) in
+  (* readings 0.(<100 continue) 50.(<100 continue) 150.(>=100 STOP) *)
+  let now = stepping_clock [ 0.; 50.; 150. ] in
+  let outcome, trace =
+    engine_run ~deadline:100. ~now ~backend ~token:None v
+  in
+  Alcotest.(check int) "ran body exactly 3 times" 3 !count;
+  Alcotest.(check bool) "stopped via deadline after 3 iters" true
+    (loop_stop trace = Some (3, "deadline"));
+  Alcotest.(check (list bool)) "recorded one verdict per iteration"
+    [ false; false; true ] (deadline_reads trace);
+  Alcotest.(check outcome_testable) "completed without commit"
+    Completed_no_commit outcome
+
+(* Polarity 2: the deadline is NOT reached => Deadline never fires, and the
+   governor still RAN (a false verdict per iteration) rather than being skipped.
+   Without the recorded-verdict assertion this test would also pass if the
+   Deadline arm did nothing at all. *)
+let test_loop_deadline_not_reached () =
+  let count = ref 0 in
+  let backend = Backend.stub ~agent:(deadline_agent count) () in
+  let v =
+    validate_ok ~floor:[]
+      (deadline_loop_wf "deadline-far" [ Max_iters 2; Deadline ])
+  in
+  let now = stepping_clock [ 0.; 1.; 2.; 3. ] in
+  let _outcome, trace =
+    engine_run ~deadline:1_000_000. ~now ~backend ~token:None v
+  in
+  Alcotest.(check int) "ran body exactly 2 times" 2 !count;
+  Alcotest.(check bool) "stopped via max_iters, not deadline" true
+    (loop_stop trace = Some (2, "max_iters"));
+  (* Max_iters fires on iteration 2 BEFORE the Deadline arm is reached that
+     round, so exactly one false verdict is recorded (iteration 1). *)
+  Alcotest.(check (list bool)) "deadline governor ran and read false"
+    [ false ] (deadline_reads trace)
+
+(* A Deadline governor with NO runtime deadline never fires — the same posture
+   as Budget against a constant stub. The ceiling remains the guarantee. *)
+let test_loop_deadline_absent_never_fires () =
+  let count = ref 0 in
+  let backend = Backend.stub ~agent:(deadline_agent count) () in
+  let v =
+    validate_ok ~floor:[] (deadline_loop_wf "deadline-none" [ Deadline ])
+  in
+  let _outcome, trace = engine_run ~max_loop_iters:3 ~backend ~token:None v in
+  Alcotest.(check int) "ran to the ceiling" 3 !count;
+  Alcotest.(check bool) "stopped by the ceiling, not the deadline" true
+    (loop_stop trace = Some (3, "ceiling"));
+  Alcotest.(check (list bool)) "every verdict is false" [ false; false; false ]
+    (deadline_reads trace)
+
+(* THE design test: replay is clock-free. The recorded verdict decides, so a
+   trace recorded when the deadline had passed replays with no deadline and no
+   clock supplied at all — Engine.replay's signature has neither. If replay
+   re-read the wall clock, a recorded run would stop being reproducible the
+   moment the deadline passed. *)
+let test_loop_deadline_replay_is_clock_free () =
+  let count = ref 0 in
+  let backend = Backend.stub ~agent:(deadline_agent count) () in
+  let v = validate_ok ~floor:[] (deadline_loop_wf "deadline-replay" [ Deadline ]) in
+  let now = stepping_clock [ 0.; 50.; 150. ] in
+  let outcome, trace =
+    engine_run ~deadline:100. ~now ~backend ~token:None v
+  in
+  let ran_live = !count in
+  Alcotest.(check bool) "the live run did stop on the deadline" true
+    (loop_stop trace = Some (3, "deadline"));
+  (* replay takes NO deadline and NO clock, and consults no backend. *)
+  let replayed = engine_replay ~trace v in
+  Alcotest.(check outcome_testable) "replayed outcome identical" outcome
+    replayed;
+  Alcotest.(check int) "replay consulted no agent" ran_live !count;
+  (* Non-vacuity: replay must actually CONSUME the recorded verdict. Swap the
+     Deadline_read for a Budget_read and replay must refuse rather than shrug. *)
+  let tampered =
+    List.map
+      (function
+        | Deadline_read { expired = true } -> Budget_read { value = 0 }
+        | e -> e)
+      trace
+  in
+  let raised =
+    try
+      ignore (engine_replay ~trace:tampered v);
+      false
+    with Engine.Replay_mismatch _ -> true
+  in
+  Alcotest.(check bool) "a swapped deadline verdict => Replay_mismatch" true
+    raised
+
+(* The JS compiler must REFUSE a Deadline governor rather than emit JS that
+   silently loses it. The engine records a wall-clock verdict as replay evidence;
+   a JS target has no such recorded reading, so any emitted approximation would
+   be a governor that looks present and behaves differently. Same posture as the
+   Spawn step. *)
+let test_compiler_refuses_deadline () =
+  let raises_compile_error wf =
+    try
+      ignore (Compiler.compile_workflow wf);
+      false
+    with Compiler.Compile_error msg -> contains_substring msg "Deadline"
+  in
+  Alcotest.(check bool) "Deadline governor => Compile_error naming Deadline" true
+    (raises_compile_error (deadline_loop_wf "js" [ Deadline ]));
+  (* Also when it merely accompanies a compilable governor. *)
+  Alcotest.(check bool) "Deadline alongside Max_iters => Compile_error" true
+    (raises_compile_error (deadline_loop_wf "js2" [ Max_iters 2; Deadline ]))
+
+(* The nullary shape survives a JSON round-trip, and an unknown extra key is
+   rejected — the deadline instant must never be smuggled into the file. *)
+let test_deadline_governor_json_roundtrip () =
+  let src =
+    {|{"name":"d","steps":[{"kind":"loop","governors":[{"kind":"deadline"}],"body":[{"kind":"gate","id":"g","when":{"lit":{"bool":true}}}]}]}|}
+  in
+  (match Workflow_json.of_string src with
+  | Error e -> Alcotest.fail ("deadline governor must parse: " ^ e)
+  | Ok wf ->
+      let back = Yojson.Safe.to_string (Workflow_json.to_json wf) in
+      Alcotest.(check bool) "re-encodes as kind:deadline" true
+        (contains_substring back {|"kind":"deadline"|});
+      (* and the re-encoded form parses back to the same workflow *)
+      (match Workflow_json.of_string back with
+      | Ok wf2 -> Alcotest.(check bool) "round-trip stable" true (wf2 = wf)
+      | Error e -> Alcotest.fail ("re-encode must parse: " ^ e)));
+  (* an instant in the workflow file is a parse error, not a silent ignore *)
+  let with_instant =
+    {|{"name":"d","steps":[{"kind":"loop","governors":[{"kind":"deadline","at":1.0}],"body":[{"kind":"gate","id":"g","when":{"lit":{"bool":true}}}]}]}|}
+  in
+  match Workflow_json.of_string with_instant with
+  | Error _ -> ()
+  | Ok _ ->
+      Alcotest.fail "a deadline instant in the workflow file must be rejected"
 
 (* A Budget-ONLY loop whose backend returns a CONSTANT positive budget (the
    shipped Backend_cabal semantics) and whose [until] never holds would run
@@ -1552,6 +1739,7 @@ let test_commit_token_digest_only () =
            | Loop_iter { index } -> string_of_int index
            | Budget_read { value } -> string_of_int value
            | Fixpoint_progress { progress } -> string_of_bool progress
+           | Deadline_read { expired } -> string_of_bool expired
            | Loop_stopped { reason; _ } -> reason
            | Run_executed { id; _ } -> id
            | Commit_preflight_executed { id; _ } -> id
@@ -2262,6 +2450,7 @@ let parser_known_keys =
     ("attest", [ "kind"; "id"; "select"; "replay_domain"; "output" ]);
     ("max_iters", [ "kind"; "n" ]);
     ("budget", [ "kind" ]);
+    ("deadline", [ "kind" ]);
     ("fixpoint", [ "kind"; "window"; "progress" ]);
   ]
 
@@ -4570,6 +4759,18 @@ let () =
             test_loop_budget_terminates;
           Alcotest.test_case "unbounded loop, Fixpoint only, terminates" `Quick
             test_loop_fixpoint_terminates;
+          Alcotest.test_case "Deadline reached => loop stops" `Quick
+            test_loop_deadline_fires;
+          Alcotest.test_case "Deadline far => governor runs, does not fire"
+            `Quick test_loop_deadline_not_reached;
+          Alcotest.test_case "Deadline with no runtime deadline never fires"
+            `Quick test_loop_deadline_absent_never_fires;
+          Alcotest.test_case "Deadline replay is clock-free" `Quick
+            test_loop_deadline_replay_is_clock_free;
+          Alcotest.test_case "JS compiler refuses Deadline" `Quick
+            test_compiler_refuses_deadline;
+          Alcotest.test_case "deadline governor JSON round-trip" `Quick
+            test_deadline_governor_json_roundtrip;
           Alcotest.test_case
             "ceiling stops Budget-only loop with constant budget" `Quick
             test_loop_ceiling_budget_constant;

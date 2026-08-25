@@ -179,8 +179,9 @@ let path_bearing_head = function
 
 let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
     ?(initial_ctx = []) ?attestation_signer ?attestation_artifact_root
-    ?attestation_session_nonce ?agent_backend_id ~sw:(_sw : Eio.Switch.t)
-    ~backend ~token validated =
+    ?attestation_session_nonce ?agent_backend_id ?deadline
+    ?(now = Unix.gettimeofday) ~sw:(_sw : Eio.Switch.t) ~backend ~token
+    validated =
   let wf = Validate.Validated.workflow validated in
   let agent ~id ~prompt ~read_only ~agent_type ~model =
     backend.Backend.run_agent ~id ~prompt ~read_only ~agent_type ~model
@@ -787,6 +788,20 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
                         let v = backend.Backend.budget () in
                         let st = emit st (Budget_read { value = v }) in
                         if v <= 0 then (st, Some "budget") else (st, None)
+                    | Deadline ->
+                        (* Nondeterministic external reading, exactly like
+                           Budget: record the VERDICT (a bool, so the ledger
+                           round-trips byte-identically — never a float) and let
+                           replay re-feed it. No deadline supplied => never
+                           fires, the same posture as Budget against a constant
+                           stub. *)
+                        let expired =
+                          match deadline with
+                          | Some d -> now () >= d
+                          | None -> false
+                        in
+                        let st = emit st (Deadline_read { expired }) in
+                        if expired then (st, Some "deadline") else (st, None)
                     | Fixpoint { window; progress } ->
                         let p = eval st progress in
                         let st = emit st (Fixpoint_progress { progress = p }) in
@@ -1384,6 +1399,18 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
                             | _ ->
                                 raise
                                   (Replay_mismatch "budget reading mismatch"))
+                        | Deadline -> (
+                            (* Replay is clock-free BY DESIGN: re-reading the
+                               wall clock would make a recorded run stop being
+                               reproducible the moment the deadline passed. *)
+                            match next () with
+                            | Deadline_read { expired } ->
+                                let st = emit st (Deadline_read { expired }) in
+                                if expired then (st, Some "deadline")
+                                else (st, None)
+                            | _ ->
+                                raise
+                                  (Replay_mismatch "deadline verdict mismatch"))
                         | Fixpoint { window; progress } -> (
                             match next () with
                             | Fixpoint_progress { progress = recorded } ->

@@ -25,6 +25,8 @@ let print_trace trace =
           Printf.printf "  budget   value=%d\n" value
       | Types.Fixpoint_progress { progress } ->
           Printf.printf "  fixpoint progress=%b\n" progress
+      | Types.Deadline_read { expired } ->
+          Printf.printf "  deadline expired=%b\n" expired
       | Types.Loop_stopped { iterations; reason } ->
           Printf.printf "  loop     stopped after %d iter(s) (%s)\n" iterations
             reason

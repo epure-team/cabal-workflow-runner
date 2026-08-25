@@ -269,6 +269,11 @@ let governor_of_json (j : Yojson.Safe.t) : governor =
   | "budget" ->
       reject_unknown_keys ~what:"budget governor" ~known:[ "kind" ] j;
       Budget
+  | "deadline" ->
+      (* Nullary on purpose: the instant is a RUNTIME value (Engine.run
+         ~deadline), never a workflow-file constant. *)
+      reject_unknown_keys ~what:"deadline governor" ~known:[ "kind" ] j;
+      Deadline
   | "fixpoint" ->
       let g =
         Fixpoint
@@ -555,6 +560,7 @@ let rec expr_to_json (e : Expr.t) : Yojson.Safe.t =
 let governor_to_json = function
   | Max_iters n -> `Assoc [ ("kind", `String "max_iters"); ("n", `Int n) ]
   | Budget -> `Assoc [ ("kind", `String "budget") ]
+  | Deadline -> `Assoc [ ("kind", `String "deadline") ]
   | Fixpoint { window; progress } ->
       `Assoc
         [

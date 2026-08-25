@@ -314,6 +314,10 @@ and compile_step ctx step =
             let v = Printf.sprintf "_fixcount_%d" k in
             bind_var ctx ~src:(Printf.sprintf "loop #%d fixpoint governor" k) v;
             emit ctx (Printf.sprintf "let %s = 0;" v)
+        | Types.Deadline ->
+            raise (Compile_error
+              "Deadline governor cannot be compiled faithfully: its wall-clock \
+               reading is engine-recorded replay evidence, not a JS expression")
         | Types.Budget -> ()) governors;
       emit ctx "while (true) {";
       let bctx = enter_scope ctx in
@@ -327,6 +331,10 @@ and compile_step ctx step =
             emit bctx (Printf.sprintf "if (++_maxiters_%d >= %d) break;" k n)
         | Types.Budget ->
             emit bctx "if (budget.remaining() <= 0) break;"
+        | Types.Deadline ->
+            raise (Compile_error
+              "Deadline governor cannot be compiled faithfully: its wall-clock \
+               reading is engine-recorded replay evidence, not a JS expression")
         | Types.Fixpoint { window; progress } ->
             emit bctx (Printf.sprintf
               "if (!(%s)) { if (++_fixcount_%d >= %d) break; } else { _fixcount_%d = 0; }"
