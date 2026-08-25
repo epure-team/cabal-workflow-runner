@@ -153,6 +153,8 @@ type step =
   | Foreach of { over : string; steps : step list }
       (** Iterate over the JSON array at [ctx[over]], running [steps] once per
           element (bound as [ctx["item"]]). Sequential, not concurrent. *)
+  | Spawn of { id : string; children : spawn_child list }
+      (** Static, inline, sequential child bodies sharing the ordinary CWR context. *)
   | Shell of {
       id : string;
       commands : string list;  (** non-empty; each run via [sh -c cmd]. *)
@@ -179,6 +181,8 @@ type step =
       replay_domain : string;
       output : string;
     }
+
+and spawn_child = { id : string; steps : step list }
       (** Native authenticated export; never calls a backend. *)
 
 (** A loop governor — each can independently fire to stop the loop. *)
@@ -325,6 +329,14 @@ type trace_entry =
       (** Records the outcome of one foreach iteration. *)
   | Foreach_completed of { iterations : int }
       (** Records completion of a foreach step with the number of iterations run. *)
+  | Spawn_started of { id : string }
+  | Spawn_child_completed of {
+      spawn_id : string;
+      child_id : string;
+      outcome : outcome;
+      ctx : (string * Yojson.Safe.t) list;
+    }
+  | Spawn_completed of { id : string; children : int; outcome : outcome }
   | Ctx_snapshot of { ctx : (string * Yojson.Safe.t) list }
       (** Ledger-layer header recording the initial_ctx that was passed to
           {!Engine.run}. Written as the FIRST line of an on-disk ledger so that

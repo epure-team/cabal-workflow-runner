@@ -5,14 +5,23 @@
 > is implemented and tested, but the MVP boundaries are real: replay is now
 > **persistable on disk** (`run --ledger <file>` writes the trace; `replay <wf>
 > --ledger <file>` re-runs it byte-identically in a later process), the workflow
-> format is **JSON only** (YAML / Markdown front-ends are planned), there is **no `Spawn` /
-> sub-workflow step** yet, and the cabal-backed **live-dispatch path has been
+> format is **JSON only** (YAML / Markdown front-ends are planned), and `Spawn` is a
+> deliberately narrow **static, inline, sequential** composite (not a subprocess or
+> scheduler). The cabal-backed **live-dispatch path has been
 > validated on one small model**, not broadly. Interfaces may change.
 
 A **deterministic workflow engine on [cabal](https://github.com/epure-team/cabal)**
 (the Caml Agent Backend Abstraction Library). It interprets a declarative workflow —
 sequence, **governed loop**, branch, gate, and a terminal commit — running the
 control-flow **deterministically in OCaml** and dispatching **agent steps via cabal**.
+
+## Static `Spawn` experiment
+
+`{"kind":"spawn","id":"delegation","children":[{"id":"research","steps":[...]}, ...]}`
+executes finite child bodies in declaration order against the shared CWR context.
+Child IDs are non-empty and unique within a Spawn; each body is non-empty. Spawn is
+rejected below `Spawn`, `Parallel`, `Loop`, and `Foreach`, and the compiler rejects it
+explicitly because its replay evidence cannot be represented faithfully in JS.
 
 Agents return **structured JSON** bound into a **run context**; gate / branch / loop
 decisions are a **total predicate DSL** over that context (always terminating, never

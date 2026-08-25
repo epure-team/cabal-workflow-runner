@@ -89,6 +89,7 @@ type step =
   | Commit of { id : string; preflight : commit_preflight option }
   | Parallel of { branches : step list list }
   | Foreach of { over : string; steps : step list }
+  | Spawn of { id : string; children : spawn_child list }
   | Shell of {
       id : string;
       commands : string list;
@@ -108,6 +109,8 @@ type step =
       replay_domain : string;
       output : string;
     }
+
+and spawn_child = { id : string; steps : step list }
 
 and governor =
   | Max_iters of int
@@ -239,6 +242,14 @@ type trace_entry =
   | Foreach_iter_started of { index : int; element : Yojson.Safe.t }
   | Foreach_iter_completed of { index : int; outcome : outcome }
   | Foreach_completed of { iterations : int }
+  | Spawn_started of { id : string }
+  | Spawn_child_completed of {
+      spawn_id : string;
+      child_id : string;
+      outcome : outcome;
+      ctx : (string * Yojson.Safe.t) list;
+    }
+  | Spawn_completed of { id : string; children : int; outcome : outcome }
   | Ctx_snapshot of { ctx : (string * Yojson.Safe.t) list }
       (** Ledger-layer header recording the initial_ctx that was passed to
           [Engine.run]. Written as the FIRST line of an on-disk ledger so that

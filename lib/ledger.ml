@@ -111,6 +111,15 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
         [ ("index", `Int index); ("outcome", outcome_to_json outcome) ]
   | Foreach_completed { iterations } ->
       tagged "foreach_completed" [ ("iterations", `Int iterations) ]
+  | Spawn_started { id } -> tagged "spawn_started" [ ("id", `String id) ]
+  | Spawn_child_completed { spawn_id; child_id; outcome; ctx } ->
+      tagged "spawn_child_completed"
+        [ ("spawn_id", `String spawn_id); ("child_id", `String child_id);
+          ("outcome", outcome_to_json outcome); ("ctx", `Assoc ctx) ]
+  | Spawn_completed { id; children; outcome } ->
+      tagged "spawn_completed"
+        [ ("id", `String id); ("children", `Int children);
+          ("outcome", outcome_to_json outcome) ]
   | Shell_executed { id; results } ->
       tagged "shell_executed"
         [ ("id", `String id);
@@ -341,6 +350,16 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
       Foreach_iter_completed { index = dec_int "index" json; outcome }
   | "foreach_completed" ->
       Foreach_completed { iterations = dec_int "iterations" json }
+  | "spawn_started" -> Spawn_started { id = dec_string "id" json }
+  | "spawn_child_completed" ->
+      let ctx = match assoc_field "ctx" json with
+        | `Assoc fields -> fields | _ -> err "field \"ctx\" must be an object" in
+      Spawn_child_completed { spawn_id = dec_string "spawn_id" json;
+        child_id = dec_string "child_id" json;
+        outcome = outcome_of_json (assoc_field "outcome" json); ctx }
+  | "spawn_completed" -> Spawn_completed { id = dec_string "id" json;
+      children = dec_int "children" json;
+      outcome = outcome_of_json (assoc_field "outcome" json) }
   | "shell_executed" ->
       let id = dec_string "id" json in
       let results =

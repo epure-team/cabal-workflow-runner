@@ -556,6 +556,18 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
         | None ->
             let msg = Printf.sprintf "foreach.over=%S not found in ctx" over in
             { st with terminal = Some (Blocked msg) })
+    | Spawn { id; children } ->
+        let st = emit st (Spawn_started { id }) in
+        let st, completed = List.fold_left (fun (st, n) (child : spawn_child) ->
+          if st.terminal <> None then (st, n)
+          else
+            let st = go st child.steps in
+            let outcome = match st.terminal with Some value -> value | None -> Completed_no_commit in
+            let st = emit st (Spawn_child_completed { spawn_id = id; child_id = child.id;
+              outcome; ctx = st.ctx }) in
+            (st, n + 1)) (st, 0) children in
+        let outcome = match st.terminal with Some value -> value | None -> Completed_no_commit in
+        emit st (Spawn_completed { id; children = completed; outcome })
     | Parallel { branches } ->
         let n = List.length branches in
         (* None = branch was cancelled before completing *)
@@ -1201,6 +1213,28 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
             (* Missing key: run set Blocked; reproduce it here. *)
             let msg = Printf.sprintf "foreach.over=%S not found in ctx" over in
             { st with terminal = Some (Blocked msg) })
+    | Spawn { id; children } -> (
+        match next () with
+        | Spawn_started { id = recorded } when recorded = id ->
+            let st = emit st (Spawn_started { id }) in
+            let st, completed = List.fold_left (fun (st, n) (child : spawn_child) ->
+              if st.terminal <> None then (st, n)
+              else
+                let st = go st child.steps in
+                let outcome = match st.terminal with Some value -> value | None -> Completed_no_commit in
+                match next () with
+                | Spawn_child_completed { spawn_id; child_id; outcome = recorded_outcome; ctx }
+                  when spawn_id = id && child_id = child.id && recorded_outcome = outcome && ctx = st.ctx ->
+                    (emit st (Spawn_child_completed { spawn_id = id; child_id = child.id;
+                       outcome; ctx = st.ctx }), n + 1)
+                | _ -> raise (Replay_mismatch "spawn child evidence mismatch")) (st, 0) children in
+            let outcome = match st.terminal with Some value -> value | None -> Completed_no_commit in
+            (match next () with
+             | Spawn_completed { id = recorded; children = count; outcome = recorded_outcome }
+               when recorded = id && count = completed && recorded_outcome = outcome ->
+                 emit st (Spawn_completed { id; children = completed; outcome })
+             | _ -> raise (Replay_mismatch "spawn completion evidence mismatch"))
+        | _ -> raise (Replay_mismatch "spawn start evidence mismatch"))
     | Parallel { branches } -> (
         (* Consume: Parallel_started,
                    Parallel_branch_completed{branch_idx=0; trace=[...]; outcome}

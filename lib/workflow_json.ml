@@ -421,6 +421,21 @@ let rec step_of_json json =
       reject_unknown_keys ~what:"foreach step"
         ~known:[ "kind"; "over"; "steps" ] json;
       s
+  | "spawn" ->
+      let children = List.map (function
+        | (`Assoc _ as child) ->
+            let id = req_nonempty_string "id" child in
+            let steps = List.map step_of_json (req_nonempty_list "steps" child) in
+            reject_unknown_keys ~what:"spawn child" ~known:[ "id"; "steps" ] child;
+            { Types.id; steps }
+        | _ -> err "each spawn child must be an object")
+        (req_nonempty_list "children" json) in
+      let ids = List.map (fun (child : Types.spawn_child) -> child.id) children in
+      if List.length ids <> List.length (List.sort_uniq String.compare ids) then
+        err "spawn child ids must be unique";
+      let s = Spawn { id = req_nonempty_string "id" json; children } in
+      reject_unknown_keys ~what:"spawn step" ~known:[ "kind"; "id"; "children" ] json;
+      s
   | "shell" ->
       let s =
         Shell
@@ -650,6 +665,13 @@ let rec step_to_json = function
           ("over", `String over);
           ("steps", `List (List.map step_to_json steps));
         ]
+  | Spawn { id; children } ->
+      `Assoc [
+        ("kind", `String "spawn"); ("id", `String id);
+        ("children", `List (List.map (fun (child : Types.spawn_child) ->
+          `Assoc [ ("id", `String child.id);
+                   ("steps", `List (List.map step_to_json child.steps)) ]) children));
+      ]
   | Shell { id; commands; on_failure } ->
       `Assoc
         ([

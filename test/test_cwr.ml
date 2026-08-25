@@ -1566,6 +1566,11 @@ let test_commit_token_digest_only () =
                Printf.sprintf "foreach_iter_completed_%d" index
            | Foreach_completed { iterations } ->
                Printf.sprintf "foreach_completed_%d" iterations
+           | Spawn_started { id } -> "spawn_started_" ^ id
+           | Spawn_child_completed { spawn_id; child_id; _ } ->
+               "spawn_child_" ^ spawn_id ^ "_" ^ child_id
+           | Spawn_completed { id; children; _ } ->
+               Printf.sprintf "spawn_completed_%s_%d" id children
            | Shell_executed { id; _ } -> id
            | Evidence_evaluated { id; _ } -> id
            | Attestation_exported { id; _ } -> id
@@ -2021,7 +2026,7 @@ let test_schema_no_drift () =
    unknown kind. *)
 let test_schema_kinds_agree () =
   (* Hard-coded expected set the parser (Workflow_json.step_of_json) accepts. *)
-  let expected = [ "agent"; "attest"; "branch"; "commit"; "evidence"; "foreach"; "gate"; "loop"; "parallel"; "run"; "shell" ] in
+  let expected = [ "agent"; "attest"; "branch"; "commit"; "evidence"; "foreach"; "gate"; "loop"; "parallel"; "run"; "shell"; "spawn" ] in
   (* Extract the kind consts enumerated under $defs/step/oneOf in the schema. *)
   let top = match Workflow_schema.schema with `Assoc l -> l | _ -> [] in
   let step_def =
@@ -2251,6 +2256,7 @@ let parser_known_keys =
     ("commit", [ "kind"; "id"; "preflight" ]);
     ("parallel", [ "kind"; "branches" ]);
     ("foreach", [ "kind"; "over"; "steps" ]);
+    ("spawn", [ "kind"; "id"; "children" ]);
     ("shell", [ "kind"; "id"; "commands"; "on_failure" ]);
     ("evidence", [ "kind"; "id"; "build"; "check"; "zero_admits"; "tier"; "output" ]);
     ("attest", [ "kind"; "id"; "select"; "replay_domain"; "output" ]);
@@ -2660,6 +2666,11 @@ let test_ledger_roundtrip_all_variants () =
       Foreach_iter_started { index = 0; element = `String "x" };
       Foreach_iter_completed { index = 0; outcome = Completed_no_commit };
       Foreach_completed { iterations = 1 };
+      Spawn_started { id = "delegation" };
+      Spawn_child_completed { spawn_id = "delegation"; child_id = "research";
+        outcome = Completed_no_commit; ctx = [ ("outputs", `Assoc []) ] };
+      Spawn_completed { id = "delegation"; children = 1;
+        outcome = Completed_no_commit };
     ]
   in
   let serialised = Ledger.to_ndjson trace in
@@ -4472,6 +4483,35 @@ let test_commit_preflight_parse_lint_compiler () =
       {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["x"],"stdout_schema":{"ready":"bool"},"lock_file":"../escape"}}]}|};
       {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["cwr.commit_lock"],"stdout_schema":{"ready":"bool"},"lock_file":".campaign-state/.manifest-write.lock"}}]}|} ]
 
+let test_spawn_parse_run_replay_and_reject () =
+  let raw =
+    {|{"name":"spawn","steps":[{"kind":"spawn","id":"delegation","children":[{"id":"first","steps":[{"kind":"agent","id":"a","prompt":"a"}]},{"id":"second","steps":[{"kind":"agent","id":"b","prompt":"b"}]}]}]}|}
+  in
+  let wf = match Workflow_json.of_string raw with
+    | Ok wf -> wf | Error e -> Alcotest.failf "spawn parse failed: %s" e in
+  Alcotest.(check bool) "spawn round-trip" true
+    (contains_substring (Yojson.Safe.to_string (Workflow_json.to_json wf)) "spawn");
+  let backend = Backend.stub ~agent:(fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ->
+    true, `Assoc [ ("id", `String id) ]) () in
+  let validated = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None validated in
+  Alcotest.(check outcome_testable) "spawn completes" Completed_no_commit outcome;
+  Alcotest.(check bool) "spawn markers" true
+    (List.exists (function Spawn_started { id = "delegation" } -> true | _ -> false) trace
+     && List.exists (function Spawn_completed { id = "delegation"; children = 2; _ } -> true | _ -> false) trace);
+  Alcotest.(check outcome_testable) "spawn replay is backend-free" outcome
+    (engine_replay ~trace validated);
+  let rejected =
+    { name = "nested"; version = None;
+      steps = [ Spawn { id = "outer"; children = [ { id = "child";
+        steps = [ Spawn { id = "inner"; children = [ { id = "x"; steps = [ Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) } ] } ] } ] } ] } ] }
+  in
+  Alcotest.(check bool) "nested spawn rejected" true
+    (Lint.has_errors (Lint.check rejected));
+  let compiler_rejected = try ignore (Compiler.compile_workflow wf); false
+    with Compiler.Compile_error msg -> contains_substring msg "Spawn" in
+  Alcotest.(check bool) "compiler rejects spawn" true compiler_rejected
+
 let () =
   let test_agent_structured_input_parses_and_roundtrips () =
     let raw =
@@ -4741,6 +4781,9 @@ let () =
           Alcotest.test_case "branch outputs merged post-parallel" `Quick
             test_parallel_branch_output_merge;
         ] );
+      ( "spawn",
+        [ Alcotest.test_case "static Spawn parses, executes, replays, and compiler rejects" `Quick
+            test_spawn_parse_run_replay_and_reject ] );
       ( "lint-parallel",
         [
           Alcotest.test_case "commit-in-parallel => error diagnostic" `Quick

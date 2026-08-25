@@ -57,6 +57,13 @@ let print_trace trace =
             (Types.string_of_outcome outcome)
       | Types.Foreach_completed { iterations } ->
           Printf.printf "  foreach  completed %d iter(s)\n" iterations
+      | Types.Spawn_started { id } -> Printf.printf "  spawn    started %s\n" id
+      | Types.Spawn_child_completed { spawn_id; child_id; outcome; ctx = _ } ->
+          Printf.printf "  spawn    child %s/%s %s\n" spawn_id child_id
+            (Types.string_of_outcome outcome)
+      | Types.Spawn_completed { id; children; outcome } ->
+          Printf.printf "  spawn    completed %s (%d) %s\n" id children
+            (Types.string_of_outcome outcome)
       | Types.Shell_executed { id; results } ->
           Printf.printf "  shell    %-16s %d command(s)\n" id (List.length results)
       | Types.Evidence_evaluated { id; tier; passed } ->
@@ -415,6 +422,7 @@ let rec attest_steps steps = List.concat_map (function
   | Types.Loop { body; _ } -> attest_steps body
   | Types.Parallel { branches } -> List.concat_map attest_steps branches
   | Types.Foreach { steps; _ } -> attest_steps steps
+  | Types.Spawn { children; _ } -> List.concat_map (fun (child : Types.spawn_child) -> attest_steps child.steps) children
   | Types.Agent _ | Types.Gate _ | Types.Run _ | Types.Commit _ | Types.Shell _
   | Types.Evidence _ -> []) steps
 
