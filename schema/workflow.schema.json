@@ -437,6 +437,13 @@
         },
         {
           "type": "object",
+          "required": [ "kind" ],
+          "properties": { "kind": { "const": "deadline" } },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "required": [ "kind", "window", "progress" ],
           "properties": {
             "kind": { "const": "fixpoint" },

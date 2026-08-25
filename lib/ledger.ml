@@ -57,6 +57,8 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
   | Budget_read { value } -> tagged "budget_read" [ ("value", `Int value) ]
   | Fixpoint_progress { progress } ->
       tagged "fixpoint_progress" [ ("progress", `Bool progress) ]
+  | Deadline_read { expired } ->
+      tagged "deadline_read" [ ("expired", `Bool expired) ]
   | Loop_stopped { iterations; reason } ->
       tagged "loop_stopped"
         [ ("iterations", `Int iterations); ("reason", `String reason) ]
@@ -282,6 +284,7 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
   | "budget_read" -> Budget_read { value = dec_int "value" json }
   | "fixpoint_progress" ->
       Fixpoint_progress { progress = dec_bool "progress" json }
+  | "deadline_read" -> Deadline_read { expired = dec_bool "expired" json }
   | "loop_stopped" ->
       Loop_stopped
         {

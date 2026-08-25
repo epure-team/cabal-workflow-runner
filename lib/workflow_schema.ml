@@ -151,6 +151,8 @@ let governor_def : Yojson.Safe.t =
               ~props:[ ("kind", kind_const "max_iters"); ("n", bounded_int) ];
             closed_object_with ~required:[ "kind" ]
               ~props:[ ("kind", kind_const "budget") ];
+            closed_object_with ~required:[ "kind" ]
+              ~props:[ ("kind", kind_const "deadline") ];
             closed_object_with
               ~required:[ "kind"; "window"; "progress" ]
               ~props:

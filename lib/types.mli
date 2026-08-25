@@ -189,6 +189,20 @@ and spawn_child = { id : string; steps : step list }
 and governor =
   | Max_iters of int  (** stop after [n] iterations ([n >= 1]). *)
   | Budget  (** stop once [backend.budget () <= 0]. *)
+  | Deadline
+      (** stop once the operator-supplied wall-clock deadline has passed. The
+          instant is NOT in the workflow file: it is supplied at runtime to
+          {!val:Engine.run} (like the approval token and [run_allowlist]), so a
+          workflow declaring [Deadline] under a runtime with no deadline never
+          fires it — exactly as [Budget] never fires against a constant budget
+          stub. Like [Budget], the reading is nondeterministic, so each check
+          records a {!Deadline_read} verdict and replay re-feeds the RECORDED
+          verdict instead of consulting the clock.
+
+          {b This does not bound a step's duration.} Governors are checked
+          between iterations, so a single long-running agent step can overrun
+          the deadline arbitrarily; [Deadline] bounds how many further
+          iterations start, not when the run ends. *)
   | Fixpoint of { window : int; progress : Expr.t }
       (** stop after [window] consecutive iterations with [progress = false]
           ([window >= 1]). *)
@@ -276,6 +290,7 @@ type trace_entry =
   | Loop_iter of { index : int }
   | Budget_read of { value : int }
   | Fixpoint_progress of { progress : bool }
+  | Deadline_read of { expired : bool }
   | Loop_stopped of { iterations : int; reason : string }
   | Run_executed of {
       id : string;

@@ -21,6 +21,8 @@ val run :
   ?attestation_artifact_root:string ->
   ?attestation_session_nonce:string ->
   ?agent_backend_id:string ->
+  ?deadline:float ->
+  ?now:(unit -> float) ->
   sw:Eio.Switch.t ->
   backend:Backend.t ->
   token:string option ->
@@ -49,8 +51,9 @@ val run :
       the arm.
     - [Loop] -> bounded by the engine ceiling [max_loop_iters]; each iteration
       binds ["loop.iter"], runs [body], then stops if [until] holds OR any governor
-      fires ([Max_iters], [Budget] via [backend.budget], or [Fixpoint]). The
-      ceiling is the termination guarantee; governors are early-stop heuristics.
+      fires ([Max_iters], [Budget] via [backend.budget], [Deadline] via the
+      wall clock, or [Fixpoint]). The ceiling is the termination guarantee;
+      governors are early-stop heuristics.
     - [Run] -> execute an observable shell command via the INJECTED
       [backend.run_command] effect, recording the full {!Types.run_result} as a
       [Run_executed] trace entry and binding it into ["outputs.<id>"]. The
@@ -81,6 +84,19 @@ val run :
     can NEVER grant itself the allowlist — it is not a workflow field. The
     [working_dir] bounds the cwd / snapshot scope but does NOT sandbox the
     command from absolute paths in its args; full isolation is out of scope.
+
+    [deadline] (absent by default) is likewise OPERATOR-supplied and RUNTIME-only:
+    an absolute instant (Unix epoch seconds) after which a [Deadline] governor
+    stops its loop. A workflow file cannot carry it. Each [Deadline] check
+    records its verdict, and {!val:replay} re-feeds the RECORDED verdict rather
+    than consulting the clock — which is why [replay] takes no [deadline]: a run
+    recorded after its deadline passed must still reproduce. [now] (default
+    [Unix.gettimeofday]) is the clock seam, so a caller can supply a
+    deterministic clock; it is only ever read by a [Deadline] governor check.
+
+    {b [deadline] does not bound a step's duration.} Governors are evaluated
+    between iterations, so one long agent step can overrun it arbitrarily; it
+    bounds how many further iterations start, not when the run ends.
 
     The token is exclusively a runtime parameter; no step can carry it. *)
 

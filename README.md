@@ -26,9 +26,9 @@ explicitly because its replay evidence cannot be represented faithfully in JS.
 Agents return **structured JSON** bound into a **run context**; gate / branch / loop
 decisions are a **total predicate DSL** over that context (always terminating, never
 raising). Every loop is **hard-bounded by an engine iteration ceiling** (default
-`10_000`) — the termination guarantee; `Max_iters` / `Budget` / `Fixpoint` / `until` are
-early-stop heuristics under it (a loop must still declare ≥1 governor, by intent). A
-floor `Gate` that evaluates **false blocks** the run.
+`10_000`) — the termination guarantee; `Max_iters` / `Budget` / `Deadline` / `Fixpoint`
+/ `until` are early-stop heuristics under it (a loop must still declare ≥1 governor, by
+intent). A floor `Gate` that evaluates **false blocks** the run.
 
 You get data-driven workflows **without** losing determinism, because the interpreter
 is deterministic, the **safety floor is enforced by the engine/validator as an
@@ -36,6 +36,27 @@ invariant over any workflow** (not by the workflow author), and runs **replay** 
 recorded trace — the governor's inputs (and the constant ceiling) are recorded, so even
 a loop that hits the ceiling replays byte-identically. See [`SPEC.md`](SPEC.md) and
 [`CHANGELOG.md`](CHANGELOG.md).
+
+## The `Deadline` governor
+
+`{"kind":"deadline"}` stops a loop once an operator-supplied wall-clock instant has
+passed. The instant is **not in the workflow file** — it is supplied at runtime
+(`Engine.run ~deadline`), like the approval token and the `Run` allowlist. A workflow
+declaring `Deadline` under a runtime that supplies none never fires it, exactly as
+`Budget` never fires against a constant budget stub.
+
+**What it does not do.** `Deadline` does **not** bound the duration of a step. Governors
+are checked *between* iterations, so a single long-running agent step can overrun the
+deadline by any amount; what the governor bounds is how many further iterations start.
+Agent steps carry no timeout, so "the run ends by T" is not a guarantee this feature
+provides — if you need a hard stop, you still need one outside the engine.
+
+**Replay is clock-free.** Each check records its verdict (`deadline_read`, a bool — never
+a float, so the ledger round-trips byte-identically) and replay re-feeds the *recorded*
+verdict instead of re-reading the clock. Without that, a recorded run would stop being
+reproducible the moment its deadline passed. The JS compiler **refuses** a `Deadline`
+governor for the same reason: a JS target has no engine-recorded clock reading, so any
+emitted approximation would be a governor that looks present and behaves differently.
 
 The project is **domain-neutral**. [`examples/bounty.workflow.json`](examples/bounty.workflow.json)
 is just one illustration — the bounty pipeline expressed as a single workflow file.

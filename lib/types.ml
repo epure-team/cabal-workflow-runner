@@ -115,6 +115,7 @@ and spawn_child = { id : string; steps : step list }
 and governor =
   | Max_iters of int
   | Budget
+  | Deadline
   | Fixpoint of { window : int; progress : Expr.t }
 
 type workflow = { name : string; steps : step list; version : string option }
@@ -202,6 +203,8 @@ type trace_entry =
   | Loop_iter of { index : int }  (** start of loop iteration [index] (0-based). *)
   | Budget_read of { value : int }  (** a [backend.budget ()] reading. *)
   | Fixpoint_progress of { progress : bool }  (** a Fixpoint progress verdict. *)
+  | Deadline_read of { expired : bool }
+      (** a Deadline governor's wall-clock verdict. *)
   | Loop_stopped of { iterations : int; reason : string }
   | Run_executed of {
       id : string;

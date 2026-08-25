@@ -29,7 +29,7 @@ commit). A `workflow` is a name plus a `step list`:
 | `Agent { id; prompt; read_only; output_schema; on_failure; protocol; brief; agent_type; model; input }` | Dispatch agent work; records `(success, structured_json)` and binds it into the run context under `outputs.<id>`. Optional `input` selects guaranteed predecessor paths for a **read-only** Agent and creates engine-owned request/result receipts under `receipts.<id>`. A **`success = false` run fails closed** → `Aborted` **by default** (`on_failure = "abort"`); with **`on_failure = "continue"` the failure is soft. On success, `output_schema` is validated fail-closed. | Effect isolated to the backend; structured output and optional receipts recorded and replay-checked. |
 | `Gate { id; when_ }` | **Pure** verdict: `Pass` iff `Expr.eval when_` over the run context (no backend). A `Pass` records the verdict and continues; a **`Fail` BLOCKS** the run (`Blocked`, naming the gate id). | Verdict recorded; a false gate is a terminal block. |
 | `Branch { when_; then_; else_ }` | Evaluate `when_`; take `then_` when true, `else_` when false. | Pure control flow over the recorded verdict. |
-| `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Fixpoint` are early-stop heuristics under it. |
+| `Loop { body; until; governors }` | Run `body`; bind its outputs; stop when `until` holds, any governor fires, **or** the engine iteration ceiling is reached. | **Hard-bounded** — every loop stops at an unconditional engine ceiling (default `10_000`); `until`/`Budget`/`Deadline`/`Fixpoint` are early-stop heuristics under it. |
 | `Run { id; cmd; working_dir; timeout_ms; observe; input; stdout_schema }` | Execute an observable command (no shell) via the injected `Backend.run_command`. Optional `input` selects dotted context paths into restricted-canonical JSON on stdin; optional `stdout_schema` requires a non-truncated canonical-profile object stdout and binds it as `outputs.<id>.parsed`. Structured Runs are invalid beneath Parallel. | Command runs **exactly once** live. `Run_executed` binds result, input digest, and parsed stdout; replay recomputes/revalidates them and **never executes**. |
 | `Attest { id; select; replay_domain; output }` | Select context paths and atomically export a canonical Ed25519 envelope beneath an operator artifact root. Requires an engine-held signer and non-empty operator session nonce. | No backend receives the private key. Replay and standalone verification recompute bindings and verify against a pin without writing. |
 | `Commit { id; preflight }` | The **only** step that can file/submit. Optional preflight contains required `cmd`, `input`, `stdout_schema` and optional `working_dir`, `timeout_ms`. | Requires a runtime token first. Preflight then executes once through the Run allowlist immediately before Commit; its receipt is Commit-bound and replay never executes it. |
@@ -133,12 +133,19 @@ heuristics**:
 
 - `Max_iters n` — an explicit **lower** bound: stop after `n` iterations (`n ≥ 1`);
 - `Budget` — stop once `backend.budget () <= 0`;
+- `Deadline` — stop once the operator-supplied wall-clock instant has passed. The instant
+  is a **runtime** value (`Engine.run ~deadline`), never a workflow field; with none
+  supplied the governor never fires. Each check records a `deadline_read` **bool** verdict
+  and replay re-feeds the recorded verdict rather than reading the clock, so a run
+  recorded after its deadline passed still replays byte-identically. It bounds how many
+  further iterations **start** — it does **not** bound the duration of a step;
 - `Fixpoint { window; progress }` — stop after `window` consecutive iterations where
   `progress` evaluated `false` (`window ≥ 1`).
 
 Per iteration the engine first checks the ceiling, then binds `loop.iter`, runs `body`
 (binding its agent outputs), then stops if `until` holds **or** any governor fires. A
-loop may legitimately have **no `Max_iters`** (e.g. only `Budget` or `Fixpoint`): the
+loop may legitimately have **no `Max_iters`** (e.g. only `Budget`, `Deadline`, or
+`Fixpoint`): the
 ceiling still bounds it. What is forbidden by the validator is an **empty** `governors`
 list (intent), but the termination guarantee itself is the ceiling, not the governors.
 
