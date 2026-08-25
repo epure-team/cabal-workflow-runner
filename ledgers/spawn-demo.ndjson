@@ -1,0 +1,3 @@
+{"kind":"spawn_started","id":"delegation"}
+{"kind":"spawn_child_completed","spawn_id":"delegation","child_id":"research","outcome":"completed_no_commit","ctx":{"outputs":{"research":{"status":"ok"}}}}
+{"kind":"spawn_completed","id":"delegation","children":1,"outcome":"completed_no_commit"}
