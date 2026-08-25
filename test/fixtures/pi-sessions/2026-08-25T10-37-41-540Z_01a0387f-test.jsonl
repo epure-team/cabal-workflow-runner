@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"01a0387f-test","timestamp":"2026-08-25T10:37:41.540Z","cwd":"/workspace/project"}
+{"type":"session_info","id":"info","parentId":null,"timestamp":"2026-08-25T10:37:41.541Z","name":"P1 typed domain"}
+{"type":"model_change","id":"model","parentId":"info","timestamp":"2026-08-25T10:37:41.555Z","provider":"ollama","modelId":"qwen-test"}
+{"type":"message","id":"user","parentId":"model","timestamp":"2026-08-25T10:37:42.000Z","message":{"role":"user","content":[{"type":"text","text":"Inspect the domain. api_key=must-not-leak"}]}}
+{"type":"message","id":"assistant","parentId":"user","timestamp":"2026-08-25T10:37:43.000Z","message":{"role":"assistant","content":[{"type":"text","text":"I will inspect it."},{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"lib/domain.ml","authorization":"Bearer must-not-leak"}}],"model":"qwen-test","stopReason":"toolUse"}}
+{"type":"message","id":"result","parentId":"assistant","timestamp":"2026-08-25T10:37:44.000Z","message":{"role":"toolResult","toolCallId":"call-1","toolName":"read","content":[{"type":"text","text":"type money = int"}],"isError":false}}
+{"type":"message","id":"done","parentId":"result","timestamp":"2026-08-25T10:37:45.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"model":"qwen-test","stopReason":"stop"}}
