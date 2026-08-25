@@ -71,6 +71,7 @@ let rec any_commit steps =
       | Loop { body; _ } -> any_commit body
       | Parallel { branches } -> List.exists any_commit branches
       | Foreach { steps = body; _ } -> any_commit body
+      | Spawn { children; _ } -> List.exists (fun (child : spawn_child) -> any_commit child.steps) children
       | Agent _ | Gate _ | Run _ | Shell _ | Evidence _ | Attest _ -> false)
     steps
 
@@ -88,6 +89,7 @@ and collect_agent_ids_step step : string list =
   | Loop { body; _ } -> collect_agent_ids body
   | Parallel { branches } -> List.concat_map collect_agent_ids branches
   | Foreach { steps = body; _ } -> collect_agent_ids body
+  | Spawn { children; _ } -> List.concat_map (fun (child : spawn_child) -> collect_agent_ids child.steps) children
   | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ | Attest _ -> []
 
 and collect_agent_ids steps =
@@ -255,6 +257,10 @@ and floor_step ~floor ~loc ~guaranteed acc step =
       ignore
         (floor_steps ~floor ~loc_prefix:(loc ^ ".steps") ~guaranteed acc body);
       guaranteed
+  | Spawn { children; _ } ->
+      List.fold_left (fun g (child : spawn_child) ->
+        floor_steps ~floor ~loc_prefix:(loc ^ ".children." ^ child.id) ~guaranteed:g acc child.steps)
+        guaranteed children
 
 (* ---- output-reference analysis (Warning diagnostics) -------------------- *)
 
@@ -528,6 +534,10 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
          and propagate body outputs forward, since typical use is: foreach body
          produces something, then steps after foreach read it. *)
       refs_steps ~loc_prefix:(loc ^ ".steps") ~produced ~warned_missing acc body
+  | Spawn { children; _ } ->
+      List.fold_left (fun produced (child : spawn_child) ->
+        refs_steps ~loc_prefix:(loc ^ ".children." ^ child.id) ~produced ~warned_missing acc child.steps)
+        produced children
 
 (* ---- unreachable-after-commit + no-commit (Warnings) -------------------- *)
 
@@ -546,6 +556,7 @@ let rec any_continue_agent steps =
       | Loop { body; _ } -> any_continue_agent body
       | Parallel { branches } -> List.exists any_continue_agent branches
       | Foreach { steps = body; _ } -> any_continue_agent body
+      | Spawn { children; _ } -> List.exists (fun (child : spawn_child) -> any_continue_agent child.steps) children
       | Agent _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ | Attest _ -> false)
     steps
 
@@ -583,6 +594,8 @@ let rec unreachable_steps ~loc_prefix acc steps =
                 branches
           | Foreach { steps = body; _ } ->
               unreachable_steps ~loc_prefix:(loc ^ ".steps") acc body
+          | Spawn { children; _ } -> List.iter (fun (child : spawn_child) ->
+              unreachable_steps ~loc_prefix:(loc ^ ".children." ^ child.id) acc child.steps) children
           | _ -> ());
           let seen' = match step with Commit _ -> true | _ -> false in
           (i + 1, seen')
@@ -658,6 +671,8 @@ let rec run_steps ~loc_prefix acc steps =
             branches
       | Foreach { steps = body; _ } ->
           run_steps ~loc_prefix:(loc ^ ".steps") acc body
+      | Spawn { children; _ } -> List.iter (fun (child : spawn_child) ->
+          run_steps ~loc_prefix:(loc ^ ".children." ^ child.id) acc child.steps) children
       | _ -> ())
     steps
 
@@ -673,6 +688,7 @@ let attest_safety acc steps =
     | Branch { then_; else_; _ } -> collect_agents then_; collect_agents else_
     | Loop { body; _ } -> collect_agents body
     | Foreach { steps; _ } -> collect_agents steps
+    | Spawn { children; _ } -> List.iter (fun (child : spawn_child) -> collect_agents child.steps) children
     | Parallel { branches } -> List.iter collect_agents branches
     | Attest _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> ()) steps in
   collect_agents steps;
@@ -733,6 +749,8 @@ let attest_safety acc steps =
           ~loc_prefix:(loc ^ ".body") body
       | Foreach { steps; _ } -> walk ~in_parallel ~repeatable:true
           ~loc_prefix:(loc ^ ".steps") steps
+      | Spawn { children; _ } -> List.iter (fun (child : spawn_child) ->
+          walk ~in_parallel ~repeatable ~loc_prefix:(loc ^ ".children." ^ child.id) child.steps) children
       | Parallel { branches } -> List.iteri (fun n branch ->
           walk ~in_parallel:true ~repeatable
             ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc n) branch) branches
@@ -775,6 +793,25 @@ let check ?(floor_gates = []) (wf : Types.workflow) : diagnostic list =
   (* Warnings: run steps execute commands (+ destructive-command notice). *)
   run_steps ~loc_prefix:"steps" acc wf.steps;
   attest_safety acc wf.steps;
+  let rec spawn_placement ~under_forbidden ~in_spawn ~loc_prefix steps =
+    List.iteri (fun i step ->
+      let loc = loc_index loc_prefix i in match step with
+      | Spawn { id; children } ->
+          if under_forbidden || in_spawn then acc := { severity = Error;
+            code = "invalid-spawn-placement";
+            message = Printf.sprintf "Spawn %S cannot occur beneath Spawn, Parallel, Loop, or Foreach" id; loc } :: !acc;
+          List.iter (fun (child : spawn_child) -> spawn_placement ~under_forbidden:false ~in_spawn:true
+            ~loc_prefix:(loc ^ ".children." ^ child.id) child.steps) children
+      | Branch { then_; else_; _ } ->
+          spawn_placement ~under_forbidden ~in_spawn ~loc_prefix:(loc ^ ".then") then_;
+          spawn_placement ~under_forbidden ~in_spawn ~loc_prefix:(loc ^ ".else") else_
+      | Loop { body; _ } -> spawn_placement ~under_forbidden:true ~in_spawn ~loc_prefix:(loc ^ ".body") body
+      | Foreach { steps; _ } -> spawn_placement ~under_forbidden:true ~in_spawn ~loc_prefix:(loc ^ ".steps") steps
+      | Parallel { branches } -> List.iteri (fun n branch -> spawn_placement ~under_forbidden:true ~in_spawn
+          ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc n) branch) branches
+      | _ -> ()) steps
+  in
+  spawn_placement ~under_forbidden:false ~in_spawn:false ~loc_prefix:"steps" wf.steps;
   (* Error: a soft-failing agent (on_failure=continue) in a workflow that can
      Commit. The commit-floor invariant guarantees a Commit is gate-ID-preceded
      but NOT that those gates' predicates consume the soft-failed agent's output —

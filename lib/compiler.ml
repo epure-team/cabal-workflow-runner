@@ -375,6 +375,9 @@ and compile_step ctx step =
       add_note ctx ~kind:"foreach"
         ~description:(Printf.sprintf
           "foreach over ctx key %S compiled to pipeline(); static ctx reference" over)
+  | Types.Spawn { id; _ } ->
+      raise (Compile_error (Printf.sprintf
+        "Spawn step %S cannot be compiled faithfully: static sequential delegation and replay evidence are engine-only" id))
   | Types.Shell { id; commands; on_failure = _ } ->
       emit_comment ctx (Printf.sprintf
         "[CWR shell: id=%S (%d command(s)) — not representable in Claude Workflow JS]" id
@@ -414,6 +417,7 @@ let compile_workflow (wf : Types.workflow) : string * note list =
     | Types.Loop { body; _ } -> has_attest body
     | Types.Parallel { branches } -> List.exists has_attest branches
     | Types.Foreach { steps; _ } -> has_attest steps
+    | Types.Spawn { children; _ } -> List.exists (fun (child : Types.spawn_child) -> has_attest child.steps) children
     | _ -> false) steps in
   if has_attest wf.steps then
     raise (Compile_error
