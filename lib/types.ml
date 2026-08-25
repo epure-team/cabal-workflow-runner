@@ -43,6 +43,34 @@ module Schema = struct
           | Some v -> if ok_ty ty v then go rest else Error field)
     in
     go schema
+
+  (* The same constraint as a JSON Schema object, for a backend that can
+     constrain its model natively. Kept deliberately equivalent to [validate]
+     above: every arm here mirrors an arm of [ok_ty], [required] mirrors
+     [validate]'s "an absent field is an error", and [additionalProperties]
+     mirrors the fact that [validate] never looks at extra fields. If [ok_ty]
+     gains an arm, this must gain one too — a native constraint STRICTER than
+     [validate] would reject output the engine would have accepted; a LOOSER one
+     is merely a weaker guide. See the .mli for why [Any] stays required and why
+     no "$schema" key is emitted. *)
+  let json_schema_of_ty = function
+    | String -> `Assoc [ ("type", `String "string") ]
+    | Int -> `Assoc [ ("type", `String "integer") ]
+    | Number -> `Assoc [ ("type", `String "number") ]
+    | Bool -> `Assoc [ ("type", `String "boolean") ]
+    | Enum opts ->
+        `Assoc
+          [ ("type", `String "string");
+            ("enum", `List (List.map (fun o -> `String o) opts)) ]
+    | Any -> `Assoc []
+
+  let to_json_schema (schema : t) : Yojson.Safe.t =
+    `Assoc
+      [ ("type", `String "object");
+        ( "properties",
+          `Assoc (List.map (fun (f, ty) -> (f, json_schema_of_ty ty)) schema) );
+        ("required", `List (List.map (fun (f, _) -> `String f) schema));
+        ("additionalProperties", `Bool true) ]
 end
 
 type on_failure = Abort | Continue

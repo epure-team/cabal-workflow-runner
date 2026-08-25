@@ -23,6 +23,34 @@ module Schema : sig
   val validate : t -> Yojson.Safe.t -> (unit, string) result
   (** Fail-closed: each required field must be present and type-correct.
       Returns [Error field] naming the first offending field, else [Ok ()]. *)
+
+  val to_json_schema : t -> Yojson.Safe.t
+  (** The same constraint expressed as a JSON Schema object, for a backend that
+      can constrain its model's output natively (a CLI's [--json-schema]).
+
+      This is a {b guide}, not the guarantee: {!validate} is still applied to
+      whatever comes back. A backend may ignore the schema, add a field of its
+      own, or be replaced by one with no native support at all.
+
+      Translation, field by field:
+      - [String] / [Int] / [Number] / [Bool] become ["string"] / ["integer"] /
+        ["number"] / ["boolean"]. [Number] accepts an int in {!validate}, and
+        JSON Schema's ["number"] does too, so the two agree.
+      - [Enum opts] becomes a ["string"] with an ["enum"], mirroring
+        {!validate}'s [Enum opts, `String s -> List.mem s opts].
+      - [Any] becomes the empty schema [{}] and {b stays in ["required"]}.
+        {!validate} demands the field be PRESENT while accepting any type for
+        it, so dropping it from ["required"] would invite a model to omit a
+        field the validator then rejects — trading a soft constraint for a hard
+        abort.
+      - ["additionalProperties"] is [true], because {!validate} ignores extra
+        fields and at least one backend adds its own (a dispatch session id).
+        [false] here would reject output the engine accepts.
+
+      No ["$schema"] key is emitted. The dialect belongs to the transport — a
+      backend declares which draft its CLI accepts — and every construct used
+      here is identical in draft 7 and 2020-12, so naming one would only risk a
+      strict consumer rejecting the other. *)
 end
 
 (** A single workflow step. Illegal states are made hard to express:

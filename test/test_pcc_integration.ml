@@ -186,7 +186,7 @@ let engine_run ~fixture_dir ~author_edit ~fixer_seq
           let run_command = Cwr_runner.Runner.make ~sw ~env ~base:fixture_dir in
           let run_pinned_command = Cwr_runner.Runner.make_pinned ~sw ~env ~base:fixture_dir in
           let calls = Hashtbl.create 8 in
-          let run_agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+          let run_agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
             let n = Option.value ~default:0 (Hashtbl.find_opt calls id) in
             Hashtbl.replace calls id (n + 1);
             match id with
