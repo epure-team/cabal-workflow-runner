@@ -499,6 +499,45 @@ let test_required_attestation_cannot_be_bypassed () =
     (Result.is_ok (Validate.workflow ~required_attestations:["export"]
       ~floor_gates:[] { empty with steps = [ attest ] }))
 
+(* The Spawn arm of Validate.required_attestation_errors UNIONS the guaranteed
+   set across children (unlike Foreach/Loop, which discard it). That is only
+   sound because Spawn children are static, non-empty and sequential, and
+   because Engine.go short-circuits every later step once a terminal is set.
+   These cases pin both polarities of that reasoning. *)
+let test_spawn_attestation_floor () =
+  let attest = Attest { id = "export"; select = [ "campaign" ];
+    replay_domain = "d"; output = "a.json" } in
+  let spawn children = { name = "spawn-floor"; version = Some "1.0";
+    steps = [ Spawn { id = "delegation"; children } ] } in
+  let check_ok label wf = Alcotest.(check bool) label true
+    (Result.is_ok (Validate.workflow ~required_attestations:["export"]
+      ~floor_gates:[] wf)) in
+  let check_err label wf = Alcotest.(check bool) label true
+    (Result.is_error (Validate.workflow ~required_attestations:["export"]
+      ~floor_gates:[] wf)) in
+  (* A child that attests makes the attestation guaranteed: children are static
+     and always entered, so unlike a foreach body this is not a "may run zero
+     times" path. *)
+  check_ok "attest in the only child is guaranteed"
+    (spawn [ { id = "a"; steps = [ attest ] } ]);
+  check_ok "attest in a later child is still guaranteed"
+    (spawn [ { id = "a"; steps = [ Gate { id = "g";
+                 when_ = Expr.Lit (Expr.Bool true) } ] };
+             { id = "b"; steps = [ attest ] } ]);
+  (* Nothing attests anywhere: must be refused, else the union arm would be a
+     floor bypass rather than a sound relaxation. *)
+  check_err "spawn without any attest rejected"
+    (spawn [ { id = "a"; steps = [ Gate { id = "g";
+                 when_ = Expr.Lit (Expr.Bool true) } ] } ]);
+  (* Ordering must still be enforced INSIDE the union: a Commit in an earlier
+     child cannot borrow an attestation performed by a later child. *)
+  check_err "commit before a later child's attest rejected"
+    (spawn [ { id = "a"; steps = [ Commit { id = "c"; preflight = None } ] };
+             { id = "b"; steps = [ attest ] } ]);
+  check_ok "commit after an earlier child's attest accepted"
+    (spawn [ { id = "a"; steps = [ attest ] };
+             { id = "b"; steps = [ Commit { id = "c"; preflight = None } ] } ])
+
 let test_distinct_attest_ids_and_outputs_are_unique () =
   let mk id output = Attest { id; select = [ "campaign" ];
     replay_domain = "d"; output } in
@@ -663,6 +702,8 @@ let () =
             test_required_attestation_cannot_be_bypassed;
           Alcotest.test_case "distinct IDs and outputs are unique" `Quick
             test_distinct_attest_ids_and_outputs_are_unique;
+          Alcotest.test_case "spawn attestation floor" `Quick
+            test_spawn_attestation_floor;
           Alcotest.test_case "loop occurrences are signed and replayed" `Quick
             test_loop_occurrences_are_distinct_and_replayable;
           Alcotest.test_case "repeatable output requires occurrence template" `Quick
