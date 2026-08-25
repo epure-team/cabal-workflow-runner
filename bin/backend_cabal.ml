@@ -78,6 +78,12 @@ let extract_json (raw : string) : Yojson.Safe.t option =
 
 let structured_output (result : Backend_types.task_result) :
     bool * Yojson.Safe.t =
+  let attach_session_id json =
+    match result.Backend_types.session_id, json with
+    | Some session_id, `Assoc fields ->
+        `Assoc (("session_id", `String session_id) :: List.remove_assoc "session_id" fields)
+    | _ -> json
+  in
   let base_success =
     match result.Backend_types.status with
     | Backend_types.Success -> true
@@ -90,10 +96,10 @@ let structured_output (result : Backend_types.task_result) :
   in
   let from_text () = extract_json result.Backend_types.agent_text in
   match (base_success, from_report) with
-  | true, Some j -> (true, j)
+  | true, Some j -> (true, attach_session_id j)
   | true, None -> (
       match from_text () with
-      | Some j -> (true, j)
+      | Some j -> (true, attach_session_id j)
       (* successful run but no parseable structured JSON => fail closed *)
       | None -> (false, `Assoc [ ("error", `String "no parseable structured JSON") ]))
   | false, _ ->
