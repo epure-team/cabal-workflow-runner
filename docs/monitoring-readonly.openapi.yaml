@@ -1,0 +1,83 @@
+openapi: 3.1.0
+info:
+  title: CWR read-only monitoring proposal
+  version: 0.1.0-experimental
+  description: >-
+    Design artifact only. This API is intentionally not implemented by CWR and
+    MUST NOT receive authority to run, replay, dispatch, approve, mutate, or
+    write workflow artifacts.
+servers:
+  - url: https://cwr-monitor.example.invalid
+security:
+  - tailnetAuth: []
+paths:
+  /v1/ledgers:
+    get:
+      summary: List operator-selected persisted ledgers
+      operationId: listLedgers
+      responses:
+        '200':
+          description: Raw, untrusted ledger metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LedgerSummary'
+        '401': { description: Unauthenticated }
+        '403': { description: Unauthorized }
+  /v1/ledgers/{ledgerId}/entries:
+    get:
+      summary: Read a bounded ordered page of raw ledger entries
+      operationId: getLedgerEntries
+      parameters:
+        - $ref: '#/components/parameters/LedgerId'
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Raw, untrusted entries; no replay or attestation verdict is implied.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ledgerId, raw_untrusted, entries]
+                properties:
+                  ledgerId: { type: string }
+                  raw_untrusted: { const: true }
+                  entries:
+                    type: array
+                    items: {}
+        '400': { description: Invalid pagination or ledger data }
+        '401': { description: Unauthenticated }
+        '403': { description: Unauthorized }
+        '404': { description: Ledger not selected or not found }
+components:
+  parameters:
+    LedgerId:
+      name: ledgerId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+  schemas:
+    LedgerSummary:
+      type: object
+      required: [id, raw_untrusted]
+      properties:
+        id: { type: string }
+        raw_untrusted: { const: true }
+  securitySchemes:
+    tailnetAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Tailscale identity proxy token
