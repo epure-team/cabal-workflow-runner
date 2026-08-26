@@ -4842,6 +4842,32 @@ let test_dynamic_parallel_zero_branches_is_noop () =
        | Dynamic_parallel_completed { id = "fanout"; branches = 0; outcome = Completed_no_commit; failed = [] } -> true
        | _ -> false) trace)
 
+(* FR-007/AC-5: exactly 1 runtime-resolved branch must run the single branch
+   without triggering Parallel's static >=2-branch arity check
+   ("parallel-too-few-branches", enforced only for literal "kind":"parallel"
+   steps at parse time in Workflow_json.of_json). dynamic_parallel's runtime
+   branch count is resolved from [over] at engine-run time, not from a
+   static "branches" list at parse time, so that check structurally cannot
+   apply here regardless of the resolved count -- this test proves a
+   1-branch run actually succeeds end-to-end rather than merely asserting
+   the two mechanisms are textually distinct. *)
+let test_dynamic_parallel_single_branch_skips_parallel_arity_check () =
+  let agent_calls = ref 0 in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    incr agent_calls; (true, `Assoc []) in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "only" ]) ] v in
+  Alcotest.(check outcome_testable) "1 branch => success, not blocked on arity"
+    Completed_no_commit outcome;
+  Alcotest.(check int) "exactly one agent dispatched" 1 !agent_calls;
+  Alcotest.(check bool) "the single branch's completion is recorded" true
+    (List.exists (function
+       | Dynamic_parallel_branch_completed { key = "only"; _ } -> true
+       | _ -> false) trace)
+
 let test_dynamic_parallel_over_resolution_fails_closed () =
   let agent_calls = ref 0 in
   let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
@@ -5386,6 +5412,8 @@ let () =
             test_dynamic_parallel_parse_roundtrip;
           Alcotest.test_case "0 branches => success no-op, no agent dispatched" `Quick
             test_dynamic_parallel_zero_branches_is_noop;
+          Alcotest.test_case "1 branch => succeeds, never triggers Parallel's arity check (FR-007/AC-5)" `Quick
+            test_dynamic_parallel_single_branch_skips_parallel_arity_check;
           Alcotest.test_case "over resolution fails closed before any dispatch" `Quick
             test_dynamic_parallel_over_resolution_fails_closed;
           Alcotest.test_case "proves genuine fiber-level concurrency (overlap, not just eventual completion)" `Quick
