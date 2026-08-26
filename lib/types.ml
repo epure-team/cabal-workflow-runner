@@ -118,6 +118,7 @@ type step =
   | Parallel of { branches : step list list }
   | Foreach of { over : string; steps : step list }
   | Spawn of { id : string; children : spawn_child list }
+  | Dynamic_parallel of { id : string; over : string; steps : step list }
   | Shell of {
       id : string;
       commands : string list;
@@ -157,6 +158,12 @@ type outcome =
   | Completed_no_commit
   | Blocked of string
   | Aborted of string
+  | Cancelled of string
+      (* A Dynamic_parallel branch that was still in flight when a sibling
+         branch aborted: it never got the chance to commit or fail on its own
+         terms. Genuinely distinct from [Aborted]/[Blocked] (which mean the
+         branch itself hit an error) and from "never started" (a cancelled
+         branch DID begin; it just didn't get to finish). *)
 
 (* A single observed filesystem change produced by a [Run] step. *)
 type file_change_kind =
@@ -281,6 +288,23 @@ type trace_entry =
       ctx : (string * Yojson.Safe.t) list;
     }
   | Spawn_completed of { id : string; children : int; outcome : outcome }
+  | Dynamic_parallel_started of { id : string; branches : int }
+  | Dynamic_parallel_branch_completed of {
+      id : string;
+      branch_idx : int;
+      key : string;
+      trace : trace_entry list;
+      outcome : outcome;
+      branch_outputs : (string * Yojson.Safe.t) list;
+    }
+  | Dynamic_parallel_completed of {
+      id : string;
+      branches : int;
+      outcome : outcome;
+      failed : (string * string) list;
+          (** (key, reason) for EVERY branch that raised an error — plural,
+              never truncated to the first offender. *)
+    }
   | Ctx_snapshot of { ctx : (string * Yojson.Safe.t) list }
       (** Ledger-layer header recording the initial_ctx that was passed to
           [Engine.run]. Written as the FIRST line of an on-disk ledger so that
@@ -315,3 +339,4 @@ let string_of_outcome = function
   | Completed_no_commit -> "Completed_no_commit"
   | Blocked reason -> Printf.sprintf "Blocked(%s)" reason
   | Aborted reason -> Printf.sprintf "Aborted(%s)" reason
+  | Cancelled reason -> Printf.sprintf "Cancelled(%s)" reason

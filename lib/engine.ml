@@ -177,6 +177,204 @@ let path_bearing_head = function
   | head :: _ -> String.contains head '/'
   | [] -> false
 
+(* ------------------------------------------------------------------ *)
+(* Dynamic_parallel: resolving [over] and instantiating one branch per   *)
+(* runtime array element.                                                *)
+(* ------------------------------------------------------------------ *)
+
+(* Hard engine ceiling, independent of ANY caller-side clamp elsewhere in the
+   stack: a Dynamic_parallel step never dispatches more than this many
+   concurrent branches, full stop. *)
+let dynamic_parallel_max_branches = 32
+
+(* Resolve [over] (a flat ctx key, exactly like Foreach's) to the list of
+   unique, non-empty runtime branch keys, or a clear fail-closed reason.
+   Fails BEFORE any branch is dispatched: malformed/non-array/non-string
+   element/duplicate/over-ceiling all reject here, never partway through
+   forking. *)
+let resolve_dynamic_parallel_over ctx over =
+  match List.assoc_opt over ctx with
+  | None ->
+      Error (Printf.sprintf "dynamic_parallel.over=%S not found in ctx" over)
+  | Some (`List elements) ->
+      let rec collect acc = function
+        | [] -> Ok (List.rev acc)
+        | `String s :: rest ->
+            if String.trim s = "" then
+              Error (Printf.sprintf
+                "dynamic_parallel.over=%S contains an empty-string element" over)
+            else if String.contains s '/' then
+              Error (Printf.sprintf
+                "dynamic_parallel.over=%S contains a key with an unsafe '/' \
+                 character (%S)" over s)
+            else collect (s :: acc) rest
+        | _ :: _ ->
+            Error (Printf.sprintf
+              "dynamic_parallel.over=%S contains a non-string element" over)
+      in
+      Result.bind (collect [] elements) (fun keys ->
+        let uniq = List.sort_uniq String.compare keys in
+        if List.length uniq <> List.length keys then
+          Error (Printf.sprintf
+            "dynamic_parallel.over=%S contains duplicate elements" over)
+        else if List.length keys > dynamic_parallel_max_branches then
+          Error (Printf.sprintf
+            "dynamic_parallel.over=%S resolves to %d branches, exceeding the \
+             %d-branch engine ceiling"
+            over (List.length keys) dynamic_parallel_max_branches)
+        else Ok keys)
+  | Some other ->
+      Error (Printf.sprintf
+        "dynamic_parallel.over=%S is not a JSON array (got %s)" over
+        (Yojson.Safe.to_string other))
+
+(* Every id a Dynamic_parallel template declares as its OWN producer
+   (Agent/Run/Commit/Shell/Evidence/Attest/Dynamic_parallel/Gate/Spawn ids),
+   collected ONCE per template. Used to tell "this selector/expr path refers
+   to a sibling INSIDE this template" (must be rewritten per-branch) from
+   "this selector refers to ctx bound before Dynamic_parallel ran" (must NOT
+   be rewritten). *)
+let rec dynamic_parallel_template_ids steps =
+  List.concat_map
+    (function
+      | Agent { id; _ } | Run { id; _ } | Commit { id; _ }
+      | Shell { id; _ } | Evidence { id; _ } | Attest { id; _ }
+      | Dynamic_parallel { id; _ } | Gate { id; _ } -> [ id ]
+      | Branch { then_; else_; _ } ->
+          dynamic_parallel_template_ids then_
+          @ dynamic_parallel_template_ids else_
+      | Loop { body; _ } -> dynamic_parallel_template_ids body
+      | Parallel { branches } ->
+          List.concat_map dynamic_parallel_template_ids branches
+      | Foreach { steps; _ } -> dynamic_parallel_template_ids steps
+      | Spawn { id; children } ->
+          id
+          :: List.concat_map
+               (fun (c : spawn_child) ->
+                 c.id :: dynamic_parallel_template_ids c.steps)
+               children)
+    steps
+
+(* Rewrite a dotted "outputs.<id>..." / "receipts.<id>..." selector so it
+   points at the branch-local (suffixed) id, iff [pid] is one of THIS
+   template's own producer ids. Any other selector (referring to ctx bound
+   before Dynamic_parallel ran) is left untouched. *)
+let dynamic_parallel_rewrite_selector ~template_ids ~suffix path =
+  match String.split_on_char '.' path with
+  | (("outputs" | "receipts") as ns) :: pid :: rest when List.mem pid template_ids ->
+      String.concat "." (ns :: (pid ^ suffix) :: rest)
+  | _ -> path
+
+let rec dynamic_parallel_rewrite_expr ~template_ids ~suffix (e : Expr.t) : Expr.t =
+  let rw = dynamic_parallel_rewrite_expr ~template_ids ~suffix in
+  let rw_path segs =
+    match segs with
+    | (("outputs" | "receipts") as ns) :: pid :: rest when List.mem pid template_ids ->
+        ns :: (pid ^ suffix) :: rest
+    | segs -> segs
+  in
+  match e with
+  | Expr.Path p -> Expr.Path (rw_path p)
+  | Expr.Exists p -> Expr.Exists (rw_path p)
+  | Expr.Lit _ -> e
+  | Expr.Not e -> Expr.Not (rw e)
+  | Expr.And es -> Expr.And (List.map rw es)
+  | Expr.Or es -> Expr.Or (List.map rw es)
+  | Expr.Eq (a, b) -> Expr.Eq (rw a, rw b)
+  | Expr.Ne (a, b) -> Expr.Ne (rw a, rw b)
+  | Expr.Lt (a, b) -> Expr.Lt (rw a, rw b)
+  | Expr.Le (a, b) -> Expr.Le (rw a, rw b)
+  | Expr.Gt (a, b) -> Expr.Gt (rw a, rw b)
+  | Expr.Ge (a, b) -> Expr.Ge (rw a, rw b)
+  | Expr.In (a, b) -> Expr.In (rw a, rw b)
+
+(* Instantiate one Dynamic_parallel branch's copy of the template: every step
+   id gets suffixed with "#<key>" (so ctx/ledger keys can never collide across
+   siblings — this is what makes a branch's Attest step_id genuinely
+   branch-unique, with ZERO changes to attestation.ml), every in-template
+   selector/expr path referencing a sibling producer id is rewritten to match,
+   and every Attest output path is namespaced by branch index (so two
+   siblings materializing the SAME output template — e.g. both using only
+   "{occurrence}" — can never race on the same file). *)
+(* Namespace an Attest output path by branch index, WITHOUT introducing any
+   new directory component: [write_atomic]/[Secure_fs] never creates missing
+   parent directories, so a directory-prefix scheme would fail closed the
+   moment a template's own declared directory didn't already exist. Renaming
+   the file's stem instead ("proof.json" -> "proof#0.json") stays inside the
+   template's own (already-required-to-exist) directory. *)
+let dynamic_parallel_namespace_output ~branch_idx output =
+  let dir = Filename.dirname output in
+  let base = Filename.basename output in
+  let ext = Filename.extension base in
+  let stem = Filename.remove_extension base in
+  let namespaced = Printf.sprintf "%s#%d%s" stem branch_idx ext in
+  if dir = "." then namespaced else Filename.concat dir namespaced
+
+let rec dynamic_parallel_rewrite_step ~template_ids ~suffix ~branch_idx
+    (step : step) : step =
+  let rw = dynamic_parallel_rewrite_step ~template_ids ~suffix ~branch_idx in
+  let rws = List.map rw in
+  let sfx id = id ^ suffix in
+  let rwsel = dynamic_parallel_rewrite_selector ~template_ids ~suffix in
+  let rwselopt = Option.map (List.map rwsel) in
+  let rwexpr = dynamic_parallel_rewrite_expr ~template_ids ~suffix in
+  match step with
+  | Agent a -> Agent { a with id = sfx a.id; input = rwselopt a.input }
+  | Gate g -> Gate { id = sfx g.id; when_ = rwexpr g.when_ }
+  | Branch b -> Branch { when_ = rwexpr b.when_; then_ = rws b.then_; else_ = rws b.else_ }
+  | Loop l ->
+      Loop
+        {
+          body = rws l.body;
+          until = Option.map rwexpr l.until;
+          governors =
+            List.map
+              (function
+                | Fixpoint { window; progress } ->
+                    Fixpoint { window; progress = rwexpr progress }
+                | g -> g)
+              l.governors;
+        }
+  | Run r -> Run { r with id = sfx r.id; input = rwselopt r.input }
+  | Commit c ->
+      Commit
+        {
+          id = sfx c.id;
+          preflight =
+            Option.map
+              (fun (p : commit_preflight) -> { p with input = List.map rwsel p.input })
+              c.preflight;
+        }
+  | Parallel p -> Parallel { branches = List.map rws p.branches }
+  | Foreach f -> Foreach { over = f.over; steps = rws f.steps }
+  | Dynamic_parallel dp ->
+      Dynamic_parallel { id = sfx dp.id; over = dp.over; steps = rws dp.steps }
+  | Spawn sp ->
+      Spawn
+        {
+          id = sfx sp.id;
+          children =
+            List.map
+              (fun (c : spawn_child) -> { id = sfx c.id; steps = rws c.steps })
+              sp.children;
+        }
+  | Shell sh -> Shell { sh with id = sfx sh.id }
+  | Evidence e -> Evidence { e with id = sfx e.id }
+  | Attest a ->
+      Attest
+        {
+          id = sfx a.id;
+          select = List.map rwsel a.select;
+          replay_domain = a.replay_domain;
+          output = dynamic_parallel_namespace_output ~branch_idx a.output;
+        }
+
+let dynamic_parallel_branch_steps ~template_ids ~key ~branch_idx steps =
+  let suffix = "#" ^ key in
+  List.map
+    (dynamic_parallel_rewrite_step ~template_ids ~suffix ~branch_idx)
+    steps
+
 let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
     ?(initial_ctx = []) ?attestation_signer ?attestation_artifact_root
     ?attestation_session_nonce ?agent_backend_id ?deadline
@@ -577,6 +775,163 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
             (st, n + 1)) (st, 0) children in
         let outcome = match st.terminal with Some value -> value | None -> Completed_no_commit in
         emit st (Spawn_completed { id; children = completed; outcome })
+    | Dynamic_parallel { id; over; steps = body } -> (
+        match resolve_dynamic_parallel_over st.ctx over with
+        | Error msg ->
+            let st = emit st (Blocked_at { id; reason = msg }) in
+            { st with terminal = Some (Blocked msg) }
+        | Ok keys ->
+            let n = List.length keys in
+            let template_ids = dynamic_parallel_template_ids body in
+            let st = emit st (Dynamic_parallel_started { id; branches = n }) in
+            (* None = branch cancelled (a sibling raised) before it completed.
+               Each branch's final [attest_counts] is captured too (4th
+               element) — inherited from the host's counts at fork time and
+               possibly incremented by its own Attest steps — so a repeat
+               dispatch of the SAME runtime key (e.g. this whole
+               Dynamic_parallel step retried by an enclosing Loop) sees
+               occurrence continue from where the previous dispatch left off,
+               instead of colliding on occurrence 0 again. *)
+            let results
+                : (Types.outcome * Types.trace * (string * Yojson.Safe.t) list
+                  * (string * int) list)
+                  option array
+              =
+              Array.make n None
+            in
+            (try
+               Eio.Switch.run (fun branch_sw ->
+                   List.iteri
+                     (fun i key ->
+                       Eio.Fiber.fork ~sw:branch_sw (fun () ->
+                           let branch_steps =
+                             dynamic_parallel_branch_steps ~template_ids ~key
+                               ~branch_idx:i body
+                           in
+                           let branch_st0 =
+                             bind { st with rev_trace = [] } "item" (`String key)
+                           in
+                           let branch_st =
+                             try go branch_st0 branch_steps with
+                             | Eio.Cancel.Cancelled _ as e -> raise e
+                             | exn ->
+                                 {
+                                   branch_st0 with
+                                   terminal = Some (Aborted (Printexc.to_string exn));
+                                 }
+                           in
+                           let outcome =
+                             match branch_st.terminal with
+                             | Some o -> o
+                             | None -> Completed_no_commit
+                           in
+                           let trace = List.rev branch_st.rev_trace in
+                           results.(i) <-
+                             Some (outcome, trace, branch_st.ctx, branch_st.attest_counts);
+                           match outcome with
+                           | Aborted _ | Blocked _ -> Eio.Switch.fail branch_sw Exit
+                           | _ -> ()))
+                     keys)
+             with Exit -> ());
+            (* Fill any slots left in flight when the switch failed: a
+               genuinely distinct [Cancelled] outcome, never conflated with
+               "never started" (this branch DID begin) or [Aborted]/[Blocked]
+               (it never got the chance to fail on its own terms). *)
+            Array.iteri
+              (fun i slot ->
+                if slot = None then
+                  results.(i) <-
+                    Some
+                      ( Cancelled
+                          "a sibling Dynamic_parallel branch raised an error \
+                           before this branch could finish",
+                        [], [], [] ))
+              results;
+            let st =
+              List.fold_left
+                (fun (st, i) result_opt ->
+                  let outcome, trace, branch_ctx, _ = Option.get result_opt in
+                  let branch_outputs =
+                    match List.assoc_opt "outputs" branch_ctx with
+                    | Some (`Assoc fields) -> fields
+                    | _ -> []
+                  in
+                  let st =
+                    emit st
+                      (Dynamic_parallel_branch_completed
+                         { id; branch_idx = i; key = List.nth keys i; trace;
+                           outcome; branch_outputs })
+                  in
+                  (st, i + 1))
+                (st, 0) (Array.to_list results)
+              |> fst
+            in
+            (* Every branch's step ids are already namespaced ("<id>#<key>"),
+               so merging outputs is a plain union — no collision arbitration
+               needed (unlike Parallel's static branches, which can genuinely
+               collide on a shared literal id). *)
+            let st =
+              Array.fold_left
+                (fun st result_opt ->
+                  let _outcome, _trace, branch_ctx, _ = Option.get result_opt in
+                  match List.assoc_opt "outputs" branch_ctx with
+                  | None -> st
+                  | Some (`Assoc branch_outputs) ->
+                      let prior =
+                        match List.assoc_opt "outputs" st.ctx with
+                        | Some (`Assoc fields) -> fields
+                        | _ -> []
+                      in
+                      let merged =
+                        List.fold_left
+                          (fun acc (k, v) -> (k, v) :: List.remove_assoc k acc)
+                          prior branch_outputs
+                      in
+                      bind st "outputs" (`Assoc merged)
+                  | Some _ -> st)
+                st results
+            in
+            (* Merge every branch's attest occurrence counts back into the
+               host, index-ordered (deterministic, replay-reproducible). *)
+            let st =
+              Array.fold_left
+                (fun st result_opt ->
+                  let _, _, _, branch_counts = Option.get result_opt in
+                  let merged =
+                    List.fold_left
+                      (fun acc (aid, count) -> (aid, count) :: List.remove_assoc aid acc)
+                      st.attest_counts branch_counts
+                  in
+                  { st with attest_counts = merged })
+                st results
+            in
+            let failed =
+              List.mapi (fun i key -> (i, key)) keys
+              |> List.filter_map (fun (i, key) ->
+                     match Option.get results.(i) with
+                     | (Aborted reason, _, _, _) | (Blocked reason, _, _, _) ->
+                         Some (key, reason)
+                     | _ -> None)
+            in
+            let outcome =
+              if failed = [] then Completed_no_commit
+              else
+                let summary =
+                  String.concat "; "
+                    (List.map (fun (key, reason) -> Printf.sprintf "%s: %s" key reason)
+                       failed)
+                in
+                Aborted
+                  (Printf.sprintf
+                     "dynamic_parallel %S: %d branch(es) raised an error — %s" id
+                     (List.length failed) summary)
+            in
+            let st =
+              match outcome with
+              | Aborted _ -> { st with terminal = Some outcome }
+              | _ -> st
+            in
+            emit st (Dynamic_parallel_completed { id; branches = n; outcome; failed }))
     | Parallel { branches } ->
         let n = List.length branches in
         (* None = branch was cancelled before completing *)
@@ -649,8 +1004,14 @@ let run ?(max_loop_iters = default_max_loop_iters) ?(run_allowlist = [])
         let worst = Array.fold_left (fun acc result_opt ->
           let (outcome, _, _) = Option.get result_opt in
           match (acc, outcome) with
+          (* [Cancelled] is a Dynamic_parallel-only outcome; Parallel never
+             produces it, but the shared [outcome] type still requires an
+             exhaustive match. Treated with the same fail-loud priority as
+             [Aborted] — dead code for Parallel today, not a behavior change. *)
           | Aborted r, _ -> Aborted r
           | _, Aborted r -> Aborted r
+          | Cancelled r, _ -> Cancelled r
+          | _, Cancelled r -> Cancelled r
           | Blocked r, _ -> Blocked r
           | _, Blocked r -> Blocked r
           | Committed _ as c, _ -> c
@@ -849,18 +1210,33 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
       raise (Replay_mismatch
         "authenticated replay requires validated required_attestations")
   | _ -> ());
-  let pending = ref trace in
-  let next () =
-    match !pending with
-    | [] -> raise (Replay_mismatch "trace exhausted before workflow completed")
-    | e :: tl ->
-        pending := tl;
-        e
+  (* A [next] cursor over some trace segment: [make_cursor l] returns a
+     [pending] ref (for the trailing-garbage check) and a [next] function that
+     pops one entry at a time, failing closed once exhausted. Every
+     Dynamic_parallel branch gets its OWN cursor (over that branch's own
+     recorded sub-trace) rather than sharing the host [pending] ref, which is
+     what lets a branch's Attest genuinely reach Attestation.verify (see the
+     Dynamic_parallel arm below) instead of Parallel's discard-and-reproduce
+     replay (which intentionally stays untouched). *)
+  let make_cursor l =
+    let pending = ref l in
+    let next () =
+      match !pending with
+      | [] -> raise (Replay_mismatch "trace exhausted before workflow completed")
+      | e :: tl ->
+          pending := tl;
+          e
+    in
+    (pending, next)
   in
   (* During replay we re-feed recorded agent outputs and recorded budget
      readings; we still re-evaluate the pure DSL over the rebuilt ctx (it is
      total and deterministic) and assert it matches the recorded verdict. *)
   let eval_ctx st e = Expr.eval ~ctx:(ctx_for st) e in
+  (* The walker is parameterized over [next] so it can be instantiated once
+     for the host trace and again, independently, for each Dynamic_parallel
+     branch's own sub-trace. *)
+  let rec make_walker ~next =
   let rec go st steps =
     match (st.terminal, steps) with
     | Some _, _ | _, [] -> st
@@ -1258,6 +1634,152 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
                  emit st (Spawn_completed { id; children = completed; outcome })
              | _ -> raise (Replay_mismatch "spawn completion evidence mismatch"))
         | _ -> raise (Replay_mismatch "spawn start evidence mismatch"))
+    | Dynamic_parallel { id; over; steps = body } -> (
+        match resolve_dynamic_parallel_over st.ctx over with
+        | Error msg -> (
+            match next () with
+            | Blocked_at { id = rid; reason } when rid = id && reason = msg ->
+                let st = emit st (Blocked_at { id; reason }) in
+                { st with terminal = Some (Blocked reason) }
+            | _ -> raise (Replay_mismatch
+                "dynamic_parallel resolution-block entry mismatch"))
+        | Ok keys -> (
+            let n = List.length keys in
+            let template_ids = dynamic_parallel_template_ids body in
+            match next () with
+            | Dynamic_parallel_started { id = recorded; branches = rn }
+              when recorded = id && rn = n ->
+                let st = emit st (Dynamic_parallel_started { id; branches = n }) in
+                (* Each branch replays against its OWN independent local
+                   cursor over its own recorded sub-trace (via [make_walker]),
+                   recursively dispatched exactly like Foreach/Spawn's shared
+                   cursor — never Parallel's discard-and-reproduce. This is
+                   what lets a branch's Attest genuinely reach
+                   Attestation.verify. *)
+                (* [st_before]'s ctx is every branch's baseline (mirroring
+                   [run]: all branches fork from the SAME pre-dispatch host
+                   ctx — none of them see a SIBLING's merged outputs). Only
+                   [attest_counts] threads incrementally across branches (via
+                   [st] below), which is safe because disjoint per-branch
+                   Attest ids never collide within one dispatch and is
+                   required for cross-DISPATCH occurrence continuation (a
+                   retried Dynamic_parallel step). *)
+                let st_before = st in
+                let rec loop st i failed =
+                  if i >= n then (st, List.rev failed)
+                  else
+                    let key = List.nth keys i in
+                    match next () with
+                    | Dynamic_parallel_branch_completed
+                        { id = did; branch_idx; key = rkey; trace = branch_trace;
+                          outcome = recorded_outcome; branch_outputs }
+                      when did = id && branch_idx = i ->
+                        if rkey <> key then
+                          raise (Replay_mismatch
+                            "dynamic_parallel branch key diverged");
+                        let merge_branch_outputs st =
+                          if branch_outputs = [] then st
+                          else
+                            let prior =
+                              match List.assoc_opt "outputs" st.ctx with
+                              | Some (`Assoc fields) -> fields
+                              | _ -> []
+                            in
+                            let merged =
+                              List.fold_left
+                                (fun acc (k, v) -> (k, v) :: List.remove_assoc k acc)
+                                prior branch_outputs
+                            in
+                            bind st "outputs" (`Assoc merged)
+                        in
+                        (match recorded_outcome with
+                        | Cancelled _ ->
+                            (* Never durably ran: nothing to recompute. *)
+                            let st = emit st (Dynamic_parallel_branch_completed
+                              { id; branch_idx = i; key; trace = branch_trace;
+                                outcome = recorded_outcome; branch_outputs }) in
+                            loop (merge_branch_outputs st) (i + 1) failed
+                        | _ ->
+                            let branch_pending, branch_next = make_cursor branch_trace in
+                            let branch_go, _ = make_walker ~next:branch_next in
+                            let branch_steps =
+                              dynamic_parallel_branch_steps ~template_ids ~key
+                                ~branch_idx:i body
+                            in
+                            let branch_st0 =
+                              bind
+                                { st_before with rev_trace = [];
+                                  attest_counts = st.attest_counts }
+                                "item" (`String key)
+                            in
+                            let branch_st = branch_go branch_st0 branch_steps in
+                            let recomputed_outcome =
+                              match branch_st.terminal with
+                              | Some o -> o
+                              | None -> Completed_no_commit
+                            in
+                            if recomputed_outcome <> recorded_outcome then
+                              raise (Replay_mismatch
+                                "dynamic_parallel branch outcome diverged");
+                            if !branch_pending <> [] then
+                              raise (Replay_mismatch
+                                "dynamic_parallel branch trace has trailing entries");
+                            let recomputed_outputs =
+                              match List.assoc_opt "outputs" branch_st.ctx with
+                              | Some (`Assoc fields) -> fields
+                              | _ -> []
+                            in
+                            if recomputed_outputs <> branch_outputs then
+                              raise (Replay_mismatch
+                                "dynamic_parallel branch outputs diverged");
+                            let st = emit st (Dynamic_parallel_branch_completed
+                              { id; branch_idx = i; key; trace = branch_trace;
+                                outcome = recorded_outcome; branch_outputs }) in
+                            let failed = match recorded_outcome with
+                              | Aborted reason | Blocked reason -> (key, reason) :: failed
+                              | _ -> failed
+                            in
+                            (* Merge this branch's attest occurrence counts
+                               back into the host, same as [run]: a repeat
+                               dispatch of this key sees occurrence continue
+                               from here rather than colliding on 0 again. *)
+                            let st =
+                              { (merge_branch_outputs st) with
+                                attest_counts = branch_st.attest_counts }
+                            in
+                            loop st (i + 1) failed)
+                    | _ -> raise (Replay_mismatch
+                        "dynamic_parallel branch entry mismatch")
+                in
+                let st, failed = loop st 0 [] in
+                let outcome =
+                  if failed = [] then Completed_no_commit
+                  else
+                    let summary =
+                      String.concat "; "
+                        (List.map
+                           (fun (key, reason) -> Printf.sprintf "%s: %s" key reason)
+                           failed)
+                    in
+                    Aborted
+                      (Printf.sprintf
+                         "dynamic_parallel %S: %d branch(es) raised an error — %s"
+                         id (List.length failed) summary)
+                in
+                let st =
+                  match outcome with
+                  | Aborted _ -> { st with terminal = Some outcome }
+                  | _ -> st
+                in
+                (match next () with
+                | Dynamic_parallel_completed
+                    { id = rid; branches = rbranches; outcome = ro; failed = rf }
+                  when rid = id && rbranches = n && ro = outcome && rf = failed ->
+                    emit st
+                      (Dynamic_parallel_completed { id; branches = n; outcome; failed })
+                | _ -> raise (Replay_mismatch
+                    "dynamic_parallel completion evidence mismatch"))
+            | _ -> raise (Replay_mismatch "dynamic_parallel start evidence mismatch")))
     | Parallel { branches } -> (
         (* Consume: Parallel_started,
                    Parallel_branch_completed{branch_idx=0; trace=[...]; outcome}
@@ -1290,7 +1812,9 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
                       bind st "outputs" (`Assoc merged)
                   in
                   let worst = match (worst, outcome) with
+                    (* see the identical comment at the live [run] fold above. *)
                     | Aborted r, _ | _, Aborted r -> Aborted r
+                    | Cancelled r, _ | _, Cancelled r -> Cancelled r
                     | Blocked r, _ | _, Blocked r -> Blocked r
                     | Committed _ as c, _ | _, (Committed _ as c) -> c
                     | Completed_no_commit, Completed_no_commit -> Completed_no_commit
@@ -1458,12 +1982,16 @@ let replay ?(max_loop_iters = default_max_loop_iters) ?(initial_ctx = [])
     in
     iter st 0
   in
+  (go, go_step)
+  in
+  let host_pending, host_next = make_cursor trace in
+  let go, _go_step = make_walker ~next:host_next in
   let outcome, _trace =
     finish (go { rev_trace = []; ctx = initial_ctx; attest_counts = [];
                  terminal = None } wf.steps)
   in
   (* The walk must have consumed the WHOLE trace: a trace that is a valid prefix
      followed by extra (garbage) entries must NOT replay successfully. *)
-  if !pending <> [] then
+  if !host_pending <> [] then
     raise (Replay_mismatch "trailing trace entries after workflow completed");
   outcome

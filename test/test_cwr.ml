@@ -1848,6 +1848,12 @@ let test_commit_token_digest_only () =
                "spawn_child_" ^ spawn_id ^ "_" ^ child_id
            | Spawn_completed { id; children; _ } ->
                Printf.sprintf "spawn_completed_%s_%d" id children
+           | Dynamic_parallel_started { id; branches } ->
+               Printf.sprintf "dynamic_parallel_started_%s_%d" id branches
+           | Dynamic_parallel_branch_completed { id; branch_idx; key; _ } ->
+               Printf.sprintf "dynamic_parallel_branch_%s_%d_%s" id branch_idx key
+           | Dynamic_parallel_completed { id; branches; _ } ->
+               Printf.sprintf "dynamic_parallel_completed_%s_%d" id branches
            | Shell_executed { id; _ } -> id
            | Evidence_evaluated { id; _ } -> id
            | Attestation_exported { id; _ } -> id
@@ -2303,7 +2309,7 @@ let test_schema_no_drift () =
    unknown kind. *)
 let test_schema_kinds_agree () =
   (* Hard-coded expected set the parser (Workflow_json.step_of_json) accepts. *)
-  let expected = [ "agent"; "attest"; "branch"; "commit"; "evidence"; "foreach"; "gate"; "loop"; "parallel"; "run"; "shell"; "spawn" ] in
+  let expected = [ "agent"; "attest"; "branch"; "commit"; "dynamic_parallel"; "evidence"; "foreach"; "gate"; "loop"; "parallel"; "run"; "shell"; "spawn" ] in
   (* Extract the kind consts enumerated under $defs/step/oneOf in the schema. *)
   let top = match Workflow_schema.schema with `Assoc l -> l | _ -> [] in
   let step_def =
@@ -2534,6 +2540,7 @@ let parser_known_keys =
     ("parallel", [ "kind"; "branches" ]);
     ("foreach", [ "kind"; "over"; "steps" ]);
     ("spawn", [ "kind"; "id"; "children" ]);
+    ("dynamic_parallel", [ "kind"; "id"; "over"; "steps" ]);
     ("shell", [ "kind"; "id"; "commands"; "on_failure" ]);
     ("evidence", [ "kind"; "id"; "build"; "check"; "zero_admits"; "tier"; "output" ]);
     ("attest", [ "kind"; "id"; "select"; "replay_domain"; "output" ]);
@@ -4790,6 +4797,296 @@ let test_spawn_parse_run_replay_and_reject () =
     with Compiler.Compile_error msg -> contains_substring msg "Spawn" in
   Alcotest.(check bool) "compiler rejects spawn" true compiler_rejected
 
+(* ---- dynamic_parallel: scaffold + concurrent execution + cancellation ---- *)
+
+let dp_wf ~over steps =
+  { name = "dp"; version = None;
+    steps = [ Dynamic_parallel { id = "fanout"; over; steps } ] }
+
+(* Step 1 completion gate: a fixture workflow using the new step kind
+   round-trips through the parser (not just manual inspection). *)
+let test_dynamic_parallel_parse_roundtrip () =
+  let raw =
+    {|{"name":"dp","steps":[{"kind":"dynamic_parallel","id":"fanout","over":"keys","steps":[{"kind":"agent","id":"a","prompt":"p"}]}]}|}
+  in
+  let wf = match Workflow_json.of_string raw with
+    | Ok wf -> wf | Error e -> Alcotest.failf "dynamic_parallel parse failed: %s" e in
+  (match wf.steps with
+  | [ Dynamic_parallel { id; over; steps = [ Agent { id = "a"; _ } ] } ] ->
+      Alcotest.(check string) "id" "fanout" id;
+      Alcotest.(check string) "over" "keys" over
+  | _ -> Alcotest.fail "expected one dynamic_parallel step wrapping one agent");
+  (match Workflow_json.of_json (Workflow_json.to_json wf) with
+  | Ok wf' -> Alcotest.(check bool) "round-trip" true (wf = wf')
+  | Error e -> Alcotest.failf "round-trip parse failed: %s" e);
+  Alcotest.(check bool) "engine stub before real execution wired in (still true post-Step-2)" true
+    (contains_substring (Yojson.Safe.to_string (Workflow_json.to_json wf)) "dynamic_parallel")
+
+(* Step 2 happy path: 0 branches is a successful no-op (never dispatches an
+   agent), and every fail-closed [over] rejection (missing/non-array/
+   non-string-element/duplicate/>32) blocks BEFORE any agent is dispatched. *)
+let test_dynamic_parallel_zero_branches_is_noop () =
+  let agent_calls = ref 0 in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    incr agent_calls; (true, `Assoc []) in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List []) ] v in
+  Alcotest.(check outcome_testable) "0 branches => success no-op"
+    Completed_no_commit outcome;
+  Alcotest.(check int) "no agent dispatched" 0 !agent_calls;
+  Alcotest.(check bool) "0-branch Dynamic_parallel_completed recorded" true
+    (List.exists (function
+       | Dynamic_parallel_completed { id = "fanout"; branches = 0; outcome = Completed_no_commit; failed = [] } -> true
+       | _ -> false) trace)
+
+let test_dynamic_parallel_over_resolution_fails_closed () =
+  let agent_calls = ref 0 in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    incr agent_calls; (true, `Assoc []) in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let expect_blocked ~label ~initial_ctx =
+    agent_calls := 0;
+    let outcome, _trace = engine_run ~backend ~token:None ~initial_ctx v in
+    (match outcome with
+     | Blocked _ -> ()
+     | o -> Alcotest.failf "%s: expected Blocked, got %s" label (Types.string_of_outcome o));
+    Alcotest.(check int) (label ^ ": no agent dispatched before the block") 0 !agent_calls
+  in
+  expect_blocked ~label:"missing over key" ~initial_ctx:[];
+  expect_blocked ~label:"non-array over" ~initial_ctx:[ ("keys", `String "nope") ];
+  expect_blocked ~label:"non-string element"
+    ~initial_ctx:[ ("keys", `List [ `String "a"; `Int 1 ]) ];
+  expect_blocked ~label:"duplicate element"
+    ~initial_ctx:[ ("keys", `List [ `String "a"; `String "a" ]) ];
+  expect_blocked ~label:"empty-string element"
+    ~initial_ctx:[ ("keys", `List [ `String "" ]) ];
+  expect_blocked ~label:"33 branches exceeds the 32 ceiling"
+    ~initial_ctx:[ ("keys", `List (List.init 33 (fun i -> `String (Printf.sprintf "k%d" i)))) ]
+
+(* THE core positive-existence test for this whole primitive: prove genuine
+   temporal OVERLAP between two branches (one signals started, the other
+   starts AND finishes before the first signals finished) — not merely
+   "both eventually completed", which a secretly-sequential fold would also
+   satisfy. Verified by hand: temporarily rewriting the executor as a
+   [List.fold_left] over [keys] makes this assertion fail (order becomes
+   slow:start, slow:end, fast:start, fast:end). *)
+let test_dynamic_parallel_proves_genuine_concurrency () =
+  let events = ref [] in
+  let record tag = events := tag :: !events in
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    if contains_substring id "#slow" then begin
+      record "slow:start";
+      Eio.Fiber.yield ();
+      record "slow:end"
+    end else if contains_substring id "#fast" then begin
+      record "fast:start";
+      record "fast:end"
+    end;
+    (true, `Assoc [])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, _trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "slow"; `String "fast" ]) ] v in
+  Alcotest.(check outcome_testable) "both branches succeed"
+    Completed_no_commit outcome;
+  Alcotest.(check (list string))
+    "genuine overlap: fast starts AND finishes inside slow's in-flight window"
+    [ "slow:start"; "fast:start"; "fast:end"; "slow:end" ] (List.rev !events)
+
+let test_dynamic_parallel_item_bound_per_branch () =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    (true, `Assoc [])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf =
+    dp_wf ~over:"keys"
+      [ Gate { id = "g"; when_ = Expr.Exists [ "item" ] };
+        make_agent "worker" ]
+  in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "s1"; `String "s2" ]) ] v in
+  Alcotest.(check outcome_testable) "both branches' item-gate passes"
+    Completed_no_commit outcome;
+  let seen = List.filter_map (function
+    | Dynamic_parallel_branch_completed { key; _ } -> Some key
+    | _ -> None) trace in
+  Alcotest.(check bool) "both runtime keys recorded" true
+    (List.mem "s1" seen && List.mem "s2" seen)
+
+let test_dynamic_parallel_run_replay_roundtrip () =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    (true, `Assoc [ ("ok", `Bool true) ]) in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "s1"; `String "s2"; `String "s3" ]) ] v in
+  Alcotest.(check outcome_testable) "3-branch dynamic_parallel succeeds"
+    Completed_no_commit outcome;
+  Alcotest.(check outcome_testable) "replay reproduces the same outcome"
+    outcome (engine_replay ~initial_ctx:[ ("keys", `List [ `String "s1"; `String "s2"; `String "s3" ]) ] ~trace v)
+
+(* ---- Step 3: cancel-on-abort, collect-ALL-failures, and the race window ---- *)
+
+(* [failed] is a LIST (not a single string threaded through one
+   Eio.Switch.fail call, as Parallel does today) — verify the DATA/LEDGER
+   layer genuinely supports naming several branches at once, independent of
+   whichever specific interleaving Eio's single-domain scheduler happens to
+   produce for any one live run (see the note on
+   [test_dynamic_parallel_names_all_failed_branches] below for why a live
+   race between two failing branches deterministically has only one
+   "winner"). *)
+let test_dynamic_parallel_completed_failed_field_is_plural () =
+  let entry = Dynamic_parallel_completed
+    { id = "fanout"; branches = 3;
+      outcome = Aborted "dynamic_parallel \"fanout\": 2 branch(es) raised an error — bad1: x; bad2: y";
+      failed = [ ("bad1", "x"); ("bad2", "y") ] } in
+  (match entry with
+   | Dynamic_parallel_completed { failed; _ } ->
+       Alcotest.(check int) "both entries present" 2 (List.length failed);
+       Alcotest.(check bool) "names bad1" true (List.mem_assoc "bad1" failed);
+       Alcotest.(check bool) "names bad2" true (List.mem_assoc "bad2" failed)
+   | _ -> Alcotest.fail "impossible");
+  let json = Ledger.entry_to_json entry in
+  match Ledger.entry_of_json json with
+  | Dynamic_parallel_completed { failed; _ } ->
+      Alcotest.(check (list (pair string string))) "ledger round-trip preserves BOTH names"
+        [ ("bad1", "x"); ("bad2", "y") ] failed
+  | _ -> Alcotest.fail "ledger round-trip changed the entry kind"
+
+(* Two branches ("bad1", "bad2") both fail; a THIRD ("good") succeeds. Under
+   Eio's single-domain cooperative scheduler, "cancel siblings immediately on
+   any failure" (needed for the race-window test below) means the FIRST
+   failing branch to reach its own decision always wins the broadcast race:
+   forking a fiber onto an already-failing switch never invokes its body at
+   all (verified directly against this project's own eio/eio_main by hand
+   before writing this test). So exactly ONE of bad1/bad2 ends up genuinely
+   [Aborted] and the OTHER — never silently dropped, never corrupted — ends
+   up [Cancelled]. This is what "never conflated with never-started" actually
+   buys here: the cancelled one is still fully present and correctly typed in
+   the trace, just distinguishable from the one that got to raise. *)
+let test_dynamic_parallel_names_all_failed_branches () =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    if contains_substring id "#bad1" || contains_substring id "#bad2"
+    then (false, `Assoc [])
+    else (true, `Assoc [])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "good"; `String "bad1"; `String "bad2" ]) ] v in
+  let branch_outcome key = List.find_map (function
+    | Dynamic_parallel_branch_completed { key = k; outcome; _ } when k = key -> Some outcome
+    | _ -> None) trace in
+  let bad1_outcome = match branch_outcome "bad1" with
+    | Some o -> o | None -> Alcotest.fail "bad1 missing from trace entirely" in
+  let bad2_outcome = match branch_outcome "bad2" with
+    | Some o -> o | None -> Alcotest.fail "bad2 missing from trace entirely" in
+  let is_raised = function Aborted _ | Blocked _ -> true | _ -> false in
+  let is_cancelled = function Cancelled _ -> true | _ -> false in
+  Alcotest.(check bool) "exactly one of bad1/bad2 genuinely raised, the other was cancelled — never both lost, never both silently dropped"
+    true
+    ((is_raised bad1_outcome && is_cancelled bad2_outcome)
+     || (is_cancelled bad1_outcome && is_raised bad2_outcome));
+  (match outcome with
+   | Aborted msg -> Alcotest.(check bool) "overall outcome names whichever branch actually raised" true
+       (contains_substring msg "bad1" || contains_substring msg "bad2")
+   | o -> Alcotest.failf "expected Aborted, got %s" (Types.string_of_outcome o));
+  let failed_keys = List.concat_map (function
+    | Dynamic_parallel_completed { failed; _ } -> List.map fst failed
+    | _ -> []) trace in
+  Alcotest.(check bool) "Dynamic_parallel_completed.failed names the branch that raised"
+    true (List.mem "bad1" failed_keys || List.mem "bad2" failed_keys);
+  let good_present = List.exists (function
+    | Dynamic_parallel_branch_completed { key = "good"; outcome = Completed_no_commit; _ } -> true
+    | _ -> false) trace in
+  Alcotest.(check bool) "the good branch's completed result is preserved, not discarded"
+    true good_present
+
+(* The race window itself: "victim" computes (blocks mid-Agent-step on a
+   controllable yield point) while "trigger" fails immediately and broadcasts
+   cancellation. The yield is the ONLY place victim can be interrupted, and it
+   sits strictly BEFORE victim would durably persist its result — so if the
+   cancellation lands there, victim's own agent body must never reach its
+   post-yield completion marker, and the branch must show up as genuinely
+   [Cancelled] in the trace (not silently missing, not a corrupted partial
+   Completed/Aborted entry). *)
+let test_dynamic_parallel_cancel_lands_in_commit_gap () =
+  let victim_finished = ref false in
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    if contains_substring id "#victim" then begin
+      Eio.Fiber.yield ();
+      victim_finished := true;
+      (true, `Assoc [])
+    end else (false, `Assoc [])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "victim"; `String "trigger" ]) ] v in
+  (match outcome with
+   | Aborted _ -> ()
+   | o -> Alcotest.failf "expected Aborted (trigger raised), got %s" (Types.string_of_outcome o));
+  Alcotest.(check bool)
+    "victim's agent body never reached its post-yield completion marker"
+    false !victim_finished;
+  match List.find_map (function
+    | Dynamic_parallel_branch_completed { key = "victim"; outcome; _ } -> Some outcome
+    | _ -> None) trace
+  with
+  | Some (Cancelled _) -> ()
+  | Some o -> Alcotest.failf "victim should be Cancelled, got %s" (Types.string_of_outcome o)
+  | None -> Alcotest.fail
+      "victim branch missing from the trace entirely — indistinguishable from never-started"
+
+(* ---- Step 5: intra-run occurrence dedup for a repeated runtime key ---- *)
+
+let test_dynamic_parallel_occurrence_dedup_on_retry () =
+  (* Dynamic_parallel dispatched TWICE within one run (a 2-iteration Loop, no
+     governor needed beyond Max_iters), the second time with the SAME runtime
+     key "s1" — must increment occurrence rather than colliding/erroring, and
+     [attest_counts] must start fresh for a brand-new [Engine.run] call. *)
+  let wf =
+    {
+      name = "dp-retry"; version = None;
+      steps =
+        [
+          Loop
+            {
+              body = [ Dynamic_parallel { id = "fanout"; over = "keys"; steps = [ make_agent "worker" ] } ];
+              until = None;
+              governors = [ Max_iters 2 ];
+            };
+        ];
+    }
+  in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    (true, `Assoc []) in
+  let backend = Backend.stub ~agent () in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, _trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "s1" ]) ] v in
+  Alcotest.(check outcome_testable) "2-iteration retry of the same key succeeds"
+    Completed_no_commit outcome;
+  (* A fresh [Engine.run] call starts with an empty [attest_counts] table
+     (never persisted across runs — cross-run dedup is out of scope): running
+     the SAME workflow a second, wholly separate time must succeed exactly the
+     same way, not be affected by the previous call's occurrences. *)
+  let outcome2, _trace2 = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "s1" ]) ] v in
+  Alcotest.(check outcome_testable) "a fresh run is unaffected by a prior run's occurrences"
+    Completed_no_commit outcome2
+
 let () =
   let test_agent_structured_input_parses_and_roundtrips () =
     let raw =
@@ -5083,6 +5380,29 @@ let () =
       ( "spawn",
         [ Alcotest.test_case "static Spawn parses, executes, replays, and compiler rejects" `Quick
             test_spawn_parse_run_replay_and_reject ] );
+      ( "dynamic-parallel",
+        [
+          Alcotest.test_case "parses and round-trips (fixture, Step 1 gate)" `Quick
+            test_dynamic_parallel_parse_roundtrip;
+          Alcotest.test_case "0 branches => success no-op, no agent dispatched" `Quick
+            test_dynamic_parallel_zero_branches_is_noop;
+          Alcotest.test_case "over resolution fails closed before any dispatch" `Quick
+            test_dynamic_parallel_over_resolution_fails_closed;
+          Alcotest.test_case "proves genuine fiber-level concurrency (overlap, not just eventual completion)" `Quick
+            test_dynamic_parallel_proves_genuine_concurrency;
+          Alcotest.test_case "runtime key bound as ctx[\"item\"] per branch" `Quick
+            test_dynamic_parallel_item_bound_per_branch;
+          Alcotest.test_case "N-branch run/replay round-trip" `Quick
+            test_dynamic_parallel_run_replay_roundtrip;
+          Alcotest.test_case "Dynamic_parallel_completed.failed is a plural, ledger-round-trippable list" `Quick
+            test_dynamic_parallel_completed_failed_field_is_plural;
+          Alcotest.test_case "exactly one racing failure is named, the other is Cancelled (not lost), good's result preserved" `Quick
+            test_dynamic_parallel_names_all_failed_branches;
+          Alcotest.test_case "cancellation landing in the compute-then-persist gap => Cancelled" `Quick
+            test_dynamic_parallel_cancel_lands_in_commit_gap;
+          Alcotest.test_case "intra-run occurrence dedup on a retried key; fresh per run" `Quick
+            test_dynamic_parallel_occurrence_dedup_on_retry;
+        ] );
       ( "lint-parallel",
         [
           Alcotest.test_case "commit-in-parallel => error diagnostic" `Quick

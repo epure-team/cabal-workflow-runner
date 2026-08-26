@@ -16,6 +16,8 @@ let outcome_to_json = function
       `Assoc [ ("kind", `String "blocked"); ("reason", `String reason) ]
   | Aborted reason ->
       `Assoc [ ("kind", `String "aborted"); ("reason", `String reason) ]
+  | Cancelled reason ->
+      `Assoc [ ("kind", `String "cancelled"); ("reason", `String reason) ]
 
 let file_change_kind_to_json k = `String (string_of_file_change_kind k)
 
@@ -122,6 +124,24 @@ let rec entry_to_json (e : trace_entry) : Yojson.Safe.t =
       tagged "spawn_completed"
         [ ("id", `String id); ("children", `Int children);
           ("outcome", outcome_to_json outcome) ]
+  | Dynamic_parallel_started { id; branches } ->
+      tagged "dynamic_parallel_started"
+        [ ("id", `String id); ("branches", `Int branches) ]
+  | Dynamic_parallel_branch_completed
+      { id; branch_idx; key; trace; outcome; branch_outputs } ->
+      tagged "dynamic_parallel_branch_completed"
+        [ ("id", `String id); ("branch_idx", `Int branch_idx);
+          ("key", `String key);
+          ("trace", `List (List.map entry_to_json trace));
+          ("outcome", outcome_to_json outcome);
+          ("branch_outputs", `Assoc branch_outputs) ]
+  | Dynamic_parallel_completed { id; branches; outcome; failed } ->
+      tagged "dynamic_parallel_completed"
+        [ ("id", `String id); ("branches", `Int branches);
+          ("outcome", outcome_to_json outcome);
+          ("failed", `List (List.map (fun (key, reason) ->
+             `Assoc [ ("key", `String key); ("reason", `String reason) ])
+             failed)) ]
   | Shell_executed { id; results } ->
       tagged "shell_executed"
         [ ("id", `String id);
@@ -260,6 +280,7 @@ let outcome_of_json json =
   | "completed_no_commit" -> Completed_no_commit
   | "blocked" -> Blocked (dec_string "reason" json)
   | "aborted" -> Aborted (dec_string "reason" json)
+  | "cancelled" -> Cancelled (dec_string "reason" json)
   | other -> err "unknown outcome kind %S" other
 
 let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
@@ -363,6 +384,35 @@ let rec entry_of_json (json : Yojson.Safe.t) : trace_entry =
   | "spawn_completed" -> Spawn_completed { id = dec_string "id" json;
       children = dec_int "children" json;
       outcome = outcome_of_json (assoc_field "outcome" json) }
+  | "dynamic_parallel_started" ->
+      Dynamic_parallel_started { id = dec_string "id" json;
+        branches = dec_int "branches" json }
+  | "dynamic_parallel_branch_completed" ->
+      let trace =
+        match assoc_field "trace" json with
+        | `List l -> List.map entry_of_json l
+        | _ -> err "field \"trace\" must be a list"
+      in
+      let branch_outputs =
+        match assoc_field "branch_outputs" json with
+        | `Assoc fields -> fields
+        | _ -> err "field \"branch_outputs\" must be an object"
+      in
+      Dynamic_parallel_branch_completed
+        { id = dec_string "id" json; branch_idx = dec_int "branch_idx" json;
+          key = dec_string "key" json; trace;
+          outcome = outcome_of_json (assoc_field "outcome" json);
+          branch_outputs }
+  | "dynamic_parallel_completed" ->
+      let failed =
+        match assoc_field "failed" json with
+        | `List l -> List.map (fun entry ->
+            (dec_string "key" entry, dec_string "reason" entry)) l
+        | _ -> err "field \"failed\" must be a list"
+      in
+      Dynamic_parallel_completed { id = dec_string "id" json;
+        branches = dec_int "branches" json;
+        outcome = outcome_of_json (assoc_field "outcome" json); failed }
   | "shell_executed" ->
       let id = dec_string "id" json in
       let results =

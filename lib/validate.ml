@@ -39,6 +39,9 @@ let required_attestation_errors required steps =
     | Foreach { steps; _ } :: rest ->
         let _, errors = sequence guaranteed errors steps in
         sequence guaranteed errors rest
+    | Dynamic_parallel { steps; _ } :: rest ->
+        let _, errors = sequence guaranteed errors steps in
+        sequence guaranteed errors rest
     | Spawn { children; _ } :: rest ->
         let guaranteed, errors = List.fold_left (fun (g, errors) (child : spawn_child) ->
           sequence g errors child.steps) (guaranteed, errors) children in

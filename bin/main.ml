@@ -66,6 +66,14 @@ let print_trace trace =
       | Types.Spawn_completed { id; children; outcome } ->
           Printf.printf "  spawn    completed %s (%d) %s\n" id children
             (Types.string_of_outcome outcome)
+      | Types.Dynamic_parallel_started { id; branches } ->
+          Printf.printf "  dynpar   started %s (%d branch(es))\n" id branches
+      | Types.Dynamic_parallel_branch_completed { id; branch_idx; key; outcome; trace = _; branch_outputs = _ } ->
+          Printf.printf "  dynpar   branch[%d/%s] %s %s\n" branch_idx key id
+            (Types.string_of_outcome outcome)
+      | Types.Dynamic_parallel_completed { id; branches; outcome; failed = _ } ->
+          Printf.printf "  dynpar   completed %s (%d) %s\n" id branches
+            (Types.string_of_outcome outcome)
       | Types.Shell_executed { id; results } ->
           Printf.printf "  shell    %-16s %d command(s)\n" id (List.length results)
       | Types.Evidence_evaluated { id; tier; passed } ->
@@ -189,7 +197,7 @@ let finish_ledger handle trace =
   | Error message, _ | Ok (), Error message -> Error message
 
 let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_fd
-    attestation_root attestation_session required_attestations expected_digest =
+    attestation_root attestation_session required_attestations expected_digest deadline =
   match load_and_validate ~required_attestations ~floor_gates file with
   | Error e ->
       Printf.eprintf "%s\n" e;
@@ -251,6 +259,7 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_f
                           ~initial_ctx ?attestation_signer
                           ?attestation_artifact_root:attestation_root
                           ?attestation_session_nonce:attestation_session
+                          ?deadline
                           ~agent_backend_id:"cabal-read-only-v1" validated
                       in
                       let ledger_finish = match ledger_handle with
@@ -270,7 +279,8 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_f
                           Option.iter (fun path -> Printf.printf "ledger written: %s\n" path) ledger;
                           match outcome with
                           | Types.Committed _ | Types.Completed_no_commit -> 0
-                          | Types.Blocked _ | Types.Aborted _ -> 2))));
+                          | Types.Blocked _ | Types.Aborted _ -> 2
+                          | Types.Cancelled _ -> 2))));
       ))
 
 (* ---- replay subcommand ---- *)
@@ -425,6 +435,7 @@ let rec attest_steps steps = List.concat_map (function
   | Types.Parallel { branches } -> List.concat_map attest_steps branches
   | Types.Foreach { steps; _ } -> attest_steps steps
   | Types.Spawn { children; _ } -> List.concat_map (fun (child : Types.spawn_child) -> attest_steps child.steps) children
+  | Types.Dynamic_parallel { steps; _ } -> attest_steps steps
   | Types.Agent _ | Types.Gate _ | Types.Run _ | Types.Commit _ | Types.Shell _
   | Types.Evidence _ -> []) steps
 
@@ -582,6 +593,11 @@ let expected_workflow_digest_arg = Arg.(value & opt (some string) None &
 let required_workflow_digest_arg = Arg.(required & opt (some string) None &
   info ["expected-workflow-digest"] ~docv:"SHA256")
 let occurrence_arg = Arg.(value & opt int 0 & info ["occurrence"] ~docv:"N")
+let deadline_arg = Arg.(value & opt (some float) None &
+  info ["deadline"] ~docv:"EPOCH_SECONDS"
+    ~doc:"Operator-supplied wall-clock deadline (Unix epoch seconds, e.g. via date -d '22:00' +%s) \
+          for the workflow's Deadline governor. Runtime-only: never read from the workflow file. \
+          Absent => a workflow declaring Deadline never stops via that governor.")
 
 let run_cmd =
   let doc = "Run a workflow deterministically, dispatching agents via cabal." in
@@ -590,7 +606,7 @@ let run_cmd =
       const cmd_run $ file_arg $ floor_arg $ approve_arg $ allow_run_arg
       $ ledger_arg $ ctx_arg $ attestation_key_fd_arg $ attestation_root_arg
       $ attestation_session_arg $ require_attestation_arg
-      $ expected_workflow_digest_arg)
+      $ expected_workflow_digest_arg $ deadline_arg)
 
 let replay_ledger_arg =
   Arg.(

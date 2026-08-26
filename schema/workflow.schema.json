@@ -221,6 +221,22 @@
         },
         {
           "type": "object",
+          "required": [ "kind", "id", "over", "steps" ],
+          "properties": {
+            "kind": { "const": "dynamic_parallel" },
+            "id": { "type": "string", "pattern": ".*\\S.*" },
+            "over": { "type": "string" },
+            "steps": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/step" },
+              "minItems": 1
+            }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "required": [ "kind", "id", "commands" ],
           "properties": {
             "kind": { "const": "shell" },
