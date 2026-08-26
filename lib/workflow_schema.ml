@@ -370,6 +370,18 @@ let step_def : Yojson.Safe.t =
                ("children", obj [ ("type", s "array"); ("items", spawn_child);
                                    ("minItems", `Int 1); ("uniqueItems", `Bool true) ]) ]
   in
+  let dynamic_parallel =
+    closed_object_with
+      ~required:[ "kind"; "id"; "over"; "steps" ]
+      ~props:
+        [
+          ("kind", kind_const "dynamic_parallel");
+          ("id", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]);
+          ("over", typ "string");
+          ("steps", obj [ ("type", s "array"); ("items", ref_ "step");
+                           ("minItems", `Int 1) ]);
+        ]
+  in
   let shell =
     closed_object_with
       ~required:[ "kind"; "id"; "commands" ]
@@ -420,8 +432,8 @@ let step_def : Yojson.Safe.t =
       ( "description",
         s "A workflow step, discriminated by the \"kind\" key." );
       ( "oneOf",
-        arr [ agent; gate; branch; loop; run; commit; parallel; foreach; spawn; shell;
-              evidence; attest ] );
+        arr [ agent; gate; branch; loop; run; commit; parallel; foreach; spawn;
+              dynamic_parallel; shell; evidence; attest ] );
     ]
 
 (* ---- top level ---------------------------------------------------------- *)

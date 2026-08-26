@@ -651,6 +651,123 @@ let test_unsafe_selected_values_fail_as_controlled_outcomes () =
       ~output_path:"proof.json" ~replay_domain:"d" ~session_nonce:"s"
       ~selected:bad_selected))
 
+(* ---- Step 4: Attest is permitted beneath Dynamic_parallel ------------- *)
+
+(* Inverted rule vs Parallel: unlike [test_attest_beneath_parallel_is_rejected]
+   above (which stays completely unchanged), Attest beneath Dynamic_parallel
+   must lint clean and validate — because Dynamic_parallel's replay case gives
+   each branch its OWN independent cursor and genuinely re-dispatches into it
+   (see the run/replay test below), unlike Parallel's discard-and-reproduce
+   sub-trace. *)
+let test_attest_beneath_dynamic_parallel_is_permitted () =
+  let agent = Agent { id = "prove"; prompt = "p"; read_only = true;
+    output_schema = None; on_failure = Abort; protocol = None; brief = None;
+    agent_type = None; model = None; input = None } in
+  let attest = Attest { id = "export"; select = [ "outputs.prove" ];
+    replay_domain = "dp/v1"; output = "proof.json" } in
+  let wf = { name = "dp-attest-permitted"; version = Some "1.0";
+    steps = [ Dynamic_parallel { id = "fanout"; over = "keys";
+      steps = [ agent; attest ] } ] } in
+  let ds = Lint.check ~floor_gates:[] wf in
+  Alcotest.(check bool) "no attest-in-parallel diagnostic beneath Dynamic_parallel" false
+    (List.exists (fun (d : Lint.diagnostic) -> d.code = "attest-in-parallel") ds);
+  Alcotest.(check bool) "lint has no errors at all" false (Lint.has_errors ds);
+  Alcotest.(check bool) "validation accepts it" true
+    (Result.is_ok (Validate.workflow ~floor_gates:[] wf));
+  (* The literal Parallel rule is untouched: the SAME Attest, beneath a real
+     Parallel (two branches, since Parallel requires >= 2), is still rejected
+     exactly as before. *)
+  let under_parallel = { wf with steps =
+    [ Parallel { branches = [ [ agent; attest ]; [ agent ] ] } ] } in
+  Alcotest.(check bool) "attest-in-parallel is still enforced, unchanged" true
+    (List.exists (fun (d : Lint.diagnostic) -> d.code = "attest-in-parallel")
+       (Lint.check ~floor_gates:[] under_parallel))
+
+(* THE core Step 4 test: two Dynamic_parallel branches each run their own
+   Attest, with output paths/ids differing only by their branch suffix. Both
+   must independently record-then-replay-verify: replay must ACTUALLY call
+   Attestation.verify per branch (not just re-emit the recorded envelope, as
+   Parallel's replay does today) — proven by the tamper sub-test, which
+   corrupts one branch's envelope and checks replay rejects it. *)
+let test_dynamic_parallel_attest_replays_independently_per_branch () =
+  with_temp_dir (fun root ->
+    let prove = Agent { id = "prove"; prompt = "produce proof"; read_only = true;
+      output_schema = None; on_failure = Abort; protocol = None; brief = None;
+      agent_type = None; model = None; input = None } in
+    let export = Attest { id = "export"; select = [ "outputs.prove" ];
+      replay_domain = "dp/v1"; output = "proof.json" } in
+    (* An "anchor" Attest OUTSIDE the Dynamic_parallel step, unconditionally
+       guaranteed on every path: [required_attestations] checks a static id is
+       guaranteed reached, and "export" itself never is (Dynamic_parallel's
+       body may run 0 times, exactly like Foreach) — mirrors
+       [test_loop_occurrences_are_distinct_and_replayable]'s own "anchor"
+       pattern above. *)
+    let anchor = Attest { id = "anchor"; select = [ "campaign" ];
+      replay_domain = "dp/v1"; output = "anchor.json" } in
+    let wf = { name = "dp-attest"; version = Some "1.0";
+      steps = [ anchor; Dynamic_parallel { id = "fanout"; over = "keys";
+        steps = [ prove; export ] } ] } in
+    let s = signer () in
+    let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+      (true, `Assoc [ ("finding", `String "F-1"); ("valid", `Bool true) ]) in
+    let backend = Backend.stub ~agent () in
+    let vwf = validated ~required:[ "anchor" ] wf in
+    let initial_ctx = [ ("campaign", `String "C");
+      ("keys", `List [ `String "b1"; `String "b2" ]) ] in
+    let outcome, trace = engine_run ~attestation_signer:s
+      ~attestation_artifact_root:root ~attestation_session_nonce:"session-dp"
+      ~initial_ctx ~backend vwf
+    in
+    Alcotest.(check string) "both branches complete" "Completed_no_commit"
+      (Types.string_of_outcome outcome);
+    (* Two distinct signed artifacts, namespaced by branch index (not by
+       directory — Secure_fs never creates missing parent directories). *)
+    Alcotest.(check bool) "branch 0 artifact exists" true
+      (Sys.file_exists (Filename.concat root "proof#0.json"));
+    Alcotest.(check bool) "branch 1 artifact exists" true
+      (Sys.file_exists (Filename.concat root "proof#1.json"));
+    let branch_traces = List.filter_map (function
+      | Dynamic_parallel_branch_completed { trace; _ } -> Some trace
+      | _ -> None) trace in
+    Alcotest.(check int) "two branches recorded" 2 (List.length branch_traces);
+    let exported = List.concat_map (fun t -> List.filter_map (function
+      | Attestation_exported { id; envelope } -> Some (id, envelope)
+      | _ -> None) t) branch_traces in
+    Alcotest.(check int) "two independent Attest exports" 2 (List.length exported);
+    Alcotest.(check bool) "each branch's Attest step id carries its own key suffix" true
+      (List.exists (fun (id, _) -> id = "export#b1") exported
+       && List.exists (fun (id, _) -> id = "export#b2") exported);
+    let v = verifier s in
+    let replayed = engine_replay ~attestation_verifier:v
+      ~attestation_session_nonce:"session-dp" ~initial_ctx ~trace vwf in
+    Alcotest.(check string) "replay authenticates BOTH branches independently"
+      "Completed_no_commit" (Types.string_of_outcome replayed);
+    (* Tamper with ONE branch's exported envelope inside its sub-trace: proves
+       replay is actually calling Attestation.verify per branch, not just
+       re-emitting the recorded blob wholesale (Parallel's own limitation). *)
+    let tamper_envelope = function
+      | `Assoc fields ->
+          `Assoc (("signature", `String "sha256:0000000000000000000000000000000000000000000000000000000000000000")
+                  :: List.remove_assoc "signature" fields)
+      | j -> j
+    in
+    let tampered = List.map (function
+      | Dynamic_parallel_branch_completed
+          ({ key = "b1"; trace = branch_trace; _ } as e) ->
+          let branch_trace = List.map (function
+            | Attestation_exported { id; envelope } ->
+                Attestation_exported { id; envelope = tamper_envelope envelope }
+            | entry -> entry) branch_trace in
+          Dynamic_parallel_branch_completed { e with trace = branch_trace }
+      | entry -> entry) trace in
+    let rejected = try
+        ignore (engine_replay ~attestation_verifier:v
+          ~attestation_session_nonce:"session-dp" ~initial_ctx ~trace:tampered vwf);
+        false
+      with Engine.Replay_mismatch _ -> true in
+    Alcotest.(check bool) "a tampered per-branch envelope is rejected on replay" true
+      rejected)
+
 let () =
   Alcotest.run "cwr-attestation"
     [
@@ -697,6 +814,11 @@ let () =
       ( "parallel-safety",
         [ Alcotest.test_case "attest beneath parallel rejected" `Quick
             test_attest_beneath_parallel_is_rejected ] );
+      ( "dynamic-parallel-attest",
+        [ Alcotest.test_case "attest beneath dynamic_parallel is permitted (Parallel's own rule untouched)" `Quick
+            test_attest_beneath_dynamic_parallel_is_permitted;
+          Alcotest.test_case "two branches' Attest steps export and replay-verify independently" `Quick
+            test_dynamic_parallel_attest_replays_independently_per_branch ] );
       ( "authority-pinning",
         [ Alcotest.test_case "required attest cannot be bypassed" `Quick
             test_required_attestation_cannot_be_bypassed;

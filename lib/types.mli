@@ -183,6 +183,14 @@ type step =
           element (bound as [ctx["item"]]). Sequential, not concurrent. *)
   | Spawn of { id : string; children : spawn_child list }
       (** Static, inline, sequential child bodies sharing the ordinary CWR context. *)
+  | Dynamic_parallel of { id : string; over : string; steps : step list }
+      (** Runtime-sized, genuinely concurrent fan-out: [over] is a ctx key
+          (exactly like {!Foreach}'s) that must resolve at runtime to a JSON
+          array of unique, non-empty strings (0..32 elements; 0 is a
+          successful no-op, >32 is a hard fail-closed engine error). [steps]
+          is a TEMPLATE body forked once per array element as an independent
+          [Eio.Fiber], unlike {!Foreach} (runtime-sized but sequential) and
+          unlike {!Parallel} (concurrent but a fixed, static branch count). *)
   | Shell of {
       id : string;
       commands : string list;  (** non-empty; each run via [sh -c cmd]. *)
@@ -257,6 +265,12 @@ type outcome =
       (** A floor invariant blocked progress: no/ill-formed runtime token, or a
           [Gate] whose predicate evaluated [false]. *)
   | Aborted of string  (** Structural / schema error encountered at runtime. *)
+  | Cancelled of string
+      (** A {!Dynamic_parallel} branch still in flight when a sibling branch
+          raised: cancelled before it could commit or fail on its own terms.
+          Genuinely distinct from [Aborted]/[Blocked] (the branch itself
+          erroring) and from "never started" (a cancelled branch DID begin
+          executing). *)
 
 (** A single observed filesystem change produced by a {!Run} step. *)
 type file_change_kind =
@@ -380,6 +394,26 @@ type trace_entry =
       ctx : (string * Yojson.Safe.t) list;
     }
   | Spawn_completed of { id : string; children : int; outcome : outcome }
+  | Dynamic_parallel_started of { id : string; branches : int }
+  | Dynamic_parallel_branch_completed of {
+      id : string;
+      branch_idx : int;
+      key : string;
+      trace : trace_entry list;
+      outcome : outcome;
+      branch_outputs : (string * Yojson.Safe.t) list;
+    }
+      (** Recorded per-branch evidence for one {!Dynamic_parallel} branch,
+          index-ordered (matching [branch_idx] to the resolved runtime array
+          position, NOT execution completion order — replay is deterministic
+          over this ordering even though live execution is concurrent). *)
+  | Dynamic_parallel_completed of {
+      id : string;
+      branches : int;
+      outcome : outcome;
+      failed : (string * string) list;
+          (** (key, reason) for every branch that raised an error. *)
+    }
   | Ctx_snapshot of { ctx : (string * Yojson.Safe.t) list }
       (** Ledger-layer header recording the initial_ctx that was passed to
           {!Engine.run}. Written as the FIRST line of an on-disk ledger so that
