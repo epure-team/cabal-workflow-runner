@@ -1,8 +1,15 @@
 ; Split out as its own library (rather than a bin/-local module) so a test binary can build a
 ; REAL run_command the same way `cwr run` does, instead of re-implementing process execution +
 ; the directory-snapshot diff. See test/test_pcc_integration.ml.
+;
+; public_name: dotted under the cabal_workflow_runner package (mirrors #8's own packaging fix
+; for the lib/ library) so external consumers can `opam install cabal_workflow_runner` and use
+; Cwr_runner.Runner directly, instead of hand-duplicating this file (as cabal-chat had to before
+; this -- see its lib/real_run_command.ml, now dropped in favor of this). Packaging-only: the
+; module itself (runner.ml) is untouched.
 (library
  (name cwr_runner)
+ (public_name cabal_workflow_runner.runner)
  (modules runner)
  (libraries cabal_workflow_runner cabal eio digestif unix))
 
