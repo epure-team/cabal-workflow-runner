@@ -1,0 +1,14 @@
+{
+  "name": "cwr-readonly-monitor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cp dist/client.js dist/ui.js public/",
+    "start": "node dist/server.js",
+    "test": "node --experimental-strip-types --test test/monitor.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "typescript": "^5.9.0"
+  }
+}

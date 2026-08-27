@@ -82,6 +82,25 @@ dune build
 dune test
 ```
 
+## Read-only monitor
+
+The optional TypeScript monitor exposes only `GET` routes. It reads CWR ledgers from
+`CWR_LEDGER_ROOT` (default `./ledgers`) and Pi v3 JSONL sessions from
+`PI_SESSION_ROOT` (default `./pi-sessions`):
+
+```sh
+npm run build
+PI_SESSION_ROOT=/path/to/pi/sessions PORT=8787 npm start
+```
+
+`GET /v1/pi-sessions` lists bounded, normalized session summaries and
+`GET /v1/pi-sessions/{id}` returns a chronological, server-redacted transcript.
+Source filenames must be path-safe and files cannot escape the configured root.
+Reads are capped by `PI_SESSION_MAX_BYTES` (8 MiB), `PI_SESSION_MAX_LINES` (10,000),
+and `PI_SESSION_MAX_FILES` (500). The API reports truncation rather than silently
+presenting a partial transcript as complete. A Pi↔CWR relationship is displayed only
+when a ledger contains an explicit `session_id` equal to the Pi session id.
+
 ## CLI
 
 ```sh

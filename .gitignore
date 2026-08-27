@@ -7,3 +7,5 @@ _opam/
 .roster*
 .opencode/
 .agents/
+node_modules/
+dist/
