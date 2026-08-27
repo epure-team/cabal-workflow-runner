@@ -269,6 +269,11 @@ let governor_of_json (j : Yojson.Safe.t) : governor =
   | "budget" ->
       reject_unknown_keys ~what:"budget governor" ~known:[ "kind" ] j;
       Budget
+  | "deadline" ->
+      (* Nullary on purpose: the instant is a RUNTIME value (Engine.run
+         ~deadline), never a workflow-file constant. *)
+      reject_unknown_keys ~what:"deadline governor" ~known:[ "kind" ] j;
+      Deadline
   | "fixpoint" ->
       let g =
         Fixpoint
@@ -421,6 +426,33 @@ let rec step_of_json json =
       reject_unknown_keys ~what:"foreach step"
         ~known:[ "kind"; "over"; "steps" ] json;
       s
+  | "spawn" ->
+      let children = List.map (function
+        | (`Assoc _ as child) ->
+            let id = req_nonempty_string "id" child in
+            let steps = List.map step_of_json (req_nonempty_list "steps" child) in
+            reject_unknown_keys ~what:"spawn child" ~known:[ "id"; "steps" ] child;
+            { Types.id; steps }
+        | _ -> err "each spawn child must be an object")
+        (req_nonempty_list "children" json) in
+      let ids = List.map (fun (child : Types.spawn_child) -> child.id) children in
+      if List.length ids <> List.length (List.sort_uniq String.compare ids) then
+        err "spawn child ids must be unique";
+      let s = Spawn { id = req_nonempty_string "id" json; children } in
+      reject_unknown_keys ~what:"spawn step" ~known:[ "kind"; "id"; "children" ] json;
+      s
+  | "dynamic_parallel" ->
+      let s =
+        Dynamic_parallel
+          {
+            id = req_nonempty_string "id" json;
+            over = req_string "over" json;
+            steps = List.map step_of_json (req_nonempty_list "steps" json);
+          }
+      in
+      reject_unknown_keys ~what:"dynamic_parallel step"
+        ~known:[ "kind"; "id"; "over"; "steps" ] json;
+      s
   | "shell" ->
       let s =
         Shell
@@ -540,6 +572,7 @@ let rec expr_to_json (e : Expr.t) : Yojson.Safe.t =
 let governor_to_json = function
   | Max_iters n -> `Assoc [ ("kind", `String "max_iters"); ("n", `Int n) ]
   | Budget -> `Assoc [ ("kind", `String "budget") ]
+  | Deadline -> `Assoc [ ("kind", `String "deadline") ]
   | Fixpoint { window; progress } ->
       `Assoc
         [
@@ -650,6 +683,19 @@ let rec step_to_json = function
           ("over", `String over);
           ("steps", `List (List.map step_to_json steps));
         ]
+  | Spawn { id; children } ->
+      `Assoc [
+        ("kind", `String "spawn"); ("id", `String id);
+        ("children", `List (List.map (fun (child : Types.spawn_child) ->
+          `Assoc [ ("id", `String child.id);
+                   ("steps", `List (List.map step_to_json child.steps)) ]) children));
+      ]
+  | Dynamic_parallel { id; over; steps } ->
+      `Assoc [
+        ("kind", `String "dynamic_parallel"); ("id", `String id);
+        ("over", `String over);
+        ("steps", `List (List.map step_to_json steps));
+      ]
   | Shell { id; commands; on_failure } ->
       `Assoc
         ([

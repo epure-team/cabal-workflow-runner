@@ -78,6 +78,12 @@ let extract_json (raw : string) : Yojson.Safe.t option =
 
 let structured_output (result : Backend_types.task_result) :
     bool * Yojson.Safe.t =
+  let attach_session_id json =
+    match result.Backend_types.session_id, json with
+    | Some session_id, `Assoc fields ->
+        `Assoc (("session_id", `String session_id) :: List.remove_assoc "session_id" fields)
+    | _ -> json
+  in
   let base_success =
     match result.Backend_types.status with
     | Backend_types.Success -> true
@@ -90,10 +96,10 @@ let structured_output (result : Backend_types.task_result) :
   in
   let from_text () = extract_json result.Backend_types.agent_text in
   match (base_success, from_report) with
-  | true, Some j -> (true, j)
+  | true, Some j -> (true, attach_session_id j)
   | true, None -> (
       match from_text () with
-      | Some j -> (true, j)
+      | Some j -> (true, attach_session_id j)
       (* successful run but no parseable structured JSON => fail closed *)
       | None -> (false, `Assoc [ ("error", `String "no parseable structured JSON") ]))
   | false, _ ->
@@ -189,7 +195,7 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
     | Some m when String.trim m <> "" -> Some (String.trim m)
     | _ -> None
   in
-  let run_agent ~id ~prompt ~read_only ~agent_type ~model =
+  let run_agent ~id ~prompt ~read_only ~agent_type ~model ~output_schema =
     (* Per-step model override wins over the global CWR_MODEL default. A blank
        per-step value falls back to the default rather than pinning "". *)
     let model =
@@ -203,8 +209,18 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
       | Some _ -> None
       | None -> None
     in
+    (* Constrain the model natively when the step declared a schema. cabal
+       forwards this as the CLI's --json-schema, which the CLI itself enforces
+       (see Cabal.Claude_code: native_json_schema_output). Without it the step's
+       output_schema was only ever checked AFTER the fact, so nothing asked the
+       model for JSON in the first place and a prose answer failed the parse.
+       [None] when the step declared no schema: constrain nothing, as before. *)
+    let json_schema =
+      Option.map Cabal_workflow_runner.Types.Schema.to_json_schema output_schema
+    in
     let spec =
       Backend_types.make_task_spec ~prompt ~working_dir ~read_only ?model
+        ?json_schema
         ~expected_outputs:
           [ Backend_types.Files_changed; Backend_types.Structured_report ]
         ()

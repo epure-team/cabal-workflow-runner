@@ -48,7 +48,7 @@ let outcome_testable =
 
 (* An agent backend that returns a fixed JSON output per id. *)
 let json_backend table =
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     match List.assoc_opt id table with
     | Some j -> (true, j)
     | None -> (true, `Assoc [])
@@ -57,12 +57,13 @@ let json_backend table =
 
 (* Wrap Engine.run in an Eio context (required after ~sw threading). *)
 let engine_run ?max_loop_iters ?run_allowlist ?initial_ctx
-    ?attestation_session_nonce ?agent_backend_id ~backend ~token validated =
+    ?attestation_session_nonce ?agent_backend_id ?deadline ?now ~backend ~token
+    validated =
   Eio_main.run (fun _env ->
     Eio.Switch.run (fun sw ->
       Engine.run ?max_loop_iters ?run_allowlist ?initial_ctx
-        ?attestation_session_nonce ?agent_backend_id ~sw ~backend ~token
-        validated))
+        ?attestation_session_nonce ?agent_backend_id ?deadline ?now ~sw
+        ~backend ~token validated))
 
 (* Wrap Engine.replay in an Eio context. *)
 let engine_replay ?max_loop_iters ?initial_ctx ?attestation_session_nonce
@@ -274,7 +275,7 @@ let test_failed_agent_fails_closed () =
     }
   in
   (* a backend whose agent returns success=false with an error object *)
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     (false, `Assoc [ ("error", `String "boom") ])
   in
   let backend = Backend.stub ~agent () in
@@ -312,7 +313,7 @@ let test_soft_fail_agent_continues () =
     }
   in
   (* "a" fails, "b" succeeds *)
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     if id = "a" then (false, `Assoc [ ("error", `String "boom") ])
     else (true, `Assoc [ ("ok", `Bool true) ])
   in
@@ -458,7 +459,7 @@ let test_loop_budget_terminates () =
      read=2, iter2 read=1, iter3 read=0 -> stop. So 4 iterations? We design the
      stub so the Nth reading is the one that is <=0. *)
   let agent_count = ref 0 in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_count;
     (true, `Assoc [ ("id", `String id) ])
   in
@@ -503,7 +504,7 @@ let test_loop_fixpoint_terminates () =
      from the start => stops after 2 iterations. Budget is default (unbounded).
      until never holds. *)
   let agent_count = ref 0 in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_count;
     (true, `Assoc [ ("progressed", `Bool false) ])
   in
@@ -546,13 +547,288 @@ let test_loop_fixpoint_terminates () =
 
 (* ---- v0.5 Fix 1: the unconditional engine iteration ceiling ---- *)
 
+(* ---- Deadline governor ------------------------------------------------- *)
+
+(* An injected clock: each call yields the next instant. The seam exists so a
+   test can REACH a deadline without sleeping — a deadline test that passes only
+   because the deadline was never reached proves nothing. *)
+let stepping_clock instants =
+  let r = ref instants in
+  fun () ->
+    match !r with
+    | [] -> infinity
+    | x :: tl ->
+        r := tl;
+        x
+
+let deadline_agent counter =
+  fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ ->
+    incr counter;
+    (true, `Assoc [ ("id", `String id) ])
+
+(* A Deadline-ONLY loop whose until never holds: only the clock can stop it. *)
+let deadline_loop_wf name governors =
+  {
+    name;
+    version = None;
+    steps =
+      [
+        Loop
+          {
+            body =
+              [ Agent { id = "work"; prompt = "p"; read_only = false; output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ];
+            until = Some (Expr.Lit (Expr.Bool false));
+            governors;
+          };
+      ];
+  }
+
+(* ---- agent output_schema forwarded to the backend as a native constraint ----
+
+   Before this, a step's [output_schema] was only ever checked AFTER the fact:
+   nothing asked the model for JSON, so a prose answer failed the parse and the
+   step died with "no parseable structured JSON". The schema now also travels to
+   the backend, WITHOUT the a-posteriori check being relaxed. *)
+
+let schema_agent seen =
+  fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema ->
+    seen := !seen @ [ (id, output_schema) ];
+    (true, `Assoc [ ("ok", `Bool true) ])
+
+let two_agent_wf =
+  {
+    name = "output-schema";
+    version = None;
+    steps =
+      [
+        Agent { id = "with"; prompt = "p"; read_only = true;
+                output_schema = Some [ ("ok", Schema.Bool) ];
+                on_failure = Types.Abort; protocol = None; brief = None;
+                agent_type = None; model = None; input = None };
+        Agent { id = "without"; prompt = "p"; read_only = true;
+                output_schema = None;
+                on_failure = Types.Abort; protocol = None; brief = None;
+                agent_type = None; model = None; input = None };
+      ];
+  }
+
+let schema_json_of = function
+  | None -> "none"
+  | Some s -> Yojson.Safe.to_string ~std:true (Schema.to_json_schema s)
+
+(* The translation itself. One exact-string assertion covers every arm of the
+   mapping at once, which is also what makes it catch an accidental "$schema"
+   key or a flipped additionalProperties. *)
+let test_to_json_schema_translation () =
+  let schema =
+    [ ("a", Schema.String); ("b", Schema.Int); ("c", Schema.Number);
+      ("d", Schema.Bool); ("e", Schema.Enum [ "x"; "y" ]); ("f", Schema.Any) ]
+  in
+  let actual = Yojson.Safe.to_string ~std:true (Schema.to_json_schema schema) in
+  let expected =
+    {|{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"},"c":{"type":"number"},"d":{"type":"boolean"},"e":{"type":"string","enum":["x","y"]},"f":{}},"required":["a","b","c","d","e","f"],"additionalProperties":true}|}
+  in
+  Alcotest.(check string) "JSON Schema translation" expected actual;
+  (* Named separately because it is a decision, not a consequence: the dialect
+     belongs to the transport, so the object must not pin one. *)
+  Alcotest.(check bool) "no $schema key" false
+    (contains_substring actual "$schema");
+  (* [Any] is PRESENT-but-untyped for [validate], so it must stay required. *)
+  Alcotest.(check bool) "Any stays required" true
+    (contains_substring actual {|"f"]|})
+
+(* Polarity 1: a step that declares a schema forwards it.
+   Polarity 2: a step that declares none forwards [None] — asserted in the SAME
+   test so a plumbing bug that hard-wires one of the two cannot pass. *)
+let test_output_schema_forwarded_both_polarities () =
+  let seen = ref [] in
+  let backend = Backend.stub ~agent:(schema_agent seen) () in
+  let v = validate_ok ~floor:[] two_agent_wf in
+  let _outcome, _trace = engine_run ~backend ~token:None v in
+  let got = List.map (fun (id, s) -> (id, schema_json_of s)) !seen in
+  Alcotest.(check (list (pair string string)))
+    "each step forwards exactly its own declared schema"
+    [ ("with",
+       {|{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":true}|});
+      ("without", "none") ]
+    got
+
+(* Belt and braces: a backend that IGNORES the constraint and answers with the
+   wrong type is still caught. The native schema is a guide; [Schema.validate]
+   remains the guarantee. *)
+let test_posteriori_validation_still_applies () =
+  let ignoring_agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_
+      ~output_schema:_ =
+    (true, `Assoc [ ("ok", `String "not a bool") ])
+  in
+  let backend = Backend.stub ~agent:ignoring_agent () in
+  let v = validate_ok ~floor:[] two_agent_wf in
+  let outcome, _ = engine_run ~backend ~token:None v in
+  match outcome with
+  | Aborted reason ->
+      Alcotest.(check string) "abort names the offending field"
+        "schema mismatch: ok" reason
+  | o ->
+      Alcotest.failf "expected Aborted when the backend ignores the schema, got %s"
+        (Types.string_of_outcome o)
+
+let loop_stop trace =
+  List.find_map
+    (function
+      | Loop_stopped { iterations; reason } -> Some (iterations, reason)
+      | _ -> None)
+    trace
+
+let deadline_reads trace =
+  List.filter_map
+    (function Deadline_read { expired } -> Some expired | _ -> None)
+    trace
+
+(* Polarity 1: the deadline IS reached => the loop stops, reason "deadline". *)
+let test_loop_deadline_fires () =
+  let count = ref 0 in
+  let backend = Backend.stub ~agent:(deadline_agent count) () in
+  let v = validate_ok ~floor:[] (deadline_loop_wf "deadline-loop" [ Deadline ]) in
+  (* readings 0.(<100 continue) 50.(<100 continue) 150.(>=100 STOP) *)
+  let now = stepping_clock [ 0.; 50.; 150. ] in
+  let outcome, trace =
+    engine_run ~deadline:100. ~now ~backend ~token:None v
+  in
+  Alcotest.(check int) "ran body exactly 3 times" 3 !count;
+  Alcotest.(check bool) "stopped via deadline after 3 iters" true
+    (loop_stop trace = Some (3, "deadline"));
+  Alcotest.(check (list bool)) "recorded one verdict per iteration"
+    [ false; false; true ] (deadline_reads trace);
+  Alcotest.(check outcome_testable) "completed without commit"
+    Completed_no_commit outcome
+
+(* Polarity 2: the deadline is NOT reached => Deadline never fires, and the
+   governor still RAN (a false verdict per iteration) rather than being skipped.
+   Without the recorded-verdict assertion this test would also pass if the
+   Deadline arm did nothing at all. *)
+let test_loop_deadline_not_reached () =
+  let count = ref 0 in
+  let backend = Backend.stub ~agent:(deadline_agent count) () in
+  let v =
+    validate_ok ~floor:[]
+      (deadline_loop_wf "deadline-far" [ Max_iters 2; Deadline ])
+  in
+  let now = stepping_clock [ 0.; 1.; 2.; 3. ] in
+  let _outcome, trace =
+    engine_run ~deadline:1_000_000. ~now ~backend ~token:None v
+  in
+  Alcotest.(check int) "ran body exactly 2 times" 2 !count;
+  Alcotest.(check bool) "stopped via max_iters, not deadline" true
+    (loop_stop trace = Some (2, "max_iters"));
+  (* Max_iters fires on iteration 2 BEFORE the Deadline arm is reached that
+     round, so exactly one false verdict is recorded (iteration 1). *)
+  Alcotest.(check (list bool)) "deadline governor ran and read false"
+    [ false ] (deadline_reads trace)
+
+(* A Deadline governor with NO runtime deadline never fires — the same posture
+   as Budget against a constant stub. The ceiling remains the guarantee. *)
+let test_loop_deadline_absent_never_fires () =
+  let count = ref 0 in
+  let backend = Backend.stub ~agent:(deadline_agent count) () in
+  let v =
+    validate_ok ~floor:[] (deadline_loop_wf "deadline-none" [ Deadline ])
+  in
+  let _outcome, trace = engine_run ~max_loop_iters:3 ~backend ~token:None v in
+  Alcotest.(check int) "ran to the ceiling" 3 !count;
+  Alcotest.(check bool) "stopped by the ceiling, not the deadline" true
+    (loop_stop trace = Some (3, "ceiling"));
+  Alcotest.(check (list bool)) "every verdict is false" [ false; false; false ]
+    (deadline_reads trace)
+
+(* THE design test: replay is clock-free. The recorded verdict decides, so a
+   trace recorded when the deadline had passed replays with no deadline and no
+   clock supplied at all — Engine.replay's signature has neither. If replay
+   re-read the wall clock, a recorded run would stop being reproducible the
+   moment the deadline passed. *)
+let test_loop_deadline_replay_is_clock_free () =
+  let count = ref 0 in
+  let backend = Backend.stub ~agent:(deadline_agent count) () in
+  let v = validate_ok ~floor:[] (deadline_loop_wf "deadline-replay" [ Deadline ]) in
+  let now = stepping_clock [ 0.; 50.; 150. ] in
+  let outcome, trace =
+    engine_run ~deadline:100. ~now ~backend ~token:None v
+  in
+  let ran_live = !count in
+  Alcotest.(check bool) "the live run did stop on the deadline" true
+    (loop_stop trace = Some (3, "deadline"));
+  (* replay takes NO deadline and NO clock, and consults no backend. *)
+  let replayed = engine_replay ~trace v in
+  Alcotest.(check outcome_testable) "replayed outcome identical" outcome
+    replayed;
+  Alcotest.(check int) "replay consulted no agent" ran_live !count;
+  (* Non-vacuity: replay must actually CONSUME the recorded verdict. Swap the
+     Deadline_read for a Budget_read and replay must refuse rather than shrug. *)
+  let tampered =
+    List.map
+      (function
+        | Deadline_read { expired = true } -> Budget_read { value = 0 }
+        | e -> e)
+      trace
+  in
+  let raised =
+    try
+      ignore (engine_replay ~trace:tampered v);
+      false
+    with Engine.Replay_mismatch _ -> true
+  in
+  Alcotest.(check bool) "a swapped deadline verdict => Replay_mismatch" true
+    raised
+
+(* The JS compiler must REFUSE a Deadline governor rather than emit JS that
+   silently loses it. The engine records a wall-clock verdict as replay evidence;
+   a JS target has no such recorded reading, so any emitted approximation would
+   be a governor that looks present and behaves differently. Same posture as the
+   Spawn step. *)
+let test_compiler_refuses_deadline () =
+  let raises_compile_error wf =
+    try
+      ignore (Compiler.compile_workflow wf);
+      false
+    with Compiler.Compile_error msg -> contains_substring msg "Deadline"
+  in
+  Alcotest.(check bool) "Deadline governor => Compile_error naming Deadline" true
+    (raises_compile_error (deadline_loop_wf "js" [ Deadline ]));
+  (* Also when it merely accompanies a compilable governor. *)
+  Alcotest.(check bool) "Deadline alongside Max_iters => Compile_error" true
+    (raises_compile_error (deadline_loop_wf "js2" [ Max_iters 2; Deadline ]))
+
+(* The nullary shape survives a JSON round-trip, and an unknown extra key is
+   rejected — the deadline instant must never be smuggled into the file. *)
+let test_deadline_governor_json_roundtrip () =
+  let src =
+    {|{"name":"d","steps":[{"kind":"loop","governors":[{"kind":"deadline"}],"body":[{"kind":"gate","id":"g","when":{"lit":{"bool":true}}}]}]}|}
+  in
+  (match Workflow_json.of_string src with
+  | Error e -> Alcotest.fail ("deadline governor must parse: " ^ e)
+  | Ok wf ->
+      let back = Yojson.Safe.to_string (Workflow_json.to_json wf) in
+      Alcotest.(check bool) "re-encodes as kind:deadline" true
+        (contains_substring back {|"kind":"deadline"|});
+      (* and the re-encoded form parses back to the same workflow *)
+      (match Workflow_json.of_string back with
+      | Ok wf2 -> Alcotest.(check bool) "round-trip stable" true (wf2 = wf)
+      | Error e -> Alcotest.fail ("re-encode must parse: " ^ e)));
+  (* an instant in the workflow file is a parse error, not a silent ignore *)
+  let with_instant =
+    {|{"name":"d","steps":[{"kind":"loop","governors":[{"kind":"deadline","at":1.0}],"body":[{"kind":"gate","id":"g","when":{"lit":{"bool":true}}}]}]}|}
+  in
+  match Workflow_json.of_string with_instant with
+  | Error _ -> ()
+  | Ok _ ->
+      Alcotest.fail "a deadline instant in the workflow file must be rejected"
+
 (* A Budget-ONLY loop whose backend returns a CONSTANT positive budget (the
    shipped Backend_cabal semantics) and whose [until] never holds would run
    forever under the old code. The engine ceiling stops it at exactly
    [max_loop_iters] with reason "ceiling". *)
 let test_loop_ceiling_budget_constant () =
   let agent_count = ref 0 in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_count;
     (true, `Assoc [ ("id", `String id) ])
   in
@@ -594,7 +870,7 @@ let test_loop_ceiling_budget_constant () =
    Fixpoint; the ceiling stops it anyway. *)
 let test_loop_ceiling_fixpoint_always_progresses () =
   let agent_count = ref 0 in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_count;
     (true, `Assoc [ ("progressed", `Bool true) ])
   in
@@ -639,7 +915,7 @@ let test_loop_ceiling_fixpoint_always_progresses () =
 
 let test_replay_with_loop () =
   (* governed loop (budget) + structured agents + an expression-gated commit. *)
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     match id with
     | "assess" -> (true, `Assoc [ ("severity", `String "high") ])
     | _ -> (true, `Assoc [ ("progressed", `Bool false) ])
@@ -1552,6 +1828,7 @@ let test_commit_token_digest_only () =
            | Loop_iter { index } -> string_of_int index
            | Budget_read { value } -> string_of_int value
            | Fixpoint_progress { progress } -> string_of_bool progress
+           | Deadline_read { expired } -> string_of_bool expired
            | Loop_stopped { reason; _ } -> reason
            | Run_executed { id; _ } -> id
            | Commit_preflight_executed { id; _ } -> id
@@ -1566,6 +1843,17 @@ let test_commit_token_digest_only () =
                Printf.sprintf "foreach_iter_completed_%d" index
            | Foreach_completed { iterations } ->
                Printf.sprintf "foreach_completed_%d" iterations
+           | Spawn_started { id } -> "spawn_started_" ^ id
+           | Spawn_child_completed { spawn_id; child_id; _ } ->
+               "spawn_child_" ^ spawn_id ^ "_" ^ child_id
+           | Spawn_completed { id; children; _ } ->
+               Printf.sprintf "spawn_completed_%s_%d" id children
+           | Dynamic_parallel_started { id; branches } ->
+               Printf.sprintf "dynamic_parallel_started_%s_%d" id branches
+           | Dynamic_parallel_branch_completed { id; branch_idx; key; _ } ->
+               Printf.sprintf "dynamic_parallel_branch_%s_%d_%s" id branch_idx key
+           | Dynamic_parallel_completed { id; branches; _ } ->
+               Printf.sprintf "dynamic_parallel_completed_%s_%d" id branches
            | Shell_executed { id; _ } -> id
            | Evidence_evaluated { id; _ } -> id
            | Attestation_exported { id; _ } -> id
@@ -2021,7 +2309,7 @@ let test_schema_no_drift () =
    unknown kind. *)
 let test_schema_kinds_agree () =
   (* Hard-coded expected set the parser (Workflow_json.step_of_json) accepts. *)
-  let expected = [ "agent"; "attest"; "branch"; "commit"; "evidence"; "foreach"; "gate"; "loop"; "parallel"; "run"; "shell" ] in
+  let expected = [ "agent"; "attest"; "branch"; "commit"; "dynamic_parallel"; "evidence"; "foreach"; "gate"; "loop"; "parallel"; "run"; "shell"; "spawn" ] in
   (* Extract the kind consts enumerated under $defs/step/oneOf in the schema. *)
   let top = match Workflow_schema.schema with `Assoc l -> l | _ -> [] in
   let step_def =
@@ -2251,11 +2539,14 @@ let parser_known_keys =
     ("commit", [ "kind"; "id"; "preflight" ]);
     ("parallel", [ "kind"; "branches" ]);
     ("foreach", [ "kind"; "over"; "steps" ]);
+    ("spawn", [ "kind"; "id"; "children" ]);
+    ("dynamic_parallel", [ "kind"; "id"; "over"; "steps" ]);
     ("shell", [ "kind"; "id"; "commands"; "on_failure" ]);
     ("evidence", [ "kind"; "id"; "build"; "check"; "zero_admits"; "tier"; "output" ]);
     ("attest", [ "kind"; "id"; "select"; "replay_domain"; "output" ]);
     ("max_iters", [ "kind"; "n" ]);
     ("budget", [ "kind" ]);
+    ("deadline", [ "kind" ]);
     ("fixpoint", [ "kind"; "window"; "progress" ]);
   ]
 
@@ -2660,6 +2951,11 @@ let test_ledger_roundtrip_all_variants () =
       Foreach_iter_started { index = 0; element = `String "x" };
       Foreach_iter_completed { index = 0; outcome = Completed_no_commit };
       Foreach_completed { iterations = 1 };
+      Spawn_started { id = "delegation" };
+      Spawn_child_completed { spawn_id = "delegation"; child_id = "research";
+        outcome = Completed_no_commit; ctx = [ ("outputs", `Assoc []) ] };
+      Spawn_completed { id = "delegation"; children = 1;
+        outcome = Completed_no_commit };
     ]
   in
   let serialised = Ledger.to_ndjson trace in
@@ -2682,7 +2978,7 @@ let test_ledger_roundtrip_all_variants () =
 let test_ledger_persist_then_replay_from_file () =
   let agent_calls = ref 0 in
   let cmd_calls = ref 0 in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_calls;
     match id with
     | "assess" -> (true, `Assoc [ ("severity", `String "high") ])
@@ -2852,7 +3148,7 @@ let test_foreach_3_elements () =
         ];
     }
   in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     (true, `Assoc [])
   in
   let backend = Backend.stub ~agent () in
@@ -3011,7 +3307,7 @@ let test_parallel_two_branches_succeed () =
     }
   in
   let agent_calls = ref 0 in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr agent_calls;
     (true, `Assoc [])
   in
@@ -3055,7 +3351,7 @@ let test_parallel_one_branch_aborts () =
         ];
     }
   in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     match id with
     | "bad" -> (false, `Assoc [])
     | _ -> (true, `Assoc [])
@@ -3093,7 +3389,7 @@ let test_parallel_replay_success () =
         ];
     }
   in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc []) in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ = (true, `Assoc []) in
   let backend = Backend.stub ~agent () in
   let v = validate_ok ~floor:[] wf in
   let outcome, trace = engine_run ~backend ~token:None v in
@@ -3781,7 +4077,7 @@ let test_foreach_iterates () =
                                             on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
   let calls = ref 0 in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     incr calls;
     (true, `Assoc [])
   in
@@ -3813,7 +4109,7 @@ let test_foreach_empty_array () =
                                             on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
   let called = ref false in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = called := true; (true, `Assoc []) in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ = called := true; (true, `Assoc []) in
   let backend = Backend.stub ~agent () in
   let v = validate_ok ~floor:[] wf in
   let outcome, _trace =
@@ -3834,7 +4130,7 @@ let test_foreach_replay_iteration () =
                                             output_schema = None;
                                             on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc [("x", `Int 1)]) in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ = (true, `Assoc [("x", `Int 1)]) in
   let backend = Backend.stub ~agent () in
   let v = validate_ok ~floor:[] wf in
   let outcome, trace =
@@ -3949,7 +4245,7 @@ let test_parallel_branch_output_merge () =
               [ Agent { id = "r2"; prompt = "p"; read_only = true;
                         output_schema = None; on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] ] } ] }
   in
-  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     (true, `Assoc [("result", `String id)])
   in
   let backend = Backend.stub ~agent () in
@@ -3981,7 +4277,7 @@ let test_foreach_disk_replay () =
                                              output_schema = None;
                                              on_failure = Types.Abort; protocol = None; brief = None; agent_type = None; model = None; input = None } ] } ] }
   in
-  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc []) in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ = (true, `Assoc []) in
   let backend = Backend.stub ~agent () in
   let v = validate_ok ~floor:[] wf in
   let initial_ctx = [("items", `List [`String "x"; `String "y"])] in
@@ -4028,7 +4324,7 @@ let test_foreach_disk_replay () =
 
 let test_structured_agent_receipts_and_replay () =
   let seen_prompt = ref "" in
-  let agent ~id ~prompt ~read_only ~agent_type:_ ~model:_ =
+  let agent ~id ~prompt ~read_only ~agent_type:_ ~model:_ ~output_schema:_ =
     if id = "proof" then (true, `Assoc [ ("value", `Int 7) ])
     else begin
       seen_prompt := prompt;
@@ -4105,7 +4401,7 @@ let test_structured_agent_receipts_and_replay () =
     with Engine.Replay_mismatch _ -> true in
   Alcotest.(check bool) "tampered predecessor membership rejected" true
     path_rejected;
-  let noncanonical_agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+  let noncanonical_agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
     if id = "proof" then (true, `Assoc [ ("value", `Int 7) ])
     else (true, `Assoc [ ("score", `Float 1.5) ]) in
   let bad_outcome, bad_trace = engine_run
@@ -4472,6 +4768,351 @@ let test_commit_preflight_parse_lint_compiler () =
       {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["x"],"stdout_schema":{"ready":"bool"},"lock_file":"../escape"}}]}|};
       {|{"name":"p","steps":[{"kind":"commit","id":"c","preflight":{"cmd":["check"],"input":["cwr.commit_lock"],"stdout_schema":{"ready":"bool"},"lock_file":".campaign-state/.manifest-write.lock"}}]}|} ]
 
+let test_spawn_parse_run_replay_and_reject () =
+  let raw =
+    {|{"name":"spawn","steps":[{"kind":"spawn","id":"delegation","children":[{"id":"first","steps":[{"kind":"agent","id":"a","prompt":"a"}]},{"id":"second","steps":[{"kind":"agent","id":"b","prompt":"b"}]}]}]}|}
+  in
+  let wf = match Workflow_json.of_string raw with
+    | Ok wf -> wf | Error e -> Alcotest.failf "spawn parse failed: %s" e in
+  Alcotest.(check bool) "spawn round-trip" true
+    (contains_substring (Yojson.Safe.to_string (Workflow_json.to_json wf)) "spawn");
+  let backend = Backend.stub ~agent:(fun ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ ->
+    true, `Assoc [ ("id", `String id) ]) () in
+  let validated = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None validated in
+  Alcotest.(check outcome_testable) "spawn completes" Completed_no_commit outcome;
+  Alcotest.(check bool) "spawn markers" true
+    (List.exists (function Spawn_started { id = "delegation" } -> true | _ -> false) trace
+     && List.exists (function Spawn_completed { id = "delegation"; children = 2; _ } -> true | _ -> false) trace);
+  Alcotest.(check outcome_testable) "spawn replay is backend-free" outcome
+    (engine_replay ~trace validated);
+  let rejected =
+    { name = "nested"; version = None;
+      steps = [ Spawn { id = "outer"; children = [ { id = "child";
+        steps = [ Spawn { id = "inner"; children = [ { id = "x"; steps = [ Gate { id = "g"; when_ = Expr.Lit (Expr.Bool true) } ] } ] } ] } ] } ] }
+  in
+  Alcotest.(check bool) "nested spawn rejected" true
+    (Lint.has_errors (Lint.check rejected));
+  let compiler_rejected = try ignore (Compiler.compile_workflow wf); false
+    with Compiler.Compile_error msg -> contains_substring msg "Spawn" in
+  Alcotest.(check bool) "compiler rejects spawn" true compiler_rejected
+
+(* ---- dynamic_parallel: scaffold + concurrent execution + cancellation ---- *)
+
+let dp_wf ~over steps =
+  { name = "dp"; version = None;
+    steps = [ Dynamic_parallel { id = "fanout"; over; steps } ] }
+
+(* Step 1 completion gate: a fixture workflow using the new step kind
+   round-trips through the parser (not just manual inspection). *)
+let test_dynamic_parallel_parse_roundtrip () =
+  let raw =
+    {|{"name":"dp","steps":[{"kind":"dynamic_parallel","id":"fanout","over":"keys","steps":[{"kind":"agent","id":"a","prompt":"p"}]}]}|}
+  in
+  let wf = match Workflow_json.of_string raw with
+    | Ok wf -> wf | Error e -> Alcotest.failf "dynamic_parallel parse failed: %s" e in
+  (match wf.steps with
+  | [ Dynamic_parallel { id; over; steps = [ Agent { id = "a"; _ } ] } ] ->
+      Alcotest.(check string) "id" "fanout" id;
+      Alcotest.(check string) "over" "keys" over
+  | _ -> Alcotest.fail "expected one dynamic_parallel step wrapping one agent");
+  (match Workflow_json.of_json (Workflow_json.to_json wf) with
+  | Ok wf' -> Alcotest.(check bool) "round-trip" true (wf = wf')
+  | Error e -> Alcotest.failf "round-trip parse failed: %s" e);
+  Alcotest.(check bool) "engine stub before real execution wired in (still true post-Step-2)" true
+    (contains_substring (Yojson.Safe.to_string (Workflow_json.to_json wf)) "dynamic_parallel")
+
+(* Step 2 happy path: 0 branches is a successful no-op (never dispatches an
+   agent), and every fail-closed [over] rejection (missing/non-array/
+   non-string-element/duplicate/>32) blocks BEFORE any agent is dispatched. *)
+let test_dynamic_parallel_zero_branches_is_noop () =
+  let agent_calls = ref 0 in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    incr agent_calls; (true, `Assoc []) in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List []) ] v in
+  Alcotest.(check outcome_testable) "0 branches => success no-op"
+    Completed_no_commit outcome;
+  Alcotest.(check int) "no agent dispatched" 0 !agent_calls;
+  Alcotest.(check bool) "0-branch Dynamic_parallel_completed recorded" true
+    (List.exists (function
+       | Dynamic_parallel_completed { id = "fanout"; branches = 0; outcome = Completed_no_commit; failed = [] } -> true
+       | _ -> false) trace)
+
+(* FR-007/AC-5: exactly 1 runtime-resolved branch must run the single branch
+   without triggering Parallel's static >=2-branch arity check
+   ("parallel-too-few-branches", enforced only for literal "kind":"parallel"
+   steps at parse time in Workflow_json.of_json). dynamic_parallel's runtime
+   branch count is resolved from [over] at engine-run time, not from a
+   static "branches" list at parse time, so that check structurally cannot
+   apply here regardless of the resolved count -- this test proves a
+   1-branch run actually succeeds end-to-end rather than merely asserting
+   the two mechanisms are textually distinct. *)
+let test_dynamic_parallel_single_branch_skips_parallel_arity_check () =
+  let agent_calls = ref 0 in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    incr agent_calls; (true, `Assoc []) in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "only" ]) ] v in
+  Alcotest.(check outcome_testable) "1 branch => success, not blocked on arity"
+    Completed_no_commit outcome;
+  Alcotest.(check int) "exactly one agent dispatched" 1 !agent_calls;
+  Alcotest.(check bool) "the single branch's completion is recorded" true
+    (List.exists (function
+       | Dynamic_parallel_branch_completed { key = "only"; _ } -> true
+       | _ -> false) trace)
+
+let test_dynamic_parallel_over_resolution_fails_closed () =
+  let agent_calls = ref 0 in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    incr agent_calls; (true, `Assoc []) in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let expect_blocked ~label ~initial_ctx =
+    agent_calls := 0;
+    let outcome, _trace = engine_run ~backend ~token:None ~initial_ctx v in
+    (match outcome with
+     | Blocked _ -> ()
+     | o -> Alcotest.failf "%s: expected Blocked, got %s" label (Types.string_of_outcome o));
+    Alcotest.(check int) (label ^ ": no agent dispatched before the block") 0 !agent_calls
+  in
+  expect_blocked ~label:"missing over key" ~initial_ctx:[];
+  expect_blocked ~label:"non-array over" ~initial_ctx:[ ("keys", `String "nope") ];
+  expect_blocked ~label:"non-string element"
+    ~initial_ctx:[ ("keys", `List [ `String "a"; `Int 1 ]) ];
+  expect_blocked ~label:"duplicate element"
+    ~initial_ctx:[ ("keys", `List [ `String "a"; `String "a" ]) ];
+  expect_blocked ~label:"empty-string element"
+    ~initial_ctx:[ ("keys", `List [ `String "" ]) ];
+  expect_blocked ~label:"33 branches exceeds the 32 ceiling"
+    ~initial_ctx:[ ("keys", `List (List.init 33 (fun i -> `String (Printf.sprintf "k%d" i)))) ]
+
+(* THE core positive-existence test for this whole primitive: prove genuine
+   temporal OVERLAP between two branches (one signals started, the other
+   starts AND finishes before the first signals finished) — not merely
+   "both eventually completed", which a secretly-sequential fold would also
+   satisfy. Verified by hand: temporarily rewriting the executor as a
+   [List.fold_left] over [keys] makes this assertion fail (order becomes
+   slow:start, slow:end, fast:start, fast:end). *)
+let test_dynamic_parallel_proves_genuine_concurrency () =
+  let events = ref [] in
+  let record tag = events := tag :: !events in
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    if contains_substring id "#slow" then begin
+      record "slow:start";
+      Eio.Fiber.yield ();
+      record "slow:end"
+    end else if contains_substring id "#fast" then begin
+      record "fast:start";
+      record "fast:end"
+    end;
+    (true, `Assoc [])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, _trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "slow"; `String "fast" ]) ] v in
+  Alcotest.(check outcome_testable) "both branches succeed"
+    Completed_no_commit outcome;
+  Alcotest.(check (list string))
+    "genuine overlap: fast starts AND finishes inside slow's in-flight window"
+    [ "slow:start"; "fast:start"; "fast:end"; "slow:end" ] (List.rev !events)
+
+let test_dynamic_parallel_item_bound_per_branch () =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    (true, `Assoc [])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf =
+    dp_wf ~over:"keys"
+      [ Gate { id = "g"; when_ = Expr.Exists [ "item" ] };
+        make_agent "worker" ]
+  in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "s1"; `String "s2" ]) ] v in
+  Alcotest.(check outcome_testable) "both branches' item-gate passes"
+    Completed_no_commit outcome;
+  let seen = List.filter_map (function
+    | Dynamic_parallel_branch_completed { key; _ } -> Some key
+    | _ -> None) trace in
+  Alcotest.(check bool) "both runtime keys recorded" true
+    (List.mem "s1" seen && List.mem "s2" seen)
+
+let test_dynamic_parallel_run_replay_roundtrip () =
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    (true, `Assoc [ ("ok", `Bool true) ]) in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "s1"; `String "s2"; `String "s3" ]) ] v in
+  Alcotest.(check outcome_testable) "3-branch dynamic_parallel succeeds"
+    Completed_no_commit outcome;
+  Alcotest.(check outcome_testable) "replay reproduces the same outcome"
+    outcome (engine_replay ~initial_ctx:[ ("keys", `List [ `String "s1"; `String "s2"; `String "s3" ]) ] ~trace v)
+
+(* ---- Step 3: cancel-on-abort, collect-ALL-failures, and the race window ---- *)
+
+(* [failed] is a LIST (not a single string threaded through one
+   Eio.Switch.fail call, as Parallel does today) — verify the DATA/LEDGER
+   layer genuinely supports naming several branches at once, independent of
+   whichever specific interleaving Eio's single-domain scheduler happens to
+   produce for any one live run (see the note on
+   [test_dynamic_parallel_names_all_failed_branches] below for why a live
+   race between two failing branches deterministically has only one
+   "winner"). *)
+let test_dynamic_parallel_completed_failed_field_is_plural () =
+  let entry = Dynamic_parallel_completed
+    { id = "fanout"; branches = 3;
+      outcome = Aborted "dynamic_parallel \"fanout\": 2 branch(es) raised an error — bad1: x; bad2: y";
+      failed = [ ("bad1", "x"); ("bad2", "y") ] } in
+  (match entry with
+   | Dynamic_parallel_completed { failed; _ } ->
+       Alcotest.(check int) "both entries present" 2 (List.length failed);
+       Alcotest.(check bool) "names bad1" true (List.mem_assoc "bad1" failed);
+       Alcotest.(check bool) "names bad2" true (List.mem_assoc "bad2" failed)
+   | _ -> Alcotest.fail "impossible");
+  let json = Ledger.entry_to_json entry in
+  match Ledger.entry_of_json json with
+  | Dynamic_parallel_completed { failed; _ } ->
+      Alcotest.(check (list (pair string string))) "ledger round-trip preserves BOTH names"
+        [ ("bad1", "x"); ("bad2", "y") ] failed
+  | _ -> Alcotest.fail "ledger round-trip changed the entry kind"
+
+(* Two branches ("bad1", "bad2") both fail; a THIRD ("good") succeeds. Under
+   Eio's single-domain cooperative scheduler, "cancel siblings immediately on
+   any failure" (needed for the race-window test below) means the FIRST
+   failing branch to reach its own decision always wins the broadcast race:
+   forking a fiber onto an already-failing switch never invokes its body at
+   all (verified directly against this project's own eio/eio_main by hand
+   before writing this test). So exactly ONE of bad1/bad2 ends up genuinely
+   [Aborted] and the OTHER — never silently dropped, never corrupted — ends
+   up [Cancelled]. This is what "never conflated with never-started" actually
+   buys here: the cancelled one is still fully present and correctly typed in
+   the trace, just distinguishable from the one that got to raise. *)
+let test_dynamic_parallel_names_all_failed_branches () =
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    if contains_substring id "#bad1" || contains_substring id "#bad2"
+    then (false, `Assoc [])
+    else (true, `Assoc [])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "good"; `String "bad1"; `String "bad2" ]) ] v in
+  let branch_outcome key = List.find_map (function
+    | Dynamic_parallel_branch_completed { key = k; outcome; _ } when k = key -> Some outcome
+    | _ -> None) trace in
+  let bad1_outcome = match branch_outcome "bad1" with
+    | Some o -> o | None -> Alcotest.fail "bad1 missing from trace entirely" in
+  let bad2_outcome = match branch_outcome "bad2" with
+    | Some o -> o | None -> Alcotest.fail "bad2 missing from trace entirely" in
+  let is_raised = function Aborted _ | Blocked _ -> true | _ -> false in
+  let is_cancelled = function Cancelled _ -> true | _ -> false in
+  Alcotest.(check bool) "exactly one of bad1/bad2 genuinely raised, the other was cancelled — never both lost, never both silently dropped"
+    true
+    ((is_raised bad1_outcome && is_cancelled bad2_outcome)
+     || (is_cancelled bad1_outcome && is_raised bad2_outcome));
+  (match outcome with
+   | Aborted msg -> Alcotest.(check bool) "overall outcome names whichever branch actually raised" true
+       (contains_substring msg "bad1" || contains_substring msg "bad2")
+   | o -> Alcotest.failf "expected Aborted, got %s" (Types.string_of_outcome o));
+  let failed_keys = List.concat_map (function
+    | Dynamic_parallel_completed { failed; _ } -> List.map fst failed
+    | _ -> []) trace in
+  Alcotest.(check bool) "Dynamic_parallel_completed.failed names the branch that raised"
+    true (List.mem "bad1" failed_keys || List.mem "bad2" failed_keys);
+  let good_present = List.exists (function
+    | Dynamic_parallel_branch_completed { key = "good"; outcome = Completed_no_commit; _ } -> true
+    | _ -> false) trace in
+  Alcotest.(check bool) "the good branch's completed result is preserved, not discarded"
+    true good_present
+
+(* The race window itself: "victim" computes (blocks mid-Agent-step on a
+   controllable yield point) while "trigger" fails immediately and broadcasts
+   cancellation. The yield is the ONLY place victim can be interrupted, and it
+   sits strictly BEFORE victim would durably persist its result — so if the
+   cancellation lands there, victim's own agent body must never reach its
+   post-yield completion marker, and the branch must show up as genuinely
+   [Cancelled] in the trace (not silently missing, not a corrupted partial
+   Completed/Aborted entry). *)
+let test_dynamic_parallel_cancel_lands_in_commit_gap () =
+  let victim_finished = ref false in
+  let agent ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    if contains_substring id "#victim" then begin
+      Eio.Fiber.yield ();
+      victim_finished := true;
+      (true, `Assoc [])
+    end else (false, `Assoc [])
+  in
+  let backend = Backend.stub ~agent () in
+  let wf = dp_wf ~over:"keys" [ make_agent "worker" ] in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "victim"; `String "trigger" ]) ] v in
+  (match outcome with
+   | Aborted _ -> ()
+   | o -> Alcotest.failf "expected Aborted (trigger raised), got %s" (Types.string_of_outcome o));
+  Alcotest.(check bool)
+    "victim's agent body never reached its post-yield completion marker"
+    false !victim_finished;
+  match List.find_map (function
+    | Dynamic_parallel_branch_completed { key = "victim"; outcome; _ } -> Some outcome
+    | _ -> None) trace
+  with
+  | Some (Cancelled _) -> ()
+  | Some o -> Alcotest.failf "victim should be Cancelled, got %s" (Types.string_of_outcome o)
+  | None -> Alcotest.fail
+      "victim branch missing from the trace entirely — indistinguishable from never-started"
+
+(* ---- Step 5: intra-run occurrence dedup for a repeated runtime key ---- *)
+
+let test_dynamic_parallel_occurrence_dedup_on_retry () =
+  (* Dynamic_parallel dispatched TWICE within one run (a 2-iteration Loop, no
+     governor needed beyond Max_iters), the second time with the SAME runtime
+     key "s1" — must increment occurrence rather than colliding/erroring, and
+     [attest_counts] must start fresh for a brand-new [Engine.run] call. *)
+  let wf =
+    {
+      name = "dp-retry"; version = None;
+      steps =
+        [
+          Loop
+            {
+              body = [ Dynamic_parallel { id = "fanout"; over = "keys"; steps = [ make_agent "worker" ] } ];
+              until = None;
+              governors = [ Max_iters 2 ];
+            };
+        ];
+    }
+  in
+  let agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+    (true, `Assoc []) in
+  let backend = Backend.stub ~agent () in
+  let v = validate_ok ~floor:[] wf in
+  let outcome, _trace = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "s1" ]) ] v in
+  Alcotest.(check outcome_testable) "2-iteration retry of the same key succeeds"
+    Completed_no_commit outcome;
+  (* A fresh [Engine.run] call starts with an empty [attest_counts] table
+     (never persisted across runs — cross-run dedup is out of scope): running
+     the SAME workflow a second, wholly separate time must succeed exactly the
+     same way, not be affected by the previous call's occurrences. *)
+  let outcome2, _trace2 = engine_run ~backend ~token:None
+    ~initial_ctx:[ ("keys", `List [ `String "s1" ]) ] v in
+  Alcotest.(check outcome_testable) "a fresh run is unaffected by a prior run's occurrences"
+    Completed_no_commit outcome2
+
 let () =
   let test_agent_structured_input_parses_and_roundtrips () =
     let raw =
@@ -4530,12 +5171,33 @@ let () =
             test_loop_budget_terminates;
           Alcotest.test_case "unbounded loop, Fixpoint only, terminates" `Quick
             test_loop_fixpoint_terminates;
+          Alcotest.test_case "Deadline reached => loop stops" `Quick
+            test_loop_deadline_fires;
+          Alcotest.test_case "Deadline far => governor runs, does not fire"
+            `Quick test_loop_deadline_not_reached;
+          Alcotest.test_case "Deadline with no runtime deadline never fires"
+            `Quick test_loop_deadline_absent_never_fires;
+          Alcotest.test_case "Deadline replay is clock-free" `Quick
+            test_loop_deadline_replay_is_clock_free;
+          Alcotest.test_case "JS compiler refuses Deadline" `Quick
+            test_compiler_refuses_deadline;
+          Alcotest.test_case "deadline governor JSON round-trip" `Quick
+            test_deadline_governor_json_roundtrip;
           Alcotest.test_case
             "ceiling stops Budget-only loop with constant budget" `Quick
             test_loop_ceiling_budget_constant;
           Alcotest.test_case
             "ceiling stops Fixpoint-only loop that always progresses" `Quick
             test_loop_ceiling_fixpoint_always_progresses;
+        ] );
+      ( "agent-output-schema",
+        [
+          Alcotest.test_case "Schema.t translates to JSON Schema" `Quick
+            test_to_json_schema_translation;
+          Alcotest.test_case "schema forwarded, both polarities" `Quick
+            test_output_schema_forwarded_both_polarities;
+          Alcotest.test_case "a-posteriori validation still applies" `Quick
+            test_posteriori_validation_still_applies;
         ] );
       ( "validate-fail-closed",
         [
@@ -4740,6 +5402,34 @@ let () =
             test_parallel_replay_success;
           Alcotest.test_case "branch outputs merged post-parallel" `Quick
             test_parallel_branch_output_merge;
+        ] );
+      ( "spawn",
+        [ Alcotest.test_case "static Spawn parses, executes, replays, and compiler rejects" `Quick
+            test_spawn_parse_run_replay_and_reject ] );
+      ( "dynamic-parallel",
+        [
+          Alcotest.test_case "parses and round-trips (fixture, Step 1 gate)" `Quick
+            test_dynamic_parallel_parse_roundtrip;
+          Alcotest.test_case "0 branches => success no-op, no agent dispatched" `Quick
+            test_dynamic_parallel_zero_branches_is_noop;
+          Alcotest.test_case "1 branch => succeeds, never triggers Parallel's arity check (FR-007/AC-5)" `Quick
+            test_dynamic_parallel_single_branch_skips_parallel_arity_check;
+          Alcotest.test_case "over resolution fails closed before any dispatch" `Quick
+            test_dynamic_parallel_over_resolution_fails_closed;
+          Alcotest.test_case "proves genuine fiber-level concurrency (overlap, not just eventual completion)" `Quick
+            test_dynamic_parallel_proves_genuine_concurrency;
+          Alcotest.test_case "runtime key bound as ctx[\"item\"] per branch" `Quick
+            test_dynamic_parallel_item_bound_per_branch;
+          Alcotest.test_case "N-branch run/replay round-trip" `Quick
+            test_dynamic_parallel_run_replay_roundtrip;
+          Alcotest.test_case "Dynamic_parallel_completed.failed is a plural, ledger-round-trippable list" `Quick
+            test_dynamic_parallel_completed_failed_field_is_plural;
+          Alcotest.test_case "exactly one racing failure is named, the other is Cancelled (not lost), good's result preserved" `Quick
+            test_dynamic_parallel_names_all_failed_branches;
+          Alcotest.test_case "cancellation landing in the compute-then-persist gap => Cancelled" `Quick
+            test_dynamic_parallel_cancel_lands_in_commit_gap;
+          Alcotest.test_case "intra-run occurrence dedup on a retried key; fresh per run" `Quick
+            test_dynamic_parallel_occurrence_dedup_on_retry;
         ] );
       ( "lint-parallel",
         [

@@ -160,7 +160,7 @@ let run_command_stub ?(calls = Hashtbl.create 8) ?(run_seq = []) table
 let agent_stub ?(fixer_seq = [ `Assoc [ ("progressed", jbool true); ("done", jbool true) ] ])
     ?(reviewer = `Assoc [ ("verdict", jstr "approved"); ("reason", jstr "coherent") ])
     ?(author = `Assoc [ ("summary", jstr "renamed a function") ]) ?(calls = Hashtbl.create 8)
-    () ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ =
+    () ~id ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
   let n = Option.value ~default:0 (Hashtbl.find_opt calls id) in
   Hashtbl.replace calls id (n + 1);
   match id with

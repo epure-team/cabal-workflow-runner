@@ -151,6 +151,8 @@ let governor_def : Yojson.Safe.t =
               ~props:[ ("kind", kind_const "max_iters"); ("n", bounded_int) ];
             closed_object_with ~required:[ "kind" ]
               ~props:[ ("kind", kind_const "budget") ];
+            closed_object_with ~required:[ "kind" ]
+              ~props:[ ("kind", kind_const "deadline") ];
             closed_object_with
               ~required:[ "kind"; "window"; "progress" ]
               ~props:
@@ -355,6 +357,31 @@ let step_def : Yojson.Safe.t =
           ("steps", step_list);
         ]
   in
+  let spawn_child =
+    closed_object_with ~required:[ "id"; "steps" ]
+      ~props:[ ("id", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]);
+               ("steps", obj [ ("type", s "array"); ("items", ref_ "step");
+                                ("minItems", `Int 1) ]) ]
+  in
+  let spawn =
+    closed_object_with ~required:[ "kind"; "id"; "children" ]
+      ~props:[ ("kind", kind_const "spawn");
+               ("id", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]);
+               ("children", obj [ ("type", s "array"); ("items", spawn_child);
+                                   ("minItems", `Int 1); ("uniqueItems", `Bool true) ]) ]
+  in
+  let dynamic_parallel =
+    closed_object_with
+      ~required:[ "kind"; "id"; "over"; "steps" ]
+      ~props:
+        [
+          ("kind", kind_const "dynamic_parallel");
+          ("id", obj [ ("type", s "string"); ("pattern", s ".*\\S.*") ]);
+          ("over", typ "string");
+          ("steps", obj [ ("type", s "array"); ("items", ref_ "step");
+                           ("minItems", `Int 1) ]);
+        ]
+  in
   let shell =
     closed_object_with
       ~required:[ "kind"; "id"; "commands" ]
@@ -405,8 +432,8 @@ let step_def : Yojson.Safe.t =
       ( "description",
         s "A workflow step, discriminated by the \"kind\" key." );
       ( "oneOf",
-        arr [ agent; gate; branch; loop; run; commit; parallel; foreach; shell;
-              evidence; attest ] );
+        arr [ agent; gate; branch; loop; run; commit; parallel; foreach; spawn;
+              dynamic_parallel; shell; evidence; attest ] );
     ]
 
 (* ---- top level ---------------------------------------------------------- *)

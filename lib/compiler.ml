@@ -314,6 +314,10 @@ and compile_step ctx step =
             let v = Printf.sprintf "_fixcount_%d" k in
             bind_var ctx ~src:(Printf.sprintf "loop #%d fixpoint governor" k) v;
             emit ctx (Printf.sprintf "let %s = 0;" v)
+        | Types.Deadline ->
+            raise (Compile_error
+              "Deadline governor cannot be compiled faithfully: its wall-clock \
+               reading is engine-recorded replay evidence, not a JS expression")
         | Types.Budget -> ()) governors;
       emit ctx "while (true) {";
       let bctx = enter_scope ctx in
@@ -327,6 +331,10 @@ and compile_step ctx step =
             emit bctx (Printf.sprintf "if (++_maxiters_%d >= %d) break;" k n)
         | Types.Budget ->
             emit bctx "if (budget.remaining() <= 0) break;"
+        | Types.Deadline ->
+            raise (Compile_error
+              "Deadline governor cannot be compiled faithfully: its wall-clock \
+               reading is engine-recorded replay evidence, not a JS expression")
         | Types.Fixpoint { window; progress } ->
             emit bctx (Printf.sprintf
               "if (!(%s)) { if (++_fixcount_%d >= %d) break; } else { _fixcount_%d = 0; }"
@@ -375,6 +383,12 @@ and compile_step ctx step =
       add_note ctx ~kind:"foreach"
         ~description:(Printf.sprintf
           "foreach over ctx key %S compiled to pipeline(); static ctx reference" over)
+  | Types.Spawn { id; _ } ->
+      raise (Compile_error (Printf.sprintf
+        "Spawn step %S cannot be compiled faithfully: static sequential delegation and replay evidence are engine-only" id))
+  | Types.Dynamic_parallel { id; _ } ->
+      raise (Compile_error (Printf.sprintf
+        "Dynamic_parallel step %S cannot be compiled faithfully: runtime-sized concurrent fan-out and its replay evidence are engine-only" id))
   | Types.Shell { id; commands; on_failure = _ } ->
       emit_comment ctx (Printf.sprintf
         "[CWR shell: id=%S (%d command(s)) — not representable in Claude Workflow JS]" id
@@ -414,6 +428,8 @@ let compile_workflow (wf : Types.workflow) : string * note list =
     | Types.Loop { body; _ } -> has_attest body
     | Types.Parallel { branches } -> List.exists has_attest branches
     | Types.Foreach { steps; _ } -> has_attest steps
+    | Types.Spawn { children; _ } -> List.exists (fun (child : Types.spawn_child) -> has_attest child.steps) children
+    | Types.Dynamic_parallel { steps; _ } -> has_attest steps
     | _ -> false) steps in
   if has_attest wf.steps then
     raise (Compile_error

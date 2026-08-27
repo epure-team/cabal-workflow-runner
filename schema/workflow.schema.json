@@ -192,6 +192,51 @@
         },
         {
           "type": "object",
+          "required": [ "kind", "id", "children" ],
+          "properties": {
+            "kind": { "const": "spawn" },
+            "id": { "type": "string", "pattern": ".*\\S.*" },
+            "children": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [ "id", "steps" ],
+                "properties": {
+                  "id": { "type": "string", "pattern": ".*\\S.*" },
+                  "steps": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/step" },
+                    "minItems": 1
+                  }
+                },
+                "patternProperties": { "^_": {} },
+                "additionalProperties": false
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [ "kind", "id", "over", "steps" ],
+          "properties": {
+            "kind": { "const": "dynamic_parallel" },
+            "id": { "type": "string", "pattern": ".*\\S.*" },
+            "over": { "type": "string" },
+            "steps": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/step" },
+              "minItems": 1
+            }
+          },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "required": [ "kind", "id", "commands" ],
           "properties": {
             "kind": { "const": "shell" },
@@ -403,6 +448,13 @@
           "type": "object",
           "required": [ "kind" ],
           "properties": { "kind": { "const": "budget" } },
+          "patternProperties": { "^_": {} },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [ "kind" ],
+          "properties": { "kind": { "const": "deadline" } },
           "patternProperties": { "^_": {} },
           "additionalProperties": false
         },

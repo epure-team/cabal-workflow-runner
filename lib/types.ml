@@ -43,6 +43,34 @@ module Schema = struct
           | Some v -> if ok_ty ty v then go rest else Error field)
     in
     go schema
+
+  (* The same constraint as a JSON Schema object, for a backend that can
+     constrain its model natively. Kept deliberately equivalent to [validate]
+     above: every arm here mirrors an arm of [ok_ty], [required] mirrors
+     [validate]'s "an absent field is an error", and [additionalProperties]
+     mirrors the fact that [validate] never looks at extra fields. If [ok_ty]
+     gains an arm, this must gain one too — a native constraint STRICTER than
+     [validate] would reject output the engine would have accepted; a LOOSER one
+     is merely a weaker guide. See the .mli for why [Any] stays required and why
+     no "$schema" key is emitted. *)
+  let json_schema_of_ty = function
+    | String -> `Assoc [ ("type", `String "string") ]
+    | Int -> `Assoc [ ("type", `String "integer") ]
+    | Number -> `Assoc [ ("type", `String "number") ]
+    | Bool -> `Assoc [ ("type", `String "boolean") ]
+    | Enum opts ->
+        `Assoc
+          [ ("type", `String "string");
+            ("enum", `List (List.map (fun o -> `String o) opts)) ]
+    | Any -> `Assoc []
+
+  let to_json_schema (schema : t) : Yojson.Safe.t =
+    `Assoc
+      [ ("type", `String "object");
+        ( "properties",
+          `Assoc (List.map (fun (f, ty) -> (f, json_schema_of_ty ty)) schema) );
+        ("required", `List (List.map (fun (f, _) -> `String f) schema));
+        ("additionalProperties", `Bool true) ]
 end
 
 type on_failure = Abort | Continue
@@ -89,6 +117,8 @@ type step =
   | Commit of { id : string; preflight : commit_preflight option }
   | Parallel of { branches : step list list }
   | Foreach of { over : string; steps : step list }
+  | Spawn of { id : string; children : spawn_child list }
+  | Dynamic_parallel of { id : string; over : string; steps : step list }
   | Shell of {
       id : string;
       commands : string list;
@@ -109,9 +139,12 @@ type step =
       output : string;
     }
 
+and spawn_child = { id : string; steps : step list }
+
 and governor =
   | Max_iters of int
   | Budget
+  | Deadline
   | Fixpoint of { window : int; progress : Expr.t }
 
 type workflow = { name : string; steps : step list; version : string option }
@@ -125,6 +158,12 @@ type outcome =
   | Completed_no_commit
   | Blocked of string
   | Aborted of string
+  | Cancelled of string
+      (* A Dynamic_parallel branch that was still in flight when a sibling
+         branch aborted: it never got the chance to commit or fail on its own
+         terms. Genuinely distinct from [Aborted]/[Blocked] (which mean the
+         branch itself hit an error) and from "never started" (a cancelled
+         branch DID begin; it just didn't get to finish). *)
 
 (* A single observed filesystem change produced by a [Run] step. *)
 type file_change_kind =
@@ -199,6 +238,8 @@ type trace_entry =
   | Loop_iter of { index : int }  (** start of loop iteration [index] (0-based). *)
   | Budget_read of { value : int }  (** a [backend.budget ()] reading. *)
   | Fixpoint_progress of { progress : bool }  (** a Fixpoint progress verdict. *)
+  | Deadline_read of { expired : bool }
+      (** a Deadline governor's wall-clock verdict. *)
   | Loop_stopped of { iterations : int; reason : string }
   | Run_executed of {
       id : string;
@@ -239,6 +280,31 @@ type trace_entry =
   | Foreach_iter_started of { index : int; element : Yojson.Safe.t }
   | Foreach_iter_completed of { index : int; outcome : outcome }
   | Foreach_completed of { iterations : int }
+  | Spawn_started of { id : string }
+  | Spawn_child_completed of {
+      spawn_id : string;
+      child_id : string;
+      outcome : outcome;
+      ctx : (string * Yojson.Safe.t) list;
+    }
+  | Spawn_completed of { id : string; children : int; outcome : outcome }
+  | Dynamic_parallel_started of { id : string; branches : int }
+  | Dynamic_parallel_branch_completed of {
+      id : string;
+      branch_idx : int;
+      key : string;
+      trace : trace_entry list;
+      outcome : outcome;
+      branch_outputs : (string * Yojson.Safe.t) list;
+    }
+  | Dynamic_parallel_completed of {
+      id : string;
+      branches : int;
+      outcome : outcome;
+      failed : (string * string) list;
+          (** (key, reason) for EVERY branch that raised an error — plural,
+              never truncated to the first offender. *)
+    }
   | Ctx_snapshot of { ctx : (string * Yojson.Safe.t) list }
       (** Ledger-layer header recording the initial_ctx that was passed to
           [Engine.run]. Written as the FIRST line of an on-disk ledger so that
@@ -273,3 +339,4 @@ let string_of_outcome = function
   | Completed_no_commit -> "Completed_no_commit"
   | Blocked reason -> Printf.sprintf "Blocked(%s)" reason
   | Aborted reason -> Printf.sprintf "Aborted(%s)" reason
+  | Cancelled reason -> Printf.sprintf "Cancelled(%s)" reason

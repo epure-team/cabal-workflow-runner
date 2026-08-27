@@ -23,6 +23,34 @@ module Schema : sig
   val validate : t -> Yojson.Safe.t -> (unit, string) result
   (** Fail-closed: each required field must be present and type-correct.
       Returns [Error field] naming the first offending field, else [Ok ()]. *)
+
+  val to_json_schema : t -> Yojson.Safe.t
+  (** The same constraint expressed as a JSON Schema object, for a backend that
+      can constrain its model's output natively (a CLI's [--json-schema]).
+
+      This is a {b guide}, not the guarantee: {!validate} is still applied to
+      whatever comes back. A backend may ignore the schema, add a field of its
+      own, or be replaced by one with no native support at all.
+
+      Translation, field by field:
+      - [String] / [Int] / [Number] / [Bool] become ["string"] / ["integer"] /
+        ["number"] / ["boolean"]. [Number] accepts an int in {!validate}, and
+        JSON Schema's ["number"] does too, so the two agree.
+      - [Enum opts] becomes a ["string"] with an ["enum"], mirroring
+        {!validate}'s [Enum opts, `String s -> List.mem s opts].
+      - [Any] becomes the empty schema [{}] and {b stays in ["required"]}.
+        {!validate} demands the field be PRESENT while accepting any type for
+        it, so dropping it from ["required"] would invite a model to omit a
+        field the validator then rejects — trading a soft constraint for a hard
+        abort.
+      - ["additionalProperties"] is [true], because {!validate} ignores extra
+        fields and at least one backend adds its own (a dispatch session id).
+        [false] here would reject output the engine accepts.
+
+      No ["$schema"] key is emitted. The dialect belongs to the transport — a
+      backend declares which draft its CLI accepts — and every construct used
+      here is identical in draft 7 and 2020-12, so naming one would only risk a
+      strict consumer rejecting the other. *)
 end
 
 (** A single workflow step. Illegal states are made hard to express:
@@ -153,6 +181,16 @@ type step =
   | Foreach of { over : string; steps : step list }
       (** Iterate over the JSON array at [ctx[over]], running [steps] once per
           element (bound as [ctx["item"]]). Sequential, not concurrent. *)
+  | Spawn of { id : string; children : spawn_child list }
+      (** Static, inline, sequential child bodies sharing the ordinary CWR context. *)
+  | Dynamic_parallel of { id : string; over : string; steps : step list }
+      (** Runtime-sized, genuinely concurrent fan-out: [over] is a ctx key
+          (exactly like {!Foreach}'s) that must resolve at runtime to a JSON
+          array of unique, non-empty strings (0..32 elements; 0 is a
+          successful no-op, >32 is a hard fail-closed engine error). [steps]
+          is a TEMPLATE body forked once per array element as an independent
+          [Eio.Fiber], unlike {!Foreach} (runtime-sized but sequential) and
+          unlike {!Parallel} (concurrent but a fixed, static branch count). *)
   | Shell of {
       id : string;
       commands : string list;  (** non-empty; each run via [sh -c cmd]. *)
@@ -179,12 +217,28 @@ type step =
       replay_domain : string;
       output : string;
     }
+
+and spawn_child = { id : string; steps : step list }
       (** Native authenticated export; never calls a backend. *)
 
 (** A loop governor — each can independently fire to stop the loop. *)
 and governor =
   | Max_iters of int  (** stop after [n] iterations ([n >= 1]). *)
   | Budget  (** stop once [backend.budget () <= 0]. *)
+  | Deadline
+      (** stop once the operator-supplied wall-clock deadline has passed. The
+          instant is NOT in the workflow file: it is supplied at runtime to
+          {!val:Engine.run} (like the approval token and [run_allowlist]), so a
+          workflow declaring [Deadline] under a runtime with no deadline never
+          fires it — exactly as [Budget] never fires against a constant budget
+          stub. Like [Budget], the reading is nondeterministic, so each check
+          records a {!Deadline_read} verdict and replay re-feeds the RECORDED
+          verdict instead of consulting the clock.
+
+          {b This does not bound a step's duration.} Governors are checked
+          between iterations, so a single long-running agent step can overrun
+          the deadline arbitrarily; [Deadline] bounds how many further
+          iterations start, not when the run ends. *)
   | Fixpoint of { window : int; progress : Expr.t }
       (** stop after [window] consecutive iterations with [progress = false]
           ([window >= 1]). *)
@@ -211,6 +265,12 @@ type outcome =
       (** A floor invariant blocked progress: no/ill-formed runtime token, or a
           [Gate] whose predicate evaluated [false]. *)
   | Aborted of string  (** Structural / schema error encountered at runtime. *)
+  | Cancelled of string
+      (** A {!Dynamic_parallel} branch still in flight when a sibling branch
+          raised: cancelled before it could commit or fail on its own terms.
+          Genuinely distinct from [Aborted]/[Blocked] (the branch itself
+          erroring) and from "never started" (a cancelled branch DID begin
+          executing). *)
 
 (** A single observed filesystem change produced by a {!Run} step. *)
 type file_change_kind =
@@ -272,6 +332,7 @@ type trace_entry =
   | Loop_iter of { index : int }
   | Budget_read of { value : int }
   | Fixpoint_progress of { progress : bool }
+  | Deadline_read of { expired : bool }
   | Loop_stopped of { iterations : int; reason : string }
   | Run_executed of {
       id : string;
@@ -325,6 +386,34 @@ type trace_entry =
       (** Records the outcome of one foreach iteration. *)
   | Foreach_completed of { iterations : int }
       (** Records completion of a foreach step with the number of iterations run. *)
+  | Spawn_started of { id : string }
+  | Spawn_child_completed of {
+      spawn_id : string;
+      child_id : string;
+      outcome : outcome;
+      ctx : (string * Yojson.Safe.t) list;
+    }
+  | Spawn_completed of { id : string; children : int; outcome : outcome }
+  | Dynamic_parallel_started of { id : string; branches : int }
+  | Dynamic_parallel_branch_completed of {
+      id : string;
+      branch_idx : int;
+      key : string;
+      trace : trace_entry list;
+      outcome : outcome;
+      branch_outputs : (string * Yojson.Safe.t) list;
+    }
+      (** Recorded per-branch evidence for one {!Dynamic_parallel} branch,
+          index-ordered (matching [branch_idx] to the resolved runtime array
+          position, NOT execution completion order — replay is deterministic
+          over this ordering even though live execution is concurrent). *)
+  | Dynamic_parallel_completed of {
+      id : string;
+      branches : int;
+      outcome : outcome;
+      failed : (string * string) list;
+          (** (key, reason) for every branch that raised an error. *)
+    }
   | Ctx_snapshot of { ctx : (string * Yojson.Safe.t) list }
       (** Ledger-layer header recording the initial_ctx that was passed to
           {!Engine.run}. Written as the FIRST line of an on-disk ledger so that

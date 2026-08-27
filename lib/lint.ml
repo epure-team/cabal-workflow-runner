@@ -71,6 +71,8 @@ let rec any_commit steps =
       | Loop { body; _ } -> any_commit body
       | Parallel { branches } -> List.exists any_commit branches
       | Foreach { steps = body; _ } -> any_commit body
+      | Spawn { children; _ } -> List.exists (fun (child : spawn_child) -> any_commit child.steps) children
+      | Dynamic_parallel { steps; _ } -> any_commit steps
       | Agent _ | Gate _ | Run _ | Shell _ | Evidence _ | Attest _ -> false)
     steps
 
@@ -88,6 +90,8 @@ and collect_agent_ids_step step : string list =
   | Loop { body; _ } -> collect_agent_ids body
   | Parallel { branches } -> List.concat_map collect_agent_ids branches
   | Foreach { steps = body; _ } -> collect_agent_ids body
+  | Spawn { children; _ } -> List.concat_map (fun (child : spawn_child) -> collect_agent_ids child.steps) children
+  | Dynamic_parallel { steps; _ } -> collect_agent_ids steps
   | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ | Attest _ -> []
 
 and collect_agent_ids steps =
@@ -252,6 +256,37 @@ and floor_step ~floor ~loc ~guaranteed acc step =
   | Foreach { over = _; steps = body } ->
       (* Foreach follows loop semantics: body gates are NOT added to the
          guaranteed set (the array may be empty, body may never execute). *)
+      ignore
+        (floor_steps ~floor ~loc_prefix:(loc ^ ".steps") ~guaranteed acc body);
+      guaranteed
+  | Spawn { children; _ } ->
+      List.fold_left (fun g (child : spawn_child) ->
+        floor_steps ~floor ~loc_prefix:(loc ^ ".children." ^ child.id) ~guaranteed:g acc child.steps)
+        guaranteed children
+  | Dynamic_parallel { steps = body; _ } ->
+      (* Same rationale as commit-in-parallel: branches run concurrently, so a
+         Commit reachable inside the template is not on a single deterministic
+         path. Detected up front (without disturbing [acc] twice), then the
+         body is walked once via [floor_steps] for its own diagnostics. *)
+      List.iteri (fun k step ->
+        if any_commit_step step then
+          let branch_loc = Printf.sprintf "%s.steps[%d]" loc k in
+          acc :=
+            {
+              severity = Error;
+              code = "commit-in-dynamic-parallel";
+              message =
+                Printf.sprintf
+                  "Commit is reachable inside a Dynamic_parallel template at \
+                   %s; commits are not permitted inside concurrent \
+                   dynamic-parallel branches"
+                  branch_loc;
+              loc = branch_loc;
+            }
+            :: !acc)
+        body;
+      (* Foreach-like: 0 branches is possible at runtime, so body gates are
+         NOT propagated into the guaranteed set. *)
       ignore
         (floor_steps ~floor ~loc_prefix:(loc ^ ".steps") ~guaranteed acc body);
       guaranteed
@@ -528,6 +563,14 @@ and refs_step ~loc ~produced ~warned_missing acc step : produced =
          and propagate body outputs forward, since typical use is: foreach body
          produces something, then steps after foreach read it. *)
       refs_steps ~loc_prefix:(loc ^ ".steps") ~produced ~warned_missing acc body
+  | Spawn { children; _ } ->
+      List.fold_left (fun produced (child : spawn_child) ->
+        refs_steps ~loc_prefix:(loc ^ ".children." ^ child.id) ~produced ~warned_missing acc child.steps)
+        produced children
+  | Dynamic_parallel { steps = body; _ } ->
+      (* Mirrors the Foreach arm just above: the body runs 0..N times, its
+         outputs propagate forward the same way. *)
+      refs_steps ~loc_prefix:(loc ^ ".steps") ~produced ~warned_missing acc body
 
 (* ---- unreachable-after-commit + no-commit (Warnings) -------------------- *)
 
@@ -546,6 +589,8 @@ let rec any_continue_agent steps =
       | Loop { body; _ } -> any_continue_agent body
       | Parallel { branches } -> List.exists any_continue_agent branches
       | Foreach { steps = body; _ } -> any_continue_agent body
+      | Spawn { children; _ } -> List.exists (fun (child : spawn_child) -> any_continue_agent child.steps) children
+      | Dynamic_parallel { steps; _ } -> any_continue_agent steps
       | Agent _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ | Attest _ -> false)
     steps
 
@@ -582,6 +627,10 @@ let rec unreachable_steps ~loc_prefix acc steps =
                     ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc m) acc branch)
                 branches
           | Foreach { steps = body; _ } ->
+              unreachable_steps ~loc_prefix:(loc ^ ".steps") acc body
+          | Spawn { children; _ } -> List.iter (fun (child : spawn_child) ->
+              unreachable_steps ~loc_prefix:(loc ^ ".children." ^ child.id) acc child.steps) children
+          | Dynamic_parallel { steps = body; _ } ->
               unreachable_steps ~loc_prefix:(loc ^ ".steps") acc body
           | _ -> ());
           let seen' = match step with Commit _ -> true | _ -> false in
@@ -658,6 +707,10 @@ let rec run_steps ~loc_prefix acc steps =
             branches
       | Foreach { steps = body; _ } ->
           run_steps ~loc_prefix:(loc ^ ".steps") acc body
+      | Spawn { children; _ } -> List.iter (fun (child : spawn_child) ->
+          run_steps ~loc_prefix:(loc ^ ".children." ^ child.id) acc child.steps) children
+      | Dynamic_parallel { steps = body; _ } ->
+          run_steps ~loc_prefix:(loc ^ ".steps") acc body
       | _ -> ())
     steps
 
@@ -673,6 +726,8 @@ let attest_safety acc steps =
     | Branch { then_; else_; _ } -> collect_agents then_; collect_agents else_
     | Loop { body; _ } -> collect_agents body
     | Foreach { steps; _ } -> collect_agents steps
+    | Spawn { children; _ } -> List.iter (fun (child : spawn_child) -> collect_agents child.steps) children
+    | Dynamic_parallel { steps; _ } -> collect_agents steps
     | Parallel { branches } -> List.iter collect_agents branches
     | Attest _ | Gate _ | Run _ | Commit _ | Shell _ | Evidence _ -> ()) steps in
   collect_agents steps;
@@ -733,9 +788,23 @@ let attest_safety acc steps =
           ~loc_prefix:(loc ^ ".body") body
       | Foreach { steps; _ } -> walk ~in_parallel ~repeatable:true
           ~loc_prefix:(loc ^ ".steps") steps
+      | Spawn { children; _ } -> List.iter (fun (child : spawn_child) ->
+          walk ~in_parallel ~repeatable ~loc_prefix:(loc ^ ".children." ^ child.id) child.steps) children
       | Parallel { branches } -> List.iteri (fun n branch ->
           walk ~in_parallel:true ~repeatable
             ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc n) branch) branches
+      | Dynamic_parallel { steps; _ } ->
+          (* Inverted rule vs Parallel: Attest IS permitted beneath
+             Dynamic_parallel. Each branch gets its own independent replay
+             cursor (engine.ml) so a branch's Attest genuinely reaches
+             Attestation.verify, unlike a Parallel branch's discarded
+             sub-trace — so force [in_parallel:false] here regardless of any
+             enclosing Parallel, without touching the attest-in-parallel rule
+             above (which still fires for literal Parallel). [repeatable] is
+             inherited unchanged: branch ids already carry the runtime key
+             suffix, so occurrence-templating is only required when an outer
+             Loop/Foreach ALSO repeats this template. *)
+          walk ~in_parallel:false ~repeatable ~loc_prefix:(loc ^ ".steps") steps
       | Run { id; input; stdout_schema; _ }
         when in_parallel && (input <> None || stdout_schema <> None) ->
           acc := { severity = Error; code = "structured-run-in-parallel";
@@ -775,6 +844,25 @@ let check ?(floor_gates = []) (wf : Types.workflow) : diagnostic list =
   (* Warnings: run steps execute commands (+ destructive-command notice). *)
   run_steps ~loc_prefix:"steps" acc wf.steps;
   attest_safety acc wf.steps;
+  let rec spawn_placement ~under_forbidden ~in_spawn ~loc_prefix steps =
+    List.iteri (fun i step ->
+      let loc = loc_index loc_prefix i in match step with
+      | Spawn { id; children } ->
+          if under_forbidden || in_spawn then acc := { severity = Error;
+            code = "invalid-spawn-placement";
+            message = Printf.sprintf "Spawn %S cannot occur beneath Spawn, Parallel, Loop, or Foreach" id; loc } :: !acc;
+          List.iter (fun (child : spawn_child) -> spawn_placement ~under_forbidden:false ~in_spawn:true
+            ~loc_prefix:(loc ^ ".children." ^ child.id) child.steps) children
+      | Branch { then_; else_; _ } ->
+          spawn_placement ~under_forbidden ~in_spawn ~loc_prefix:(loc ^ ".then") then_;
+          spawn_placement ~under_forbidden ~in_spawn ~loc_prefix:(loc ^ ".else") else_
+      | Loop { body; _ } -> spawn_placement ~under_forbidden:true ~in_spawn ~loc_prefix:(loc ^ ".body") body
+      | Foreach { steps; _ } -> spawn_placement ~under_forbidden:true ~in_spawn ~loc_prefix:(loc ^ ".steps") steps
+      | Parallel { branches } -> List.iteri (fun n branch -> spawn_placement ~under_forbidden:true ~in_spawn
+          ~loc_prefix:(Printf.sprintf "%s.branches[%d]" loc n) branch) branches
+      | _ -> ()) steps
+  in
+  spawn_placement ~under_forbidden:false ~in_spawn:false ~loc_prefix:"steps" wf.steps;
   (* Error: a soft-failing agent (on_failure=continue) in a workflow that can
      Commit. The commit-floor invariant guarantees a Commit is gate-ID-preceded
      but NOT that those gates' predicates consume the soft-failed agent's output —

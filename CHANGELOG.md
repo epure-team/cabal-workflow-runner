@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**`Deadline` governor.** `{"kind":"deadline"}` stops a governed loop once an
+operator-supplied wall-clock instant has passed. The instant is a runtime value
+(`Engine.run ~deadline`, with `~now` as an injectable clock seam), never a workflow
+field — a workflow declaring `Deadline` under a runtime that supplies none never fires
+it, the same posture as `Budget` against a constant budget stub. Each check records a
+`deadline_read` bool verdict and `replay` re-feeds the *recorded* verdict instead of
+consulting the clock, so a run recorded after its deadline passed still replays
+byte-identically (`replay` deliberately takes no `deadline`). The JS compiler **refuses**
+the governor: a JS target has no engine-recorded clock reading, so any emitted
+approximation would be a governor that looks present and behaves differently.
+**It does not bound a step's duration** — governors are checked between iterations, so
+one long agent step can overrun the deadline arbitrarily; it bounds how many further
+iterations start. `test/test_cwr.ml` covers both polarities (reached / not reached), the
+no-runtime-deadline case, clock-free replay including a tampered verdict rejected as
+`Replay_mismatch`, the compiler refusal, and the JSON round-trip with an instant in the
+file rejected.
+
+
 **`proof-carrying-change` example workflow.** A first assembly of cwr with
 [arch-index](https://github.com/epure-team/arch-index): gates an agent-authored code
 change on arch-index's change-impact and architecture-fitness-function verdicts

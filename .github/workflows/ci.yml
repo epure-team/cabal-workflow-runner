@@ -109,7 +109,12 @@ jobs:
       - name: Pin the public cabal library and install deps for BOTH repos (one shared switch)
         run: |
           opam pin add -n cabal https://github.com/epure-team/cabal.git
-          opam install ./arch-index --deps-only --yes
+          # --with-test is REQUIRED, not optional hygiene: arch-index declares tezt as a
+          # with-test dependency, its tezt/ dirs are part of @default, and scripts/pcc/pcc-index
+          # runs a full `dune build` in the arch-index root at RUNTIME. Without tezt installed
+          # that internal build fails, pcc-index emits nothing, and the integration test reports
+          # `stdout is not JSON: Blank input data` — a failure three steps away from its cause.
+          opam install ./arch-index --deps-only --with-test --yes
           opam install ./cwr --deps-only --with-test --yes
 
       - name: Build arch-index (pcc-*, arch-impact/arch-rules, decision-lint, producers)

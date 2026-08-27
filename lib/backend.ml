@@ -5,6 +5,7 @@ type t = {
     read_only:bool ->
     agent_type:string option ->
     model:string option ->
+    output_schema:Types.Schema.t option ->
     bool * Yojson.Safe.t;
   budget : unit -> int;
   run_command :
@@ -30,7 +31,8 @@ type t = {
 }
 
 (* By default every agent succeeds, returning an empty JSON object. *)
-let default_agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ = (true, `Assoc [])
+let default_agent ~id:_ ~prompt:_ ~read_only:_ ~agent_type:_ ~model:_ ~output_schema:_ =
+  (true, `Assoc [])
 
 (* By default the budget is effectively unbounded (a large constant). Tests that
    want [Budget] to force termination supply a decrementing stub. *)
