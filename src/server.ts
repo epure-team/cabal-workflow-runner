@@ -84,7 +84,16 @@ async function readLedger(id: string): Promise<{ entries: ParsedEntry[]; summary
   const actual = await resolveDirectFile(ledgerRoot, `${id}.ndjson`);
   const [content, metadata] = await Promise.all([readFile(actual, "utf8"), stat(actual)]);
   const entries = parseLines(content);
-  return { entries, summary: summarize(entries, metadata.size, metadata.mtime.toISOString()) };
+  // Redact before serving, summarise before redacting. The redaction machinery
+  // existed but was wired only to the Pi-session path (`piEvents`), so this --
+  // the endpoint the tool is named for, and the one carrying run inputs,
+  // outputs and commit-preflight data -- served ledger content verbatim. The
+  // summary is computed from the raw entries because it counts `kind` fields
+  // that redaction has no reason to touch, and doing it in this order keeps the
+  // counts honest if the sensitive-key list ever grows.
+  const summary = summarize(entries, metadata.size, metadata.mtime.toISOString());
+  const redacted = entries.map((entry) => ({ offset: entry.offset, value: redact(entry.value) }));
+  return { entries: redacted, summary };
 }
 
 async function ledgers() {
@@ -269,7 +278,15 @@ async function linkedPiSessions(entries: ParsedEntry[]): Promise<Array<{ id: str
 const mime = (path: string) => path.endsWith(".js") ? "text/javascript" : path.endsWith(".css") ? "text/css" : "text/html";
 
 createServer(async (req, res) => {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+  // Fixed base, not the Host header. `Host` is caller-controlled and only the
+  // pathname and search params are ever read from this URL, so interpolating it
+  // bought nothing -- and an empty or malformed Host makes `new URL` throw. Sat
+  // outside the try below, that rejection was unhandled, which Node treats as
+  // fatal: `printf 'GET /v1/ledgers HTTP/1.1\r\nHost: \r\n\r\n' | nc` ended
+  // the process, and the next request got ECONNREFUSED. Loopback-only bounds who
+  // can send it, but `KeepAlive` in deploy/ would have restarted the service and
+  // hidden the crash rather than surfaced it.
+  const url = new URL(req.url ?? "/", "http://localhost");
   if (req.method !== "GET") return json(res, 405, { error: "read-only" });
   try {
     if (url.pathname === "/v1/ledgers") return json(res, 200, { items: await ledgers() });
