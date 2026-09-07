@@ -320,6 +320,7 @@ type attempt_state = {
   mutable termination_requested : bool;
   mutable kill_escalated : bool;
   mutable process_exited : bool;
+  mutable post_finish_metadata_seen : bool;
 }
 
 let fresh_attempt_state number =
@@ -334,6 +335,7 @@ let fresh_attempt_state number =
     termination_requested = false;
     kill_escalated = false;
     process_exited = false;
+    post_finish_metadata_seen = false;
   }
 
 let retry_attempt_kind = function
@@ -430,6 +432,8 @@ let validate_lifecycle events =
               Ok ())
         | Retry_transition { kind; reason } ->
             if state.retry <> None then Error "attempt retried more than once"
+            else if state.post_finish_metadata_seen then
+              Error "attempt retried after final result metadata"
             else if state.number = max_int then
               Error "attempt number cannot advance"
             else if
@@ -490,14 +494,29 @@ let validate_lifecycle events =
                   state.activity_seen <- true;
                   state.process_exited <- true)
                 (before_attempt_end state)
-        | Session_id _ | Agent_text_delta _ | Tool_started _ | Tool_finished _
-        | Usage_observed _ ->
+        | Session_id _ | Usage_observed _ ->
+            (match (state.finished, state.retry) with
+            | Some _, None ->
+                state.activity_seen <- true;
+                state.observation_seen <- true;
+                state.post_finish_metadata_seen <- true;
+                Ok ()
+            | Some _, Some _ | None, Some _ ->
+                Error "final result metadata observed after retry transition"
+            | None, None ->
+                Result.map
+                  (fun () ->
+                    state.activity_seen <- true;
+                    state.observation_seen <- true)
+                  (before_process_exit state))
+        | Agent_text_delta _ | Tool_started _ | Tool_finished _ ->
             Result.map
               (fun () ->
                 state.activity_seen <- true;
                 state.observation_seen <- true)
               (before_process_exit state)
-        | Delivery_truncated _ | Opaque_backend_observation -> Ok ()
+        | Delivery_truncated _ | Opaque_backend_observation ->
+            before_attempt_end state
         | Task_started | Backend_selected _ | Preflight_started
         | Preflight_completed | Version_probe_started | Version_probe_completed
         | Availability_check_started | Availability_check_completed | Terminal _
@@ -570,7 +589,12 @@ let validate_lifecycle events =
       | Tool_finished _ | Usage_observed _ ->
           Result.bind (advance_lifecycle 8 "attempt event") (fun () ->
               validate_attempt_event event)
-      | Delivery_truncated _ | Opaque_backend_observation -> Ok ()
+      | (Delivery_truncated _ | Opaque_backend_observation)
+        when event.attempt = 0 ->
+          Ok ()
+      | Delivery_truncated _ | Opaque_backend_observation ->
+          Result.bind (advance_lifecycle 8 "attempt event") (fun () ->
+              validate_attempt_event event)
     in
     seen_any := true;
     result

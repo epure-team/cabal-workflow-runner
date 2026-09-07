@@ -1156,6 +1156,60 @@ let test_event_lifecycle_invariants () =
   rejects [ (0, Process_started); (0, Terminal Failed) ];
   rejects [ (1, Preflight_started); (1, Terminal Failed) ]
 
+let test_event_post_finish_final_metadata () =
+  let usage = ok (Execution_metrics.make_usage ~input_tokens:3L ()) in
+  let cost = ok (Execution_metrics.make_cost ~usd_micros:7L ()) in
+  let trace =
+    ok
+      (trace_of_payloads
+         [
+           (0, Task_started);
+           (1, Attempt_started Initial_attempt);
+           (1, Attempt_finished Attempt_succeeded);
+           (1, Session_id "final-session");
+           (1, Usage_observed {usage = Some usage; cost = Some cost});
+           (1, Terminal Succeeded);
+         ])
+  in
+  let mapped_attempt =
+    attempt ~session_id:"final-session" ~usage ~cost ~elapsed_s:0.1 ()
+  in
+  ignore
+    (response ~attempts:[mapped_attempt] ~total_elapsed_s:0.5
+       ~event_trace:trace ())
+
+let test_event_post_finish_rejects_nonfinal_metadata () =
+  let tool = ok (Workflow_event.make_tool ~name:"reader" ()) in
+  let omissions = ok (Workflow_event.make_omission_counts ~usage_events:1L ()) in
+  let rejects payload =
+    expect_error
+      (trace_of_payloads
+         [
+           (1, Attempt_started Initial_attempt);
+           (1, Attempt_finished Attempt_succeeded);
+           (1, payload);
+           (1, Terminal Succeeded);
+         ])
+  in
+  List.iter rejects
+    [
+      Agent_text_delta "late";
+      Tool_started tool;
+      Process_started;
+      Retry_transition {kind = Fresh_retry; reason = Transport_retry};
+      Delivery_truncated omissions;
+      Opaque_backend_observation;
+    ];
+  expect_error
+    (trace_of_payloads
+       [
+         (1, Attempt_started Initial_attempt);
+         (1, Attempt_finished Attempt_succeeded);
+         (1, Session_id "final-session");
+         (1, Retry_transition {kind = Fresh_retry; reason = Schema_validation});
+         (2, Terminal Failed);
+       ])
+
 let test_event_omitted_subsequence_is_conservative () =
   ignore
     (ok
@@ -1596,6 +1650,31 @@ let test_error_classification () =
       Alcotest.(check bool)
         ("execution kind " ^ tag) true (contains serialized tag))
     execution_kinds
+
+let test_telemetry_mapping_failure_retains_trace () =
+  let trace = terminal_trace () in
+  let error =
+    ok
+      (Agent_execution.make_telemetry_mapping_error
+         ~message:"unsafe source telemetry" ~event_trace:trace ())
+  in
+  (match Agent_execution.error_view error with
+  | Agent_execution.Telemetry_mapping_failure {message; event_trace} ->
+      Alcotest.(check string) "diagnostic retained in process"
+        "unsafe source telemetry" message;
+      Alcotest.(check bool) "exact valid trace retained" true
+        (Workflow_event.trace_to_yojson event_trace
+        = Workflow_event.trace_to_yojson trace)
+  | _ -> Alcotest.fail "telemetry mapping failure was misclassified");
+  let json = Agent_execution.error_to_yojson error in
+  Alcotest.(check bool) "stable failure kind" true
+    (Yojson.Safe.Util.member "error_kind" json
+    = `String "telemetry_mapping_failure");
+  Alcotest.(check bool) "safe trace persisted" true
+    (Yojson.Safe.Util.member "event_trace" json
+    = Workflow_event.trace_to_yojson trace);
+  let serialized = Yojson.Safe.to_string json in
+  check_absent "mapping diagnostic omitted" serialized "unsafe source telemetry"
 
 let test_execution_error_coherence () =
   let success = response () in
@@ -2751,6 +2830,9 @@ let test_legacy_runtime_failure_and_unsupported () =
       | Incomplete_execution _ ->
           Alcotest.fail
             "legacy bool=false returned a completed result, not partial execution"
+      | Telemetry_mapping_failure _ ->
+          Alcotest.fail
+            "legacy bool=false returned native telemetry, not adapter mapping"
       | Dispatch_failure _ ->
           Alcotest.fail "legacy bool=false is execution, not dispatch failure")
   | Ok _ -> Alcotest.fail "legacy bool=false must be an execution error");
@@ -3001,6 +3083,10 @@ let () =
             test_event_terminal_invariants;
           Alcotest.test_case "lifecycle state machine" `Quick
             test_event_lifecycle_invariants;
+          Alcotest.test_case "post-finish final session and usage metadata"
+            `Quick test_event_post_finish_final_metadata;
+          Alcotest.test_case "post-finish rejects nonfinal metadata" `Quick
+            test_event_post_finish_rejects_nonfinal_metadata;
           Alcotest.test_case "omitted-event subsequences" `Quick
             test_event_omitted_subsequence_is_conservative;
           Alcotest.test_case "event, trace, omission, and text bounds" `Quick
@@ -3022,6 +3108,8 @@ let () =
             test_serialized_projection_bounds;
           Alcotest.test_case "dispatch vs execution errors" `Quick
             test_error_classification;
+          Alcotest.test_case "telemetry mapping failure retains trace" `Quick
+            test_telemetry_mapping_failure_retains_trace;
           Alcotest.test_case "execution error coherence" `Quick
             test_execution_error_coherence;
           Alcotest.test_case "post-execution dispatch status preservation"

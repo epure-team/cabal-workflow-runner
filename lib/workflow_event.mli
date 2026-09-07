@@ -173,9 +173,12 @@ val make_trace : ?omitted_count:int64 -> t list -> (trace, string) result
     before a later start, attempt activity after finish/exit/retry, decreasing
     cumulative usage observations, negative process exit codes, process
     termination out of order, a retry kind inconsistent with the next retained
-    attempt start, and pre-dispatch events carrying nonzero attempt numbers. The
-    retained trace must also fit {!max_trace_projection_bytes}; its exact JSON
-    encoding size, including escaping, is accounted without serializing it. *)
+    attempt start, and pre-dispatch events carrying nonzero attempt numbers.
+    The only activity accepted after [Attempt_finished] is same-attempt final
+    [Session_id] and [Usage_observed] metadata immediately before the terminal;
+    observing either makes a later retry contradictory. The retained trace must
+    also fit {!max_trace_projection_bytes}; its exact JSON encoding size,
+    including escaping, is accounted without serializing it. *)
 
 val events : trace -> t list
 (** Retained events in chronological order. *)

@@ -1436,6 +1436,10 @@ type error =
       message : string;
       response : response;
     }
+  | Telemetry_mapping_error of {
+      message : string;
+      event_trace : Workflow_event.trace;
+    }
 
 type error_view =
   | Dispatch_failure of {
@@ -1463,6 +1467,10 @@ type error_view =
       kind : execution_failure_kind;
       message : string;
       response : response;
+    }
+  | Telemetry_mapping_failure of {
+      message : string;
+      event_trace : Workflow_event.trace;
     }
 
 let validate_trace_terminal_status ~status trace =
@@ -1594,6 +1602,11 @@ let make_execution_error ~kind ~message ~response () =
       (fun message -> Execution_error { kind; message; response })
       (normalize_nonempty_diagnostic "execution diagnostic" message)
 
+let make_telemetry_mapping_error ~message ~event_trace () =
+  Result.map
+    (fun message -> Telemetry_mapping_error {message; event_trace})
+    (normalize_nonempty_diagnostic "telemetry mapping diagnostic" message)
+
 let error_view = function
   | Dispatch_error { kind; message; event_trace } ->
       Dispatch_failure { kind; message; event_trace }
@@ -1609,6 +1622,8 @@ let error_view = function
         { cause; message; response; outer_event_trace }
   | Execution_error { kind; message; response } ->
       Execution_failure { kind; message; response }
+  | Telemetry_mapping_error {message; event_trace} ->
+      Telemetry_mapping_failure {message; event_trace}
 
 let response_to_yojson = response_projection
 
@@ -1679,4 +1694,11 @@ let error_to_yojson = function
           ("error_kind", `String "execution_failure");
           ("failure_kind", `String (string_of_execution_failure_kind kind));
           ("response", response_to_yojson response);
+        ]
+  | Telemetry_mapping_error {message = _; event_trace} ->
+      `Assoc
+        [
+          ("schema_version", `String "cwr.agent-execution.error/v1");
+          ("error_kind", `String "telemetry_mapping_failure");
+          ("event_trace", Workflow_event.trace_to_yojson event_trace);
         ]

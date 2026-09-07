@@ -503,8 +503,10 @@ type error
 (** Exhaustive in-process view distinguishing a proven no-invocation dispatch
     failure, an outcome with no completed attempt and indeterminate invocation
     progress, an interrupted execution with completed progress, a dispatch-layer
-    failure strictly after a completed execution, and an execution failure.
-    Completed-progress forms retain normalized attempts. *)
+    failure strictly after a completed execution, an execution failure, and a
+    boundary telemetry-mapping failure. Completed-progress forms retain
+    normalized attempts; mapping failures retain the exact safe source trace
+    even when its terminal status cannot fit another error constructor. *)
 type error_view =
   | Dispatch_failure of {
       kind : dispatch_failure_kind;
@@ -531,6 +533,10 @@ type error_view =
       kind : execution_failure_kind;
       message : string;
       response : response;
+    }
+  | Telemetry_mapping_failure of {
+      message : string;
+      event_trace : Workflow_event.trace;
     }
 
 val make_dispatch_error :
@@ -612,6 +618,17 @@ val make_execution_error :
     condition. The non-empty UTF-8 message is omitted from safe JSON
     persistence. *)
 
+val make_telemetry_mapping_error :
+  message:string ->
+  event_trace:Workflow_event.trace ->
+  unit ->
+  (error, string) result
+(** Construct an adapter-boundary failure for source telemetry that cannot be
+    represented by a richer execution/error constructor. The already validated
+    trace is retained byte-for-byte regardless of its terminal status or attempt
+    evidence; no result, attempt, status, or event is fabricated. The non-empty
+    UTF-8 diagnostic remains in process and is omitted from safe persistence. *)
+
 val error_view : error -> error_view
 (** Inspect the error classification and retained in-process diagnostic. *)
 
@@ -629,4 +646,5 @@ val error_to_yojson : error -> Yojson.Safe.t
     separate incomplete-observation lower bounds, and the safe outer trace, but
     no synthetic continuation result. Post-execution dispatch failures retain
     their fixed cause, safe response, and separate safe outer trace; execution
-    failures likewise embed the safe response and retain attempts. *)
+    failures likewise embed the safe response and retain attempts. Telemetry
+    mapping failures persist only their exact safe event trace. *)
