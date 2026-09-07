@@ -151,6 +151,8 @@ let validate_payload = function
           | Some value when not (safe_identifier value) ->
               Error "tool name is invalid"
           | _ -> Ok ())
+  | Process_exited (Exited code) when code < 0 ->
+      Error "process exit code must be non-negative"
   | Delivery_truncated counts -> validate_omissions counts
   | Task_started | Preflight_started | Preflight_completed
   | Version_probe_started | Version_probe_completed | Availability_check_started
@@ -211,20 +213,99 @@ let validate_terminal events =
     | last :: _ when is_terminal last -> Ok ()
     | _ -> Error "event trace terminal must be last"
 
-let validate_projection_bound events =
-  let fixed_overhead = (List.length events + 1) * 1024 in
-  let text_bytes =
-    List.fold_left
-      (fun total event ->
-        match event.payload with
-        | Agent_text_delta text ->
-            total + String.length (Yojson.Safe.to_string (`String text))
-        | _ -> total)
-      0 events
+type cumulative_metrics = {
+  mutable input_tokens : int64 option;
+  mutable output_tokens : int64 option;
+  mutable cache_creation_tokens : int64 option;
+  mutable cache_read_tokens : int64 option;
+  mutable usd_micros : int64 option;
+}
+
+let empty_cumulative_metrics () =
+  {
+    input_tokens = None;
+    output_tokens = None;
+    cache_creation_tokens = None;
+    cache_read_tokens = None;
+    usd_micros = None;
+  }
+
+let update_cumulative_dimension name previous current =
+  match current with
+  | None -> Ok ()
+  | Some current -> (
+      match !previous with
+      | Some previous_value when Int64.compare current previous_value < 0 ->
+          Error (name ^ " cumulative observation decreased")
+      | None | Some _ ->
+          previous := Some current;
+          Ok ())
+
+let validate_usage_snapshots events =
+  let current_attempt = ref (-1) in
+  let metrics = ref (empty_cumulative_metrics ()) in
+  let switch_attempt attempt =
+    if attempt <> !current_attempt then (
+      current_attempt := attempt;
+      metrics := empty_cumulative_metrics ())
   in
-  if fixed_overhead + text_bytes > max_trace_projection_bytes then
-    Error "event trace exceeds the serialized projection byte limit"
-  else Ok ()
+  let validate_usage usage =
+    let state = !metrics in
+    let update field name value =
+      let previous = ref field in
+      Result.map
+        (fun () -> !previous)
+        (update_cumulative_dimension name previous value)
+    in
+    Result.bind
+      (update state.input_tokens "input token"
+         (Execution_metrics.input_tokens usage))
+      (fun input_tokens ->
+        state.input_tokens <- input_tokens;
+        Result.bind
+          (update state.output_tokens "output token"
+             (Execution_metrics.output_tokens usage))
+          (fun output_tokens ->
+            state.output_tokens <- output_tokens;
+            Result.bind
+              (update state.cache_creation_tokens "cache-creation token"
+                 (Execution_metrics.cache_creation_tokens usage))
+              (fun cache_creation_tokens ->
+                state.cache_creation_tokens <- cache_creation_tokens;
+                Result.map
+                  (fun cache_read_tokens ->
+                    state.cache_read_tokens <- cache_read_tokens)
+                  (update state.cache_read_tokens "cache-read token"
+                     (Execution_metrics.cache_read_tokens usage)))))
+  in
+  let validate_cost cost =
+    let state = !metrics in
+    let previous = ref state.usd_micros in
+    Result.map
+      (fun () -> state.usd_micros <- !previous)
+      (update_cumulative_dimension "cost" previous
+         (Execution_metrics.usd_micros cost))
+  in
+  let rec loop = function
+    | [] -> Ok ()
+    | event :: rest ->
+        switch_attempt event.attempt;
+        let result =
+          match event.payload with
+          | Usage_observed { usage; cost } ->
+              Result.bind
+                (match usage with
+                | None -> Ok ()
+                | Some usage -> validate_usage usage)
+                (fun () ->
+                  match cost with
+                  | None -> Ok ()
+                  | Some cost -> validate_cost cost)
+          | _ -> Ok ()
+        in
+        Result.bind result (fun () -> loop rest)
+  in
+  loop events
 
 type phase_state = Not_seen | Started | Completed
 
@@ -500,20 +581,6 @@ let validate_lifecycle events =
   in
   loop events
 
-let make_trace ?(omitted_count = 0L) events =
-  if Int64.compare omitted_count 0L < 0 then
-    Error "omitted event count must be non-negative"
-  else if events = [] then Error "event trace must not be empty"
-  else if List.length events > max_events then
-    Error "event trace exceeds the retained event limit"
-  else
-    Result.bind (validate_order events) (fun () ->
-        Result.bind (validate_terminal events) (fun () ->
-            Result.bind (validate_lifecycle events) (fun () ->
-                Result.map
-                  (fun () -> { events; omitted_count })
-                  (validate_projection_bound events))))
-
 let events trace = trace.events
 let omitted_count trace = trace.omitted_count
 let int64_json value = `Intlit (Int64.to_string value)
@@ -685,3 +752,28 @@ let trace_to_yojson trace =
       ("events", `List (List.map event_to_yojson trace.events));
       ("omitted_count", int64_json trace.omitted_count);
     ]
+
+let validate_projection_bound trace =
+  match
+    Canonical_json.validate_standard ~max_depth:Canonical_json.max_depth
+      ~max_nodes:Canonical_json.max_nodes ~max_bytes:max_trace_projection_bytes
+      (trace_to_yojson trace)
+  with
+  | Ok () -> Ok ()
+  | Error _ -> Error "event trace exceeds the serialized projection byte limit"
+
+let make_trace ?(omitted_count = 0L) events =
+  if Int64.compare omitted_count 0L < 0 then
+    Error "omitted event count must be non-negative"
+  else if events = [] then Error "event trace must not be empty"
+  else if List.length events > max_events then
+    Error "event trace exceeds the retained event limit"
+  else
+    Result.bind (validate_order events) (fun () ->
+        Result.bind (validate_terminal events) (fun () ->
+            Result.bind (validate_usage_snapshots events) (fun () ->
+                Result.bind (validate_lifecycle events) (fun () ->
+                    let trace = { events; omitted_count } in
+                    Result.map
+                      (fun () -> trace)
+                      (validate_projection_bound trace)))))

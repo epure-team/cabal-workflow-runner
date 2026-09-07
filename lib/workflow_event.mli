@@ -31,7 +31,9 @@ type retry_reason =
   | Transport_retry
   | Other_redacted
 
-(** Process completion projected without raw status text. *)
+(** Process completion projected without raw status text. [Exited code] accepts
+    every non-negative host integer; the host-neutral contract deliberately does
+    not impose a Unix-specific 0--255 upper bound. *)
 type process_exit = Exited of int | Signaled | Unknown
 
 type tool
@@ -87,7 +89,9 @@ val omitted_control_events : omission_counts -> int64
 type terminal = Succeeded | Failed | Timed_out | Cancelled
 
 (** Safe normalized event vocabulary. [Agent_text_delta] is public assistant
-    output and is subject to {!max_text_bytes}. [Opaque_backend_observation]
+    output and is subject to {!max_text_bytes}. [Usage_observed] values are
+    cumulative snapshots within one attempt, not deltas: repeated known token or
+    cost dimensions must be non-decreasing. [Opaque_backend_observation]
     deliberately has no payload. *)
 type payload =
   | Task_started
@@ -164,11 +168,12 @@ val make_trace : ?omitted_count:int64 -> t list -> (trace, string) result
     omitted lifecycle prefixes are allowed: an absent start/completion/process
     event is treated as unknown, not as proof it did not occur. Visible
     contradictions are rejected, including repeated starts/finishes, completion
-    before a later start, attempt activity after finish/exit/retry, process
+    before a later start, attempt activity after finish/exit/retry, decreasing
+    cumulative usage observations, negative process exit codes, process
     termination out of order, a retry kind inconsistent with the next retained
     attempt start, and pre-dispatch events carrying nonzero attempt numbers. The
-    retained trace must also fit {!max_trace_projection_bytes}, accounting for
-    JSON escaping of public text. *)
+    retained trace must also fit {!max_trace_projection_bytes}; its exact JSON
+    encoding size, including escaping, is accounted without serializing it. *)
 
 val events : trace -> t list
 (** Retained events in chronological order. *)

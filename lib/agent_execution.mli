@@ -97,9 +97,14 @@ val max_public_text_bytes : int
 val max_attempts : int
 (** Maximum number of complete attempts retained in one response. *)
 
+val attempt_timing_tolerance_s : float
+(** One-millisecond one-sided tolerance when comparing an attempt duration with
+    its enclosing retained start-to-finish event interval. *)
+
 val max_response_projection_bytes : int
-(** Upper byte bound guaranteed for a serialized safe response projection by the
-    component limits enforced by the opaque constructors. *)
+(** Upper byte bound guaranteed for a serialized safe response projection.
+    Response construction performs exact compact-encoding size preflight without
+    serializing the projection. *)
 
 val max_error_projection_bytes : int
 (** Upper byte bound guaranteed for a serialized safe error projection. *)
@@ -290,10 +295,19 @@ val make_response :
     reported session across all attempts. Usage and cost are independently
     aggregated with saturating integer arithmetic. A supplied trace is
     cross-validated against attempt kinds, outcomes, durations, sessions,
-    metrics, total elapsed time, final attempt number, and overall status.
-    Missing trace events remain permitted as omissions. [event_trace] defaults
-    to [None], preserving the distinction between no collected trace and a trace
-    with omissions. *)
+    metrics, total elapsed time, final attempt number, and overall status. An
+    attempt duration may be shorter than its event start-to-finish envelope;
+    only a duration exceeding that interval by more than
+    {!attempt_timing_tolerance_s} is rejected.
+
+    Usage events are cumulative snapshots. Only the final retained observation
+    for an attempt is compared with its final aggregate, and only its known
+    dimensions are compared. A positive trace omission count, a later sequence
+    gap, or a later usage-truncation marker makes that final observation
+    conservatively unknown and skips aggregate equality. Retained known
+    snapshots must still be non-decreasing. [event_trace] defaults to [None],
+    preserving the distinction between no collected trace and a trace with
+    omissions. *)
 
 val attempts : response -> attempt list
 (** Ordered complete attempt list. *)
@@ -374,12 +388,14 @@ val make_execution_error :
   unit ->
   (error, string) result
 (** Construct a post-invocation failure retaining its full normalized response.
-    The failure kind must agree with the response: native/backend/contract
-    failures retain a failed attempt, while schema retry exhaustion retains at
-    least one earlier schema-rejected attempt and a transport-successful final
-    attempt with a schema error. Successful, timed-out, or cancelled responses
-    cannot be wrapped as execution failures. The non-empty UTF-8 message is
-    omitted from safe JSON persistence. *)
+    The failure kind must agree with the response. Native/backend/contract
+    failures retain a failed attempt. [Schema_retry_failed] requires exactly two
+    attempts: an initial schema-rejected transport success followed by a fresh
+    or resumed corrective attempt. That corrective attempt may itself be
+    schema-rejected after transport success, fail at transport/backend level,
+    time out, or be cancelled; the outer response status must match that final
+    condition. The non-empty UTF-8 message is omitted from safe JSON
+    persistence. *)
 
 val error_view : error -> error_view
 (** Inspect the error classification and retained in-process diagnostic. *)

@@ -86,16 +86,22 @@ changing the workflow format or wiring it into `Engine.run`:
   fresh/resumed attempt, path-free delivery intent, exact optional usage and integer
   micro-USD cost, aggregate telemetry, final session, cleanup status, and an optional
   bounded event trace. Response construction cross-validates overall/final status,
-  trace terminal, attempt kinds/outcomes/durations, sessions, metrics, and whole-call
-  elapsed time. Dispatch failures before execution are distinct from coherent execution
-  failures that retain attempts.
+  trace terminal, attempt kinds/outcomes, sessions, cumulative metric snapshots, and
+  whole-call elapsed time. Attempt event intervals may include bridge overhead but may
+  not be shorter than the corresponding attempt duration beyond the documented
+  one-sided tolerance. Schema-retry failures retain exactly the initial schema rejection
+  and one fresh/resumed corrective attempt, including failed, timed-out, or cancelled
+  corrective transports. Dispatch failures before execution remain distinct from
+  execution failures that retain attempts.
 - `Workflow_event` is a typed, bounded agent-completion lifecycle trace, distinct from
   the deterministic engine's `Types.trace` and ledger. It cannot represent raw
   protocol lines, prompts, attachment paths/digests/bytes, argv, stdout/stderr, tool
   arguments, chain-of-thought, or private backend JSON. Unknown observations become a
   payload-free opaque event. Its lifecycle validator permits omitted prefixes/events but
-  rejects visible phase, attempt, retry, and process-order contradictions. This batch
-  does **not** claim live event streaming.
+  rejects visible phase, attempt, retry, and process-order contradictions, negative
+  process exit codes, and decreasing known cumulative usage/cost snapshots. Exit codes
+  otherwise use the host's non-negative `int` range rather than a Unix-specific ceiling.
+  This batch does **not** claim live event streaming.
 - `Runtime` wraps one completion function. `Runtime.of_legacy_backend` adapts the
   unchanged `Backend.t` honestly as one synthetic attempt with unknown usage/cost, no
   events, no inferred session, and no cleanup requirement. It requires explicit
@@ -106,11 +112,15 @@ changing the workflow format or wiring it into `Engine.run`:
   records exact canonical media MIME types and whether domain-restricted web policies
   are enforceable, rather than inferring either from a generic boolean/web maximum.
 
-JSON validation uses bounded iterative traversal. Public constants cap JSON depth,
-nodes/bytes, public attempt text, attempt count, restricted domains, canonical output,
-and serialized trace/response/error projections. See
-[`docs/rich-agent-execution-migration.md`](docs/rich-agent-execution-migration.md) for
-adoption details.
+JSON validation uses bounded iterative traversal and checked compact-encoding size
+accounting before serialization allocation. The accounting includes string/key escaping,
+separators, and delimiters without constructing unbounded attacker-controlled diagnostic
+paths. Canonical output is serialized into a buffer sized from that successful preflight;
+trace and response projections are likewise rejected from exact pre-serialization size.
+Public constants cap JSON depth, nodes/bytes, public attempt text, attempt count,
+restricted domains, canonical output, and serialized trace/response/error projections.
+See the [rich execution migration
+notes](docs/rich-agent-execution-migration.md) for adoption details.
 
 Versioned response/error/event-trace Yojson projections are redacted persistence
 surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`, workflow JSON/schema,

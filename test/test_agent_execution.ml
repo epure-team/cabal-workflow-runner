@@ -6,6 +6,10 @@ let expect_error = function
   | Error _ -> ()
   | Ok _ -> Alcotest.fail "expected Error"
 
+let expect_error_message expected = function
+  | Error actual -> Alcotest.(check string) "fixed error" expected actual
+  | Ok _ -> Alcotest.fail "expected Error"
+
 let contains haystack needle =
   let haystack_length = String.length haystack in
   let needle_length = String.length needle in
@@ -258,6 +262,61 @@ let test_json_resource_bounds () =
   expect_error
     (Canonical_json.to_string
        (`String (String.make Canonical_json.max_canonical_bytes 'x')))
+
+let test_json_size_preflight_is_iterative_and_escape_aware () =
+  let validate ?(max_depth = Canonical_json.max_depth)
+      ?(max_nodes = Canonical_json.max_nodes) ~max_bytes json =
+    try Canonical_json.validate_standard ~max_depth ~max_nodes ~max_bytes json
+    with Stack_overflow ->
+      Alcotest.fail "JSON size preflight overflowed the stack"
+  in
+  let escaped = `String "\n" in
+  ignore (ok (validate ~max_bytes:4 escaped));
+  expect_error_message "$: JSON byte limit exceeded"
+    (validate ~max_bytes:3 escaped);
+  let escaped_key = `Assoc [ ("\n", `Null) ] in
+  ignore (ok (validate ~max_bytes:11 escaped_key));
+  expect_error_message "$: JSON byte limit exceeded"
+    (validate ~max_bytes:10 escaped_key);
+  expect_error
+    (validate ~max_bytes:1024 (`Assoc [ ("same", `Int 1); ("same", `Int 2) ]));
+  List.iter
+    (fun json ->
+      let encoded_bytes = String.length (Yojson.Safe.to_string json) in
+      ignore (ok (validate ~max_bytes:encoded_bytes json));
+      expect_error_message "$: JSON byte limit exceeded"
+        (validate ~max_bytes:(encoded_bytes - 1) json))
+    [
+      `Null;
+      `Bool false;
+      `Int min_int;
+      `Intlit "9223372036854775808";
+      `Float (-0.0);
+      `Float (Float.of_string "2.2250738585072014e-308");
+      `String "quote=\" slash=\\ newline=\n del=\127 utf8=é";
+      `List [ `Int 1; `String "two"; `Bool true ];
+      `Assoc [ ("escaped\nkey", `String "value\t"); ("empty", `List []) ];
+    ];
+  let amplified = `String (String.make (8 * 1024 * 1024) '\000') in
+  expect_error_message "$: JSON byte limit exceeded"
+    (validate ~max_bytes:1024 amplified);
+  expect_error_message "$: JSON nesting limit exceeded"
+    (validate ~max_depth:64 ~max_nodes:100_000 ~max_bytes:1024
+       (nested_json 100_000));
+  let private_key = String.make (2 * 1024 * 1024) 'k' in
+  (match
+     validate ~max_bytes:(3 * 1024 * 1024) (`Assoc [ (private_key, `Tuple []) ])
+   with
+  | Error diagnostic ->
+      check_absent "diagnostic does not copy a hostile key" diagnostic
+        private_key
+  | Ok _ -> Alcotest.fail "non-standard JSON value accepted");
+  expect_error_message "$: canonical JSON byte limit exceeded"
+    (try
+       Canonical_json.to_string
+         (`String (String.make (12 * 1024 * 1024) '\000'))
+     with Stack_overflow ->
+       Alcotest.fail "canonical JSON size preflight overflowed the stack")
 
 let test_invalid_attachment_values () =
   let make ?(id = "a") ?(path = "a.png") ?(mime_type = "image/png")
@@ -569,10 +628,168 @@ let test_response_trace_sessions_metrics_and_timing () =
        ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
        ~event_trace:(make_trace ~observed_usage:other_usage ())
        ());
+  ignore
+    (ok
+       (Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
+          ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+          ~event_trace:(make_trace ~finished_at:0.31 ())
+          ()))
+
+let test_usage_events_are_cumulative_snapshots () =
+  let usage_1 =
+    ok (Execution_metrics.make_usage ~input_tokens:2L ~output_tokens:1L ())
+  in
+  let usage_2 =
+    ok (Execution_metrics.make_usage ~input_tokens:5L ~output_tokens:4L ())
+  in
+  let usage_lower =
+    ok (Execution_metrics.make_usage ~input_tokens:4L ~output_tokens:4L ())
+  in
+  let usage_final =
+    ok (Execution_metrics.make_usage ~input_tokens:5L ~output_tokens:4L ())
+  in
+  let cost_1 = ok (Execution_metrics.make_cost ~usd_micros:3L ()) in
+  let cost_2 = ok (Execution_metrics.make_cost ~usd_micros:9L ()) in
+  let attempt = attempt ~usage:usage_final ~cost:cost_2 () in
+  let trace observations =
+    let observation_events =
+      List.mapi
+        (fun index (usage, cost) ->
+          event
+            ~seq:(Int64.of_int (index + 2))
+            ~attempt:1
+            ~elapsed_s:(0.1 +. (float_of_int index *. 0.05))
+            (Usage_observed { usage = Some usage; cost = Some cost }))
+        observations
+    in
+    let next = List.length observation_events + 2 in
+    Workflow_event.make_trace
+      (event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+         (Attempt_started Initial_attempt)
+       :: observation_events
+      @ [
+          event ~seq:(Int64.of_int next) ~attempt:1 ~elapsed_s:0.35
+            (Attempt_finished Attempt_succeeded);
+          event
+            ~seq:(Int64.of_int (next + 1))
+            ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+        ])
+  in
+  let cumulative = ok (trace [ (usage_1, cost_1); (usage_2, cost_2) ]) in
+  ignore (response ~attempts:[ attempt ] ~event_trace:cumulative ());
+  expect_error (trace [ (usage_2, cost_2); (usage_lower, cost_2) ]);
+  expect_error (trace [ (usage_1, cost_2); (usage_2, cost_1) ]);
+  let nonfinal_mismatch =
+    ok (trace [ (usage_lower, cost_1); (usage_2, cost_2) ])
+  in
+  ignore (response ~attempts:[ attempt ] ~event_trace:nonfinal_mismatch ());
+  let final_mismatch =
+    ok (trace [ (usage_1, cost_1); (usage_lower, cost_2) ])
+  in
   expect_error
     (Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
        ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
-       ~event_trace:(make_trace ~finished_at:0.31 ())
+       ~event_trace:final_mismatch ());
+  let final_cost_mismatch = ok (trace [ (usage_2, cost_1) ]) in
+  expect_error
+    (Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:final_cost_mismatch ());
+  let omitted_usage =
+    ok (Workflow_event.make_omission_counts ~usage_events:1L ())
+  in
+  let truncated_final_unknown =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+             (Usage_observed { usage = Some usage_1; cost = Some cost_1 });
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.2
+             (Delivery_truncated omitted_usage);
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.35
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:5L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  ignore
+    (response ~attempts:[ attempt ] ~event_trace:truncated_final_unknown ());
+  let gap_final_unknown =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+             (Usage_observed { usage = Some usage_1; cost = Some cost_1 });
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.35
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:5L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  ignore (response ~attempts:[ attempt ] ~event_trace:gap_final_unknown ());
+  let gap_before_final_is_known =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.1
+             (Usage_observed { usage = Some usage_lower; cost = Some cost_2 });
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.35
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:5L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  expect_error
+    (Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:gap_before_final_is_known ());
+  let unlocated_final_unknown =
+    ok
+      (Workflow_event.make_trace ~omitted_count:1L
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+             (Usage_observed { usage = Some usage_1; cost = Some cost_1 });
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.35
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  ignore
+    (response ~attempts:[ attempt ] ~event_trace:unlocated_final_unknown ())
+
+let test_attempt_timing_uses_one_sided_envelope () =
+  let attempt = attempt ~elapsed_s:0.25 () in
+  let make_trace finished_at =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:finished_at
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.5 (Terminal Succeeded);
+         ])
+  in
+  ignore
+    (response ~attempts:[ attempt ] ~total_elapsed_s:0.5
+       ~event_trace:(make_trace 0.35) ());
+  ignore
+    (response ~attempts:[ attempt ] ~total_elapsed_s:0.5
+       ~event_trace:
+         (make_trace
+            (0.05 +. 0.25 -. (Agent_execution.attempt_timing_tolerance_s /. 2.0)))
+       ());
+  expect_error
+    (Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:
+         (make_trace
+            (0.05 +. 0.25 -. (Agent_execution.attempt_timing_tolerance_s *. 2.0)))
        ())
 
 let test_response_aggregates_and_final_session () =
@@ -805,6 +1022,29 @@ let test_event_bounds () =
   in
   expect_error (Workflow_event.make_trace oversized_projection)
 
+let test_process_exit_codes () =
+  expect_error
+    (Workflow_event.make ~seq:1L ~attempt:1 ~elapsed_s:0.0
+       (Process_exited (Exited (-1))));
+  let trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.0 Process_started;
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+             (Process_exited (Exited max_int));
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.2
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.3 (Terminal Succeeded);
+         ])
+  in
+  let projection =
+    trace |> Workflow_event.trace_to_yojson |> Yojson.Safe.to_string
+  in
+  Alcotest.(check bool)
+    "nonnegative host exit code projected" true
+    (contains projection (Printf.sprintf "\"code\":%d" max_int))
+
 let test_event_helper_constructors () =
   let tool = ok (Workflow_event.make_tool ~id:"tool-1" ~name:"reader" ()) in
   Alcotest.(check (option string))
@@ -1006,7 +1246,43 @@ let test_serialized_projection_bounds () =
   in
   Alcotest.(check bool)
     "trace projection bounded" true
-    (trace_bytes <= Workflow_event.max_trace_projection_bytes)
+    (trace_bytes <= Workflow_event.max_trace_projection_bytes);
+  let escaped_event_text = String.make Workflow_event.max_text_bytes '\000' in
+  let event_count = 80 in
+  let large_trace =
+    let text_events =
+      List.init event_count (fun index ->
+          event
+            ~seq:(Int64.of_int (index + 1))
+            ~attempt:1 ~elapsed_s:0.0 (Agent_text_delta escaped_event_text))
+    in
+    ok
+      (Workflow_event.make_trace
+         (text_events
+         @ [
+             event
+               ~seq:(Int64.of_int (event_count + 1))
+               ~attempt:8 ~elapsed_s:0.1 (Terminal Succeeded);
+           ]))
+  in
+  let escaped_attempt_text =
+    String.make Agent_execution.max_public_text_bytes '\127'
+  in
+  let escaped_json =
+    `String (String.make ((Agent_execution.max_json_bytes - 2) / 6) '\000')
+  in
+  let large_attempts =
+    List.init Agent_execution.max_attempts (fun index ->
+        let number = index + 1 in
+        attempt ~number
+          ~kind:(if number = 1 then Initial_attempt else Fresh_attempt)
+          ~elapsed_s:0.0 ~text:escaped_attempt_text
+          ~structured_json:escaped_json ())
+  in
+  expect_error
+    (Agent_execution.make_response ~attempts:large_attempts ~status:Success
+       ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required
+       ~event_trace:large_trace ())
 
 let test_error_classification () =
   let dispatch =
@@ -1140,6 +1416,57 @@ let test_execution_error_coherence () =
     (ok
        (Agent_execution.make_execution_error ~kind:Schema_retry_failed
           ~message:"retry exhausted" ~response:schema_failed ()))
+
+let test_schema_retry_failure_shapes () =
+  let first = attempt ~schema_error:"first schema rejection" () in
+  let check ?(kind = Workflow_event.Fresh_attempt) status =
+    let second = attempt ~number:2 ~kind ~status () in
+    let response = response ~attempts:[ first; second ] () in
+    ignore
+      (ok
+         (Agent_execution.make_execution_error ~kind:Schema_retry_failed
+            ~message:"corrective attempt failed" ~response ()))
+  in
+  check (Failed "backend failure");
+  check Timed_out;
+  check Cancelled;
+  check ~kind:Workflow_event.Resumed_attempt (Failed "resume rejected");
+  let schema_again =
+    attempt ~number:2 ~kind:Fresh_attempt
+      ~schema_error:"second schema rejection" ()
+  in
+  let schema_response =
+    response ~attempts:[ first; schema_again ]
+      ~status:(Failed "schema retry exhausted") ()
+  in
+  ignore
+    (ok
+       (Agent_execution.make_execution_error ~kind:Schema_retry_failed
+          ~message:"schema retry exhausted" ~response:schema_response ()));
+  let no_initial_schema =
+    response
+      ~attempts:
+        [
+          attempt (); attempt ~number:2 ~kind:Fresh_attempt ~status:Timed_out ();
+        ]
+      ()
+  in
+  expect_error
+    (Agent_execution.make_execution_error ~kind:Schema_retry_failed
+       ~message:"missing first schema rejection" ~response:no_initial_schema ());
+  let three_attempts =
+    response
+      ~attempts:
+        [
+          first;
+          attempt ~number:2 ~kind:Fresh_attempt ~schema_error:"again" ();
+          attempt ~number:3 ~kind:Fresh_attempt ~status:Cancelled ();
+        ]
+      ~total_elapsed_s:1.0 ()
+  in
+  expect_error
+    (Agent_execution.make_execution_error ~kind:Schema_retry_failed
+       ~message:"more than one corrective attempt" ~response:three_attempts ())
 
 let test_runtime_seam_and_capabilities () =
   let calls = ref 0 in
@@ -1475,6 +1802,8 @@ let () =
             test_invalid_max_turns_and_metadata;
           Alcotest.test_case "bounded JSON inputs" `Quick
             test_json_resource_bounds;
+          Alcotest.test_case "pre-serialization JSON byte accounting" `Quick
+            test_json_size_preflight_is_iterative_and_escape_aware;
           Alcotest.test_case "invalid attachment fields" `Quick
             test_invalid_attachment_values;
           Alcotest.test_case "invalid domains, sessions, duplicate IDs" `Quick
@@ -1497,6 +1826,10 @@ let () =
             test_response_status_and_trace_coherence;
           Alcotest.test_case "trace sessions, metrics, and timing" `Quick
             test_response_trace_sessions_metrics_and_timing;
+          Alcotest.test_case "cumulative usage snapshots" `Quick
+            test_usage_events_are_cumulative_snapshots;
+          Alcotest.test_case "one-sided attempt timing envelope" `Quick
+            test_attempt_timing_uses_one_sided_envelope;
           Alcotest.test_case "aggregates, final session, cleanup, trace" `Quick
             test_response_aggregates_and_final_session;
         ] );
@@ -1514,6 +1847,8 @@ let () =
             test_event_omitted_subsequence_is_conservative;
           Alcotest.test_case "event, trace, omission, and text bounds" `Quick
             test_event_bounds;
+          Alcotest.test_case "host-neutral process exit codes" `Quick
+            test_process_exit_codes;
           Alcotest.test_case "opaque helper constructors" `Quick
             test_event_helper_constructors;
           Alcotest.test_case "typed vocabulary and safe opaque fallback" `Quick
@@ -1531,6 +1866,8 @@ let () =
             test_error_classification;
           Alcotest.test_case "execution error coherence" `Quick
             test_execution_error_coherence;
+          Alcotest.test_case "schema retry terminal failures" `Quick
+            test_schema_retry_failure_shapes;
         ] );
       ( "runtime",
         [

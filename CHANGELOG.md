@@ -21,7 +21,7 @@ inferring session IDs from model JSON. The library still has no Cabal dependency
 **Rich-contract review closure.** Response status is now explicit and validated against
 the final transport attempt, schema-validation outcome, normalized event terminal,
 attempt kinds/outcomes/durations, sessions, metrics, and total elapsed time. Execution
-error kinds reject incoherent successful/timeout/cancelled telemetry. Event traces now
+error kinds reject incoherent telemetry. Event traces now
 enforce phase, attempt/retry, and process lifecycle order while treating absent retained
 events conservatively as an unknown prefix/subsequence. JSON traversal is iterative and
 bounded by depth/node/serialized-byte limits; attempt text/count and trace/response/error
@@ -39,6 +39,22 @@ derived from the MIME list. Legacy read-only/routing/model claims default to fal
 require explicit caller attestation. Documentation now distinguishes agent-completion
 `Workflow_event.trace` from the engine/ledger `Types.trace`, and `SPEC.md` lists the
 library's actual dependencies rather than the obsolete “yojson-only” claim.
+
+The final review follow-up moves JSON byte enforcement ahead of serialization:
+an iterative checked-size pass accounts exactly for compact JSON escaping, keys,
+separators, and delimiters, emits fixed resource-limit diagnostics with bounded semantic
+paths, and sizes canonical serialization from the accepted result. Event-trace and
+response projections now run the same exact preflight rather than allocating an
+over-limit temporary. Process exit events reject negative codes while retaining the full
+non-negative host `int` range.
+
+Usage events are cumulative per-attempt snapshots. Repeated known dimensions must be
+non-decreasing, and only the final retained observation is compared with final attempt
+telemetry; later or unlocated omissions conservatively make it unknown. Attempt duration
+must fit inside its start/finish event envelope with a one-millisecond one-sided
+tolerance for timestamp overhead. Schema retry exhaustion now requires exactly an
+initial schema rejection plus one fresh/resumed corrective attempt and preserves a final
+schema rejection, backend/resume failure, timeout, or cancellation coherently.
 
 **Yojson 2.2 compatibility.** Canonical JSON validation now rejects Yojson's
 non-standard `Tuple`/`Variant` values explicitly and expression projection treats them
