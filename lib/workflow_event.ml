@@ -317,10 +317,14 @@ type attempt_state = {
   mutable retry : retry_kind option;
   mutable process_started : bool;
   mutable observation_seen : bool;
+  mutable session_seen : bool;
+  mutable agent_text_seen : bool;
+  mutable usage_seen : bool;
   mutable termination_requested : bool;
   mutable kill_escalated : bool;
   mutable process_exited : bool;
   mutable post_finish_metadata_seen : bool;
+  mutable post_finish_metadata_rank : int;
 }
 
 let fresh_attempt_state number =
@@ -332,10 +336,14 @@ let fresh_attempt_state number =
     retry = None;
     process_started = false;
     observation_seen = false;
+    session_seen = false;
+    agent_text_seen = false;
+    usage_seen = false;
     termination_requested = false;
     kill_escalated = false;
     process_exited = false;
     post_finish_metadata_seen = false;
+    post_finish_metadata_rank = 0;
   }
 
 let retry_attempt_kind = function
@@ -494,12 +502,18 @@ let validate_lifecycle events =
                   state.activity_seen <- true;
                   state.process_exited <- true)
                 (before_attempt_end state)
-        | Session_id _ | Usage_observed _ ->
+        | Session_id _ ->
             (match (state.finished, state.retry) with
+            | Some _, None when state.session_seen ->
+                Error "final session metadata was already observed"
+            | Some _, None when state.post_finish_metadata_rank > 0 ->
+                Error "final session metadata is out of order"
             | Some _, None ->
                 state.activity_seen <- true;
                 state.observation_seen <- true;
+                state.session_seen <- true;
                 state.post_finish_metadata_seen <- true;
+                state.post_finish_metadata_rank <- 1;
                 Ok ()
             | Some _, Some _ | None, Some _ ->
                 Error "final result metadata observed after retry transition"
@@ -507,9 +521,54 @@ let validate_lifecycle events =
                 Result.map
                   (fun () ->
                     state.activity_seen <- true;
-                    state.observation_seen <- true)
-                  (before_process_exit state))
-        | Agent_text_delta _ | Tool_started _ | Tool_finished _ ->
+                    state.observation_seen <- true;
+                    state.session_seen <- true)
+                  (before_attempt_end state))
+        | Agent_text_delta text ->
+            (match (state.finished, state.retry) with
+            | Some _, None when text = "" ->
+                Error "final fallback agent text must be non-empty"
+            | Some _, None when state.agent_text_seen ->
+                Error "final fallback agent text follows earlier agent text"
+            | Some _, None when state.post_finish_metadata_rank >= 3 ->
+                Error "final fallback agent text is out of order"
+            | Some _, None ->
+                state.activity_seen <- true;
+                state.observation_seen <- true;
+                state.agent_text_seen <- true;
+                state.post_finish_metadata_seen <- true;
+                state.post_finish_metadata_rank <- 2;
+                Ok ()
+            | Some _, Some _ | None, Some _ ->
+                Error "final result metadata observed after retry transition"
+            | None, None ->
+                Result.map
+                  (fun () ->
+                    state.activity_seen <- true;
+                    state.observation_seen <- true;
+                    state.agent_text_seen <- true)
+                  (before_attempt_end state))
+        | Usage_observed _ ->
+            (match (state.finished, state.retry) with
+            | Some _, None when state.usage_seen ->
+                Error "final usage metadata was already observed"
+            | Some _, None ->
+                state.activity_seen <- true;
+                state.observation_seen <- true;
+                state.usage_seen <- true;
+                state.post_finish_metadata_seen <- true;
+                state.post_finish_metadata_rank <- 3;
+                Ok ()
+            | Some _, Some _ | None, Some _ ->
+                Error "final result metadata observed after retry transition"
+            | None, None ->
+                Result.map
+                  (fun () ->
+                    state.activity_seen <- true;
+                    state.observation_seen <- true;
+                    state.usage_seen <- true)
+                  (before_attempt_end state))
+        | Tool_started _ | Tool_finished _ ->
             Result.map
               (fun () ->
                 state.activity_seen <- true;

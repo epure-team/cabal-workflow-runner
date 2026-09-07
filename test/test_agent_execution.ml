@@ -1167,16 +1167,32 @@ let test_event_post_finish_final_metadata () =
            (1, Attempt_started Initial_attempt);
            (1, Attempt_finished Attempt_succeeded);
            (1, Session_id "final-session");
+           (1, Agent_text_delta "final fallback");
            (1, Usage_observed {usage = Some usage; cost = Some cost});
            (1, Terminal Succeeded);
          ])
   in
   let mapped_attempt =
-    attempt ~session_id:"final-session" ~usage ~cost ~elapsed_s:0.1 ()
+    attempt ~session_id:"final-session" ~usage ~cost ~text:"final fallback"
+      ~elapsed_s:0.1 ()
   in
   ignore
-    (response ~attempts:[mapped_attempt] ~total_elapsed_s:0.5
+    (response ~attempts:[mapped_attempt] ~total_elapsed_s:0.6
        ~event_trace:trace ())
+
+let test_event_final_parser_observations_after_process_exit () =
+  ignore
+    (ok
+       (trace_of_payloads
+          [
+            (1, Attempt_started Initial_attempt);
+            (1, Process_started);
+            (1, Process_exited (Exited 0));
+            (1, Agent_text_delta "final parsed text");
+            (1, Session_id "final-session");
+            (1, Attempt_finished Attempt_succeeded);
+            (1, Terminal Succeeded);
+          ]))
 
 let test_event_post_finish_rejects_nonfinal_metadata () =
   let tool = ok (Workflow_event.make_tool ~name:"reader" ()) in
@@ -1193,12 +1209,56 @@ let test_event_post_finish_rejects_nonfinal_metadata () =
   in
   List.iter rejects
     [
-      Agent_text_delta "late";
       Tool_started tool;
       Process_started;
       Retry_transition {kind = Fresh_retry; reason = Transport_retry};
       Delivery_truncated omissions;
       Opaque_backend_observation;
+    ];
+  List.iter
+    (fun payloads -> expect_error (trace_of_payloads payloads))
+    [
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Agent_text_delta "streamed");
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "not-a-fallback");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "fallback");
+        (1, Agent_text_delta "duplicate");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Usage_observed {usage = None; cost = None});
+        (1, Agent_text_delta "out-of-order");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "fallback");
+        (1, Session_id "out-of-order");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "fallback");
+        (1, Retry_transition {kind = Fresh_retry; reason = Transport_retry});
+        (2, Terminal Failed);
+      ];
     ];
   expect_error
     (trace_of_payloads
@@ -3085,6 +3145,8 @@ let () =
             test_event_lifecycle_invariants;
           Alcotest.test_case "post-finish final session and usage metadata"
             `Quick test_event_post_finish_final_metadata;
+          Alcotest.test_case "final parser observations after process exit"
+            `Quick test_event_final_parser_observations_after_process_exit;
           Alcotest.test_case "post-finish rejects nonfinal metadata" `Quick
             test_event_post_finish_rejects_nonfinal_metadata;
           Alcotest.test_case "omitted-event subsequences" `Quick
