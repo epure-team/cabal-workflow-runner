@@ -40,6 +40,10 @@ val attachment_sha256 : attachment -> string
 val attachment_size_bytes : attachment -> int64
 (** Declared non-negative attachment byte size. *)
 
+val canonical_mime_type : string -> string option
+(** Return the canonical lowercase [type/subtype] form of a syntactically valid
+    MIME type, or [None]. *)
+
 (** Hierarchical backend-native web access level. This policy is an execution
     request, not a network sandbox. *)
 type web_level = Web_disabled | Web_search | Web_search_and_fetch

@@ -32,6 +32,14 @@ each unrepresentable rich field are rejected before any callback, while explicit
 `true`/`false`, routing, and model values are forwarded exactly. Migration details are in
 `docs/rich-agent-execution-migration.md`.
 
+Architecture follow-up makes tool identities and omission counters opaque and
+constructor-validated. Runtime capabilities now carry canonical supported media MIME
+types and an independent restricted-domain web bit; the generic attachment boolean is
+derived from the MIME list. Legacy read-only/routing/model claims default to false and
+require explicit caller attestation. Documentation now distinguishes agent-completion
+`Workflow_event.trace` from the engine/ledger `Types.trace`, and `SPEC.md` lists the
+library's actual dependencies rather than the obsolete “yojson-only” claim.
+
 **Yojson 2.2 compatibility.** Canonical JSON validation now rejects Yojson's
 non-standard `Tuple`/`Variant` values explicitly and expression projection treats them
 as non-comparable, restoring exhaustive compilation without changing standard workflow

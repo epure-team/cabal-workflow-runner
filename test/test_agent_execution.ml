@@ -771,19 +771,7 @@ let test_event_bounds () =
   expect_error
     (Workflow_event.make_trace ~omitted_count:(-1L)
        [ event ~seq:1L ~attempt:0 ~elapsed_s:0.0 (Terminal Succeeded) ]);
-  let invalid_omissions : Workflow_event.omission_counts =
-    {
-      text_events = -1L;
-      text_bytes = 0L;
-      usage_events = 0L;
-      session_events = 0L;
-      tool_events = 0L;
-      control_events = 0L;
-    }
-  in
-  expect_error
-    (Workflow_event.make ~seq:1L ~attempt:0 ~elapsed_s:0.0
-       (Delivery_truncated invalid_omissions));
+  expect_error (Workflow_event.make_omission_counts ~text_events:(-1L) ());
   let rec controls seq count acc =
     if count = 0 then List.rev acc
     else
@@ -817,19 +805,40 @@ let test_event_bounds () =
   in
   expect_error (Workflow_event.make_trace oversized_projection)
 
+let test_event_helper_constructors () =
+  let tool = ok (Workflow_event.make_tool ~id:"tool-1" ~name:"reader" ()) in
+  Alcotest.(check (option string))
+    "tool id" (Some "tool-1")
+    (Workflow_event.tool_id tool);
+  Alcotest.(check string) "tool name" "reader" (Workflow_event.tool_name tool);
+  expect_error (Workflow_event.make_tool ~id:"bad/tool" ~name:"reader" ());
+  expect_error (Workflow_event.make_tool ~name:"bad tool" ());
+  let omissions =
+    ok
+      (Workflow_event.make_omission_counts ~text_events:1L ~text_bytes:2L
+         ~usage_events:3L ~session_events:4L ~tool_events:5L ~control_events:6L
+         ())
+  in
+  Alcotest.(check int64)
+    "text omissions" 1L
+    (Workflow_event.omitted_text_events omissions);
+  Alcotest.(check int64)
+    "control omissions" 6L
+    (Workflow_event.omitted_control_events omissions);
+  ignore (event ~seq:1L ~attempt:1 ~elapsed_s:0.0 (Tool_started tool));
+  ignore
+    (event ~seq:2L ~attempt:1 ~elapsed_s:0.0 (Delivery_truncated omissions))
+
 let test_event_vocabulary_and_safe_opaque () =
   let usage = ok (Execution_metrics.make_usage ~output_tokens:2L ()) in
   let cost = ok (Execution_metrics.make_cost ~usd_micros:3L ()) in
-  let omissions : Workflow_event.omission_counts =
-    {
-      text_events = 1L;
-      text_bytes = 2L;
-      usage_events = 3L;
-      session_events = 4L;
-      tool_events = 5L;
-      control_events = 6L;
-    }
+  let omissions =
+    ok
+      (Workflow_event.make_omission_counts ~text_events:1L ~text_bytes:2L
+         ~usage_events:3L ~session_events:4L ~tool_events:5L ~control_events:6L
+         ())
   in
+  let tool = ok (Workflow_event.make_tool ~id:"tool-1" ~name:"reader" ()) in
   let payloads =
     [
       (0, Workflow_event.Task_started);
@@ -844,7 +853,7 @@ let test_event_vocabulary_and_safe_opaque () =
       (1, Process_started);
       (1, Session_id "session-1");
       (1, Agent_text_delta "public output");
-      (1, Tool_started { id = Some "tool-1"; name = "reader" });
+      (1, Tool_started tool);
       (1, Tool_finished { id = Some "tool-1"; name = Some "reader" });
       (1, Usage_observed { usage = Some usage; cost = Some cost });
       (1, Delivery_truncated omissions);
@@ -1136,9 +1145,12 @@ let test_runtime_seam_and_capabilities () =
   let calls = ref 0 in
   let expected = response () in
   let capabilities =
-    Runtime.make_capabilities ~native_json_schema:true ~session_resume:true
-      ~attachments:true ~maximum_web:Agent_execution.Web_search ~read_only:true
-      ~max_turns:true ~hard_timeout:true ~routing:true ~model_selection:true ()
+    ok
+      (Runtime.make_capabilities ~native_json_schema:true ~session_resume:true
+         ~media_mime_types:[ "IMAGE/PNG"; "image/jpeg" ]
+         ~maximum_web:Agent_execution.Web_search ~restricted_web_domains:true
+         ~read_only:true ~max_turns:true ~hard_timeout:true ~routing:true
+         ~model_selection:true ())
   in
   let runtime =
     ok
@@ -1158,6 +1170,41 @@ let test_runtime_seam_and_capabilities () =
   Alcotest.(check bool)
     "schema capability" true
     (Runtime.native_json_schema capabilities);
+  Alcotest.(check bool)
+    "media capability" true
+    (Runtime.attachments capabilities);
+  Alcotest.(check (list string))
+    "canonical media MIME types"
+    [ "image/png"; "image/jpeg" ]
+    (Runtime.media_mime_types capabilities);
+  Alcotest.(check bool)
+    "restricted-domain web capability" true
+    (Runtime.restricted_web_domains capabilities);
+  Alcotest.(check bool)
+    "web maximum retained" true
+    (Runtime.maximum_web capabilities = Agent_execution.Web_search);
+  let defaults = ok (Runtime.make_capabilities ()) in
+  Alcotest.(check bool)
+    "media disabled by default" false
+    (Runtime.attachments defaults);
+  Alcotest.(check (list string))
+    "no default MIME claims" []
+    (Runtime.media_mime_types defaults);
+  Alcotest.(check bool)
+    "restricted domains disabled by default" false
+    (Runtime.restricted_web_domains defaults);
+  expect_error
+    (Runtime.make_capabilities
+       ~media_mime_types:[ "image/png"; "IMAGE/PNG" ]
+       ());
+  expect_error (Runtime.make_capabilities ~media_mime_types:[ "image" ] ());
+  expect_error
+    (Runtime.make_capabilities
+       ~media_mime_types:
+         (List.init (Runtime.max_media_mime_types + 1) (fun index ->
+              Printf.sprintf "image/x-%d" index))
+       ());
+  expect_error (Runtime.make_capabilities ~restricted_web_domains:true ());
   expect_error
     (Runtime.make ~identity:"bad identity" ~complete:(fun _ -> Ok expected) ())
 
@@ -1265,6 +1312,29 @@ let test_legacy_read_only_is_explicit () =
       ()
   in
   let runtime = Runtime.of_legacy_backend ~now:(fun () -> 1.0) backend in
+  let conservative = Runtime.capabilities runtime in
+  Alcotest.(check bool)
+    "legacy read-only not claimed by default" false
+    (Runtime.read_only conservative);
+  Alcotest.(check bool)
+    "legacy routing not claimed by default" false
+    (Runtime.routing conservative);
+  Alcotest.(check bool)
+    "legacy model selection not claimed by default" false
+    (Runtime.model_selection conservative);
+  let attested =
+    Runtime.of_legacy_backend ~attested_read_only:true ~attested_routing:true
+      ~attested_model_selection:true backend
+    |> Runtime.capabilities
+  in
+  Alcotest.(check bool)
+    "caller-attested read-only claim" true
+    (Runtime.read_only attested);
+  Alcotest.(check bool)
+    "caller-attested routing claim" true (Runtime.routing attested);
+  Alcotest.(check bool)
+    "caller-attested model claim" true
+    (Runtime.model_selection attested);
   let expect_unsupported request =
     match Runtime.complete runtime request with
     | Error error -> (
@@ -1444,6 +1514,8 @@ let () =
             test_event_omitted_subsequence_is_conservative;
           Alcotest.test_case "event, trace, omission, and text bounds" `Quick
             test_event_bounds;
+          Alcotest.test_case "opaque helper constructors" `Quick
+            test_event_helper_constructors;
           Alcotest.test_case "typed vocabulary and safe opaque fallback" `Quick
             test_event_vocabulary_and_safe_opaque;
         ] );

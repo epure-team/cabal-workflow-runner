@@ -1,10 +1,15 @@
-(** Bounded, normalized, host-neutral post-completion event traces.
+(** Bounded, normalized, host-neutral agent-completion lifecycle traces.
 
     This vocabulary is intentionally unable to carry raw protocol lines,
     prompts, command arguments, attachment metadata, stdout/stderr, tool
     arguments, chain-of-thought, or private backend JSON. A bridge that observes
     an unknown future backend event must use {!Opaque_backend_observation}.
-    Batch 1 stores only completed traces; it does not provide live streaming. *)
+
+    Despite the module name, {!trace} is not the deterministic engine's
+    {!Types.trace}: it is optional backend-execution telemetry nested in an
+    {!Agent_execution.response}, is not persisted by {!Ledger}, and is not
+    consumed by {!Engine.replay}. Batch 1 stores only completed traces; it does
+    not provide live streaming. *)
 
 (** Stable kind of an actually invoked backend attempt. *)
 type attempt_kind = Initial_attempt | Fresh_attempt | Resumed_attempt
@@ -29,21 +34,53 @@ type retry_reason =
 (** Process completion projected without raw status text. *)
 type process_exit = Exited of int | Signaled | Unknown
 
-type tool = { id : string option; name : string }
-(** Public tool identity. Arguments and backend payloads are not representable.
-*)
+type tool
+(** Opaque validated public tool identity. Arguments and backend payloads are
+    not representable. *)
 
-type omission_counts = {
-  text_events : int64;
-  text_bytes : int64;
-  usage_events : int64;
-  session_events : int64;
-  tool_events : int64;
-  control_events : int64;
-}
+val make_tool : ?id:string -> name:string -> unit -> (tool, string) result
+(** Construct a tool identity. The optional id and required name use the bounded
+    portable identifier alphabet. *)
+
+val tool_id : tool -> string option
+(** Optional public tool-call identifier. *)
+
+val tool_name : tool -> string
+(** Public tool name. *)
+
+type omission_counts
 (** Omission summary copied from a bounded event delivery layer. All values must
-    already be safely saturated by the producer and must be non-negative when
-    used in {!Delivery_truncated}. *)
+    already be safely saturated by the producer. *)
+
+val make_omission_counts :
+  ?text_events:int64 ->
+  ?text_bytes:int64 ->
+  ?usage_events:int64 ->
+  ?session_events:int64 ->
+  ?tool_events:int64 ->
+  ?control_events:int64 ->
+  unit ->
+  (omission_counts, string) result
+(** Construct non-negative omission counts. Every omitted field defaults to
+    zero. *)
+
+val omitted_text_events : omission_counts -> int64
+(** Number of omitted text events. *)
+
+val omitted_text_bytes : omission_counts -> int64
+(** Number of omitted public text bytes. *)
+
+val omitted_usage_events : omission_counts -> int64
+(** Number of omitted usage observations. *)
+
+val omitted_session_events : omission_counts -> int64
+(** Number of omitted session observations. *)
+
+val omitted_tool_events : omission_counts -> int64
+(** Number of omitted tool observations. *)
+
+val omitted_control_events : omission_counts -> int64
+(** Number of omitted lifecycle/control observations. *)
 
 (** Terminal result of the whole agent execution. Failure diagnostics live in
     {!Agent_execution}; event traces retain only the stable outcome class. *)

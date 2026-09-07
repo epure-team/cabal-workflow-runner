@@ -1,8 +1,9 @@
 type capabilities = {
   native_json_schema : bool;
   session_resume : bool;
-  attachments : bool;
+  media_mime_types : string list;
   maximum_web : Agent_execution.web_level;
+  restricted_web_domains : bool;
   read_only : bool;
   max_turns : bool;
   hard_timeout : bool;
@@ -10,26 +11,70 @@ type capabilities = {
   model_selection : bool;
 }
 
-let make_capabilities ?(native_json_schema = false) ?(session_resume = false)
-    ?(attachments = false) ?(maximum_web = Agent_execution.Web_disabled)
-    ?(read_only = false) ?(max_turns = false) ?(hard_timeout = false)
-    ?(routing = false) ?(model_selection = false) () =
+let empty_capabilities =
   {
-    native_json_schema;
-    session_resume;
-    attachments;
-    maximum_web;
-    read_only;
-    max_turns;
-    hard_timeout;
-    routing;
-    model_selection;
+    native_json_schema = false;
+    session_resume = false;
+    media_mime_types = [];
+    maximum_web = Agent_execution.Web_disabled;
+    restricted_web_domains = false;
+    read_only = false;
+    max_turns = false;
+    hard_timeout = false;
+    routing = false;
+    model_selection = false;
   }
+
+let max_media_mime_types = 128
+
+let canonical_media_mime_types values =
+  if List.length values > max_media_mime_types then
+    Error "media MIME type limit exceeded"
+  else
+    let rec loop canonical = function
+      | [] ->
+          let canonical = List.rev canonical in
+          if
+            List.length canonical
+            <> List.length (List.sort_uniq String.compare canonical)
+          then Error "media MIME types must be unique"
+          else Ok canonical
+      | value :: rest -> (
+          match Agent_execution.canonical_mime_type value with
+          | None -> Error "media MIME type is invalid"
+          | Some value -> loop (value :: canonical) rest)
+    in
+    loop [] values
+
+let make_capabilities ?(native_json_schema = false) ?(session_resume = false)
+    ?(media_mime_types = []) ?(maximum_web = Agent_execution.Web_disabled)
+    ?(restricted_web_domains = false) ?(read_only = false) ?(max_turns = false)
+    ?(hard_timeout = false) ?(routing = false) ?(model_selection = false) () =
+  if restricted_web_domains && maximum_web = Agent_execution.Web_disabled then
+    Error "restricted-domain web support requires web access"
+  else
+    Result.map
+      (fun media_mime_types ->
+        {
+          native_json_schema;
+          session_resume;
+          media_mime_types;
+          maximum_web;
+          restricted_web_domains;
+          read_only;
+          max_turns;
+          hard_timeout;
+          routing;
+          model_selection;
+        })
+      (canonical_media_mime_types media_mime_types)
 
 let native_json_schema capabilities = capabilities.native_json_schema
 let session_resume capabilities = capabilities.session_resume
-let attachments capabilities = capabilities.attachments
+let attachments capabilities = capabilities.media_mime_types <> []
+let media_mime_types capabilities = capabilities.media_mime_types
 let maximum_web capabilities = capabilities.maximum_web
+let restricted_web_domains capabilities = capabilities.restricted_web_domains
 let read_only capabilities = capabilities.read_only
 let max_turns capabilities = capabilities.max_turns
 let hard_timeout capabilities = capabilities.hard_timeout
@@ -53,7 +98,7 @@ let safe_identifier value =
   && String.length value <= 128
   && String.for_all safe_character value
 
-let make ?identity ?(capabilities = make_capabilities ()) ~complete () =
+let make ?identity ?(capabilities = empty_capabilities) ~complete () =
   match identity with
   | Some value when not (safe_identifier value) ->
       Error "runtime identity is invalid"
@@ -63,8 +108,14 @@ let identity runtime = runtime.identity
 let capabilities runtime = runtime.capabilities
 let complete runtime request = runtime.complete_fn request
 
-let legacy_capabilities =
-  make_capabilities ~read_only:true ~routing:true ~model_selection:true ()
+let legacy_capabilities ~attested_read_only ~attested_routing
+    ~attested_model_selection =
+  {
+    empty_capabilities with
+    read_only = attested_read_only;
+    routing = attested_routing;
+    model_selection = attested_model_selection;
+  }
 
 let unsupported_legacy_request request =
   Option.is_none (Agent_execution.read_only request)
@@ -140,7 +191,8 @@ let make_legacy_response ~elapsed_s ~status ~structured_json =
                   | Ok error -> Error error
                   | Error _ -> Error (internal_dispatch_error ())))))
 
-let of_legacy_backend ?(now = Unix.gettimeofday) backend =
+let of_legacy_backend ?(now = Unix.gettimeofday) ?(attested_read_only = false)
+    ?(attested_routing = false) ?(attested_model_selection = false) backend =
   let complete_fn request =
     if unsupported_legacy_request request then
       match
@@ -173,6 +225,8 @@ let of_legacy_backend ?(now = Unix.gettimeofday) backend =
   in
   {
     identity = Some "legacy-backend";
-    capabilities = legacy_capabilities;
+    capabilities =
+      legacy_capabilities ~attested_read_only ~attested_routing
+        ~attested_model_selection;
     complete_fn;
   }

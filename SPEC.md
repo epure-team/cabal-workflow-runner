@@ -167,8 +167,9 @@ A `Run` step executes an **observable shell command** (added in v0.9):
   fields: `1 ≤ v ≤ max_int`).
 - **`observe`** — optional relative paths to snapshot; default = the whole `working_dir`.
 
-**Keeping cabal out of the library.** The engine must *run* a command without depending
-on a process library from `lib/`, so the run is an **injected effect**: `Backend.t` gains
+**Keeping cabal and the concrete process runner out of the library.** The engine must
+*run* a command without linking its concrete Cabal-backed process implementation into
+`lib/`, so the run is an **injected effect**: `Backend.t` gains
 `run_command : id:string -> argv:string list -> working_dir:string -> timeout_ms:int
 option -> observe:string list option -> stdin_content:string option -> run_result`, where
 
@@ -185,7 +186,8 @@ The library defines these types and *calls* the injected function; only `bin/`
 (path → digest + size) diffed into a `file_change list`. `stdout`/`stderr` are
 **size-capped** (64 KiB) with the `truncated` flag. The library's stub backend supplies a
 deterministic `run_command` for tests. This mirrors how `run_agent` keeps cabal out of
-`lib/`: **`lib/` depends on yojson only.**
+`lib/`. The library's actual dependencies are `yojson`, `eio`, `unix`, `base64`,
+`digestif`, and `mirage-crypto-ec`; Cabal remains executable-only.
 
 `digest` is an **MD5 content digest** (OCaml stdlib `Digest`) used for
 **change-detection / observability** in the file diff — it is **NOT** a cryptographic
@@ -447,7 +449,7 @@ type t = {
   budget      : unit -> int;   (* a Budget governor stops the loop once this is <= 0 *)
   run_command : id:string -> argv:string list -> working_dir:string ->
                 timeout_ms:int option -> observe:string list option -> run_result;
-    (* the Run-step effect; bin/ implements it (process + dir snapshot), lib stays yojson-only *)
+    (* injected Run effect; bin/ supplies the Cabal-backed process + snapshot implementation *)
 }
 ```
 
@@ -465,7 +467,14 @@ the run performs **at most N** budget-governed loop iterations total (shared acr
 loops in that run) before the `Budget` governor stops the loop. (Determinism is
 unaffected — every `Budget_read` is recorded and replay re-feeds the recorded values.)
 cabal usage is confined to this boundary: the
-`cabal_workflow_runner` **library depends on yojson only**; only `bin/` links cabal.
+`cabal_workflow_runner` library links `yojson`, `eio`, `unix`, `base64`, `digestif`, and
+`mirage-crypto-ec`; only `bin/` links Cabal.
+
+**Trace naming.** `Types.trace` below is the deterministic engine replay trace persisted
+by `Ledger`. `Workflow_event.trace`, despite its broad historical module name, is a
+separate optional agent-completion lifecycle trace nested in `Agent_execution.response`.
+It is not an engine trace, is not written to the workflow ledger, and is not consumed by
+`Engine.replay`.
 
 `Engine.run ?max_loop_iters ~backend ~token validated : outcome * trace` performs a
 deterministic walk: `Agent` → `run_agent`, bind `outputs.<id>`; a `success = false` run

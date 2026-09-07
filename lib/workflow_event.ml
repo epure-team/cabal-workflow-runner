@@ -76,6 +76,16 @@ let safe_identifier ?(max_bytes = 128) value =
   && String.length value <= max_bytes
   && String.for_all safe_character value
 
+let make_tool ?id ~name () =
+  match id with
+  | Some value when not (safe_identifier value) ->
+      Error "tool identifier is invalid"
+  | _ when not (safe_identifier name) -> Error "tool name is invalid"
+  | _ -> Ok { id; name }
+
+let tool_id tool = tool.id
+let tool_name tool = tool.name
+
 let validate_optional_identifier name = function
   | Some value when not (safe_identifier value) -> Error (name ^ " is invalid")
   | _ -> Ok ()
@@ -96,6 +106,28 @@ let validate_omissions counts =
                     (nonnegative_count "tool_events" counts.tool_events)
                     (fun () ->
                       nonnegative_count "control_events" counts.control_events)))))
+
+let make_omission_counts ?(text_events = 0L) ?(text_bytes = 0L)
+    ?(usage_events = 0L) ?(session_events = 0L) ?(tool_events = 0L)
+    ?(control_events = 0L) () =
+  let counts =
+    {
+      text_events;
+      text_bytes;
+      usage_events;
+      session_events;
+      tool_events;
+      control_events;
+    }
+  in
+  Result.map (fun () -> counts) (validate_omissions counts)
+
+let omitted_text_events counts = counts.text_events
+let omitted_text_bytes counts = counts.text_bytes
+let omitted_usage_events counts = counts.usage_events
+let omitted_session_events counts = counts.session_events
+let omitted_tool_events counts = counts.tool_events
+let omitted_control_events counts = counts.control_events
 
 let validate_payload = function
   | Backend_selected value ->

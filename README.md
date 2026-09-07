@@ -89,7 +89,8 @@ changing the workflow format or wiring it into `Engine.run`:
   trace terminal, attempt kinds/outcomes/durations, sessions, metrics, and whole-call
   elapsed time. Dispatch failures before execution are distinct from coherent execution
   failures that retain attempts.
-- `Workflow_event` is a typed, bounded post-completion trace. It cannot represent raw
+- `Workflow_event` is a typed, bounded agent-completion lifecycle trace, distinct from
+  the deterministic engine's `Types.trace` and ledger. It cannot represent raw
   protocol lines, prompts, attachment paths/digests/bytes, argv, stdout/stderr, tool
   arguments, chain-of-thought, or private backend JSON. Unknown observations become a
   payload-free opaque event. Its lifecycle validator permits omitted prefixes/events but
@@ -100,7 +101,10 @@ changing the workflow format or wiring it into `Engine.run`:
   events, no inferred session, and no cleanup requirement. It requires explicit
   read-only intent and rejects schema, resume, attachment, web, and max-turn inputs
   before legacy dispatch; `true` and `false` read-only values plus routing/model hints
-  are forwarded unchanged.
+  are forwarded unchanged. Its capability claims are conservative by default and can be
+  enabled only through explicit caller-attestation flags. Runtime capability metadata
+  records exact canonical media MIME types and whether domain-restricted web policies
+  are enforceable, rather than inferring either from a generic boolean/web maximum.
 
 JSON validation uses bounded iterative traversal. Public constants cap JSON depth,
 nodes/bytes, public attempt text, attempt count, restricted domains, canonical output,
