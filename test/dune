@@ -24,6 +24,11 @@
  (deps
   (glob_files %{project_root}/examples/*.json)))
 
+(test
+ (name test_agent_execution)
+ (modules test_agent_execution)
+ (libraries cabal_workflow_runner alcotest eio eio_main))
+
 ; Real-subprocess integration test (Jalon 3, Workstream B) — see test_pcc_integration.ml's own
 ; header comment. A plain `executable`, NOT a `test` stanza, specifically so it is never attached
 ; to the default @runtest alias: it requires a sibling arch-index checkout on PATH, which the
