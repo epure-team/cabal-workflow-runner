@@ -300,14 +300,15 @@ val make_response :
     only a duration exceeding that interval by more than
     {!attempt_timing_tolerance_s} is rejected.
 
-    Usage events are cumulative snapshots. Only the final retained observation
-    for an attempt is compared with its final aggregate, and only its known
-    dimensions are compared. A positive trace omission count, a later sequence
-    gap, or a later usage-truncation marker makes that final observation
-    conservatively unknown and skips aggregate equality. Retained known
-    snapshots must still be non-decreasing. [event_trace] defaults to [None],
-    preserving the distinction between no collected trace and a trace with
-    omissions. *)
+    Usage events are cumulative snapshots. Every known retained dimension sets
+    a lower bound that the attempt aggregate must meet; a missing aggregate
+    dimension cannot erase that evidence. Exact equality is required only for
+    dimensions present in the final retained observation when no positive
+    unlocated omission count, later sequence gap, or later usage-truncation
+    marker makes finality unknown. A dimension absent from the final observation
+    remains lower-bound-only. Retained known snapshots must also be
+    non-decreasing. [event_trace] defaults to [None], preserving the distinction
+    between no collected trace and a trace with omissions. *)
 
 val attempts : response -> attempt list
 (** Ordered complete attempt list. *)
@@ -341,7 +342,10 @@ val cleanup_status : response -> cleanup_status
 val event_trace : response -> Workflow_event.trace option
 (** Optional bounded post-completion event trace. *)
 
-(** Stable categories for failures that occur before any backend invocation. *)
+(** Stable host-neutral dispatch-layer cause categories. {!Dispatch_failure}
+    uses them only when no backend invocation occurred;
+    {!Post_execution_dispatch_failed} uses them when completed execution exists.
+*)
 type dispatch_failure_kind =
   | Invalid_request
   | Backend_unavailable
@@ -361,10 +365,16 @@ type execution_failure_kind =
 type error
 (** Opaque rich execution error. *)
 
-(** Exhaustive in-process view distinguishing no-execution dispatch failure from
-    an execution failure that retains partial or complete attempt telemetry. *)
+(** Exhaustive in-process view distinguishing a no-execution dispatch failure,
+    a dispatch-layer failure after completed execution exists, and an execution
+    failure. Both post-execution forms retain normalized attempt telemetry. *)
 type error_view =
   | Dispatch_failure of { kind : dispatch_failure_kind; message : string }
+  | Post_execution_dispatch_failed of {
+      cause : dispatch_failure_kind;
+      message : string;
+      response : response;
+    }
   | Execution_failure of {
       kind : execution_failure_kind;
       message : string;
@@ -380,6 +390,19 @@ val redacted_dispatch_error : dispatch_failure_kind -> error
 (** Construct a total, message-free dispatch error for adapter fallback paths
     that have no safe diagnostic. The in-process message is the fixed string
     [details unavailable]. *)
+
+val make_post_execution_dispatch_error :
+  cause:dispatch_failure_kind ->
+  message:string ->
+  response:response ->
+  unit ->
+  (error, string) result
+(** Construct a dispatch-layer failure that occurred after at least one backend
+    attempt completed. Any coherent non-empty {!response} is accepted, including
+    success, backend failure, timeout, cancellation, and schema rejection; the
+    constructor never rewrites its status or fabricates telemetry. [cause] is a
+    fixed host-neutral category. The non-empty UTF-8 diagnostic remains
+    in-process and is omitted from safe JSON persistence. *)
 
 val make_execution_error :
   kind:execution_failure_kind ->
@@ -408,6 +431,6 @@ val response_to_yojson : response -> Yojson.Safe.t
 
 val error_to_yojson : error -> Yojson.Safe.t
 (** Stable redacted JSON persistence projection with schema version
-    [cwr.agent-execution.error/v1]. Dispatch diagnostics are omitted; execution
-    failures embed the safe response projection and therefore retain attempts.
-*)
+    [cwr.agent-execution.error/v1]. Diagnostics are omitted. Post-execution
+    dispatch failures retain only their fixed cause plus the safe response;
+    execution failures likewise embed the safe response and retain attempts. *)

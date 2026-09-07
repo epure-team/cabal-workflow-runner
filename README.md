@@ -87,12 +87,16 @@ changing the workflow format or wiring it into `Engine.run`:
   micro-USD cost, aggregate telemetry, final session, cleanup status, and an optional
   bounded event trace. Response construction cross-validates overall/final status,
   trace terminal, attempt kinds/outcomes, sessions, cumulative metric snapshots, and
-  whole-call elapsed time. Attempt event intervals may include bridge overhead but may
-  not be shorter than the corresponding attempt duration beyond the documented
-  one-sided tolerance. Schema-retry failures retain exactly the initial schema rejection
-  and one fresh/resumed corrective attempt, including failed, timed-out, or cancelled
-  corrective transports. Dispatch failures before execution remain distinct from
-  execution failures that retain attempts.
+  whole-call elapsed time. Cumulative usage observations retain per-dimension lower
+  bounds across later omissions; only dimensions present in a provably final observation
+  require exact equality. Retry transitions are checked against the next complete
+  response attempt even when its start event was omitted. Attempt event intervals may
+  include bridge overhead but may not be shorter than the corresponding attempt duration
+  beyond the documented one-sided tolerance. Schema-retry failures retain exactly the
+  initial schema rejection and one fresh/resumed corrective attempt, including failed,
+  timed-out, or cancelled corrective transports. Dispatch failures before execution,
+  post-execution dispatch failures retaining any coherent non-empty response, and
+  execution failures remain distinct typed shapes.
 - `Workflow_event` is a typed, bounded agent-completion lifecycle trace, distinct from
   the deterministic engine's `Types.trace` and ledger. It cannot represent raw
   protocol lines, prompts, attachment paths/digests/bytes, argv, stdout/stderr, tool
@@ -120,7 +124,8 @@ trace and response projections are likewise rejected from exact pre-serializatio
 Public constants cap JSON depth, nodes/bytes, public attempt text, attempt count,
 restricted domains, canonical output, and serialized trace/response/error projections.
 See the [rich execution migration
-notes](docs/rich-agent-execution-migration.md) for adoption details.
+notes](docs/rich-agent-execution-migration.md) for adoption details and the exhaustive
+mapping from Cabal's current `Backend_completer.make_rich` outcomes.
 
 Versioned response/error/event-trace Yojson projections are redacted persistence
 surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`, workflow JSON/schema,

@@ -762,6 +762,181 @@ let test_usage_events_are_cumulative_snapshots () =
   ignore
     (response ~attempts:[ attempt ] ~event_trace:unlocated_final_unknown ())
 
+let test_usage_observations_retain_dimension_lower_bounds () =
+  let initial_usage =
+    ok (Execution_metrics.make_usage ~input_tokens:5L ~output_tokens:1L ())
+  in
+  let final_partial_usage =
+    ok (Execution_metrics.make_usage ~output_tokens:4L ())
+  in
+  let initial_cost = ok (Execution_metrics.make_cost ~usd_micros:9L ()) in
+  let trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+             (Usage_observed
+                { usage = Some initial_usage; cost = Some initial_cost });
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.2
+             (Usage_observed
+                { usage = Some final_partial_usage; cost = None });
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.35
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:5L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  let make ?usage ?cost () =
+    let attempt = attempt ?usage ?cost () in
+    Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
+      ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required ~event_trace:trace
+      ()
+  in
+  let lower_input =
+    ok (Execution_metrics.make_usage ~input_tokens:4L ~output_tokens:4L ())
+  in
+  let valid_usage =
+    ok (Execution_metrics.make_usage ~input_tokens:6L ~output_tokens:4L ())
+  in
+  let wrong_exact_output =
+    ok (Execution_metrics.make_usage ~input_tokens:6L ~output_tokens:5L ())
+  in
+  let lower_cost = ok (Execution_metrics.make_cost ~usd_micros:8L ()) in
+  let valid_cost = ok (Execution_metrics.make_cost ~usd_micros:10L ()) in
+  expect_error (make ~usage:lower_input ~cost:valid_cost ());
+  expect_error (make ~cost:valid_cost ());
+  expect_error (make ~usage:valid_usage ());
+  expect_error (make ~usage:valid_usage ~cost:lower_cost ());
+  expect_error (make ~usage:wrong_exact_output ~cost:valid_cost ());
+  ignore (ok (make ~usage:valid_usage ~cost:valid_cost ()));
+  let usage_reappears_lower =
+    ok (Execution_metrics.make_usage ~input_tokens:4L ())
+  in
+  expect_error
+    (Workflow_event.make_trace
+       [
+         event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+           (Usage_observed { usage = Some initial_usage; cost = None });
+         event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+           (Usage_observed { usage = Some final_partial_usage; cost = None });
+         event ~seq:3L ~attempt:1 ~elapsed_s:0.15
+           (Usage_observed { usage = Some usage_reappears_lower; cost = None });
+         event ~seq:4L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+       ]);
+  expect_error
+    (Workflow_event.make_trace
+       [
+         event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+           (Usage_observed { usage = None; cost = Some initial_cost });
+         event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+           (Usage_observed { usage = None; cost = None });
+         event ~seq:3L ~attempt:1 ~elapsed_s:0.15
+           (Usage_observed { usage = None; cost = Some lower_cost });
+         event ~seq:4L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+       ])
+
+let test_usage_lower_bounds_survive_later_omissions () =
+  let observed_usage =
+    ok (Execution_metrics.make_usage ~input_tokens:5L ())
+  in
+  let omissions =
+    ok (Workflow_event.make_omission_counts ~usage_events:1L ())
+  in
+  let trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+             (Usage_observed { usage = Some observed_usage; cost = None });
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.2
+             (Delivery_truncated omissions);
+           event ~seq:5L ~attempt:1 ~elapsed_s:0.35
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:6L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  let make ?usage () =
+    Agent_execution.make_response ~attempts:[ attempt ?usage () ]
+      ~status:Success ~total_elapsed_s:0.5
+      ~cleanup_status:Cleanup_not_required ~event_trace:trace ()
+  in
+  let below = ok (Execution_metrics.make_usage ~input_tokens:4L ()) in
+  let above = ok (Execution_metrics.make_usage ~input_tokens:6L ()) in
+  expect_error (make ~usage:below ());
+  expect_error (make ());
+  ignore (ok (make ~usage:above ()));
+  let unlocated_trace =
+    ok
+      (Workflow_event.make_trace ~omitted_count:1L
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+             (Usage_observed { usage = Some observed_usage; cost = None });
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.35
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  let make_unlocated ?usage () =
+    Agent_execution.make_response ~attempts:[ attempt ?usage () ]
+      ~status:Success ~total_elapsed_s:0.5
+      ~cleanup_status:Cleanup_not_required ~event_trace:unlocated_trace ()
+  in
+  expect_error (make_unlocated ~usage:below ());
+  expect_error (make_unlocated ());
+  ignore (ok (make_unlocated ~usage:above ()))
+
+let test_retry_transition_matches_response_without_retained_start () =
+  let make_trace retry_kind =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.2
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.21
+             (Retry_transition
+                { kind = retry_kind; reason = Schema_validation });
+           event ~seq:4L ~attempt:2 ~elapsed_s:0.4
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:5L ~attempt:2 ~elapsed_s:0.45
+             (Terminal Succeeded);
+         ])
+  in
+  let first = attempt ~elapsed_s:0.1 ~schema_error:"schema" () in
+  let fresh = attempt ~number:2 ~kind:Fresh_attempt () in
+  ignore
+    (response ~attempts:[ first; fresh ] ~total_elapsed_s:1.0
+       ~event_trace:(make_trace Fresh_retry) ());
+  expect_error_message "retry transition disagrees with response attempt kind"
+    (Agent_execution.make_response ~attempts:[ first; fresh ] ~status:Success
+       ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required
+       ~event_trace:(make_trace Resume_retry) ());
+  let transition_after_final =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.2
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.21
+             (Retry_transition
+                { kind = Fresh_retry; reason = Schema_validation });
+           event ~seq:4L ~attempt:2 ~elapsed_s:0.45 (Terminal Failed);
+         ])
+  in
+  expect_error_message "retry transition has no following response attempt"
+    (Agent_execution.make_response ~attempts:[ first ]
+       ~status:(Failed "schema validation failed") ~total_elapsed_s:1.0
+       ~cleanup_status:Cleanup_not_required
+       ~event_trace:transition_after_final ())
+
 let test_attempt_timing_uses_one_sided_envelope () =
   let attempt = attempt ~elapsed_s:0.25 () in
   let make_trace finished_at =
@@ -1417,6 +1592,65 @@ let test_execution_error_coherence () =
        (Agent_execution.make_execution_error ~kind:Schema_retry_failed
           ~message:"retry exhausted" ~response:schema_failed ()))
 
+let test_post_execution_dispatch_failure_preserves_every_status () =
+  let cases =
+    [
+      ("success", response (), Agent_execution.Success);
+      ( "failed",
+        response ~attempts:[ attempt ~status:(Failed "backend") () ] (),
+        Agent_execution.Failed "backend" );
+      ( "timed out",
+        response ~attempts:[ attempt ~status:Timed_out () ] (),
+        Agent_execution.Timed_out );
+      ( "cancelled",
+        response ~attempts:[ attempt ~status:Cancelled () ] (),
+        Agent_execution.Cancelled );
+      ( "schema rejection",
+        response ~attempts:[ attempt ~schema_error:"schema" () ]
+          ~status:(Failed "schema rejection") (),
+        Agent_execution.Failed "schema rejection" );
+    ]
+  in
+  List.iter
+    (fun (label, original, expected_status) ->
+      let error =
+        ok
+          (Agent_execution.make_post_execution_dispatch_error
+             ~cause:Agent_execution.Preflight_failed
+             ~message:"PRIVATE_POST_DISPATCH_DIAGNOSTIC" ~response:original ())
+      in
+      match Agent_execution.error_view error with
+      | Post_execution_dispatch_failed
+          { cause = Preflight_failed; message; response = retained } ->
+          Alcotest.(check string)
+            (label ^ " diagnostic retained in process")
+            "PRIVATE_POST_DISPATCH_DIAGNOSTIC" message;
+          Alcotest.(check bool)
+            (label ^ " status retained") true
+            (Agent_execution.final_status retained = expected_status);
+          Alcotest.(check int)
+            (label ^ " attempts retained")
+            (List.length (Agent_execution.attempts original))
+            (List.length (Agent_execution.attempts retained));
+          let serialized =
+            Agent_execution.error_to_yojson error |> Yojson.Safe.to_string
+          in
+          Alcotest.(check bool)
+            (label ^ " fixed error kind") true
+            (contains serialized
+               "\"error_kind\":\"post_execution_dispatch_failed\"");
+          Alcotest.(check bool)
+            (label ^ " fixed cause") true
+            (contains serialized "\"cause\":\"preflight_failed\"");
+          check_absent (label ^ " private diagnostic redacted") serialized
+            "PRIVATE_POST_DISPATCH_DIAGNOSTIC"
+      | _ -> Alcotest.failf "%s post-dispatch failure misclassified" label)
+    cases;
+  expect_error
+    (Agent_execution.make_post_execution_dispatch_error
+       ~cause:Agent_execution.Preflight_failed ~message:"" ~response:(response ())
+       ())
+
 let test_schema_retry_failure_shapes () =
   let first = attempt ~schema_error:"first schema rejection" () in
   let check ?(kind = Workflow_event.Fresh_attempt) status =
@@ -1612,6 +1846,9 @@ let test_legacy_runtime_failure_and_unsupported () =
           Alcotest.(check int)
             "failed execution has attempt" 1
             (List.length (Agent_execution.attempts response))
+      | Post_execution_dispatch_failed _ ->
+          Alcotest.fail
+            "legacy bool=false is execution, not post-dispatch failure"
       | Dispatch_failure _ ->
           Alcotest.fail "legacy bool=false is execution, not dispatch failure")
   | Ok _ -> Alcotest.fail "legacy bool=false must be an execution error");
@@ -1828,6 +2065,12 @@ let () =
             test_response_trace_sessions_metrics_and_timing;
           Alcotest.test_case "cumulative usage snapshots" `Quick
             test_usage_events_are_cumulative_snapshots;
+          Alcotest.test_case "usage dimension lower bounds" `Quick
+            test_usage_observations_retain_dimension_lower_bounds;
+          Alcotest.test_case "usage lower bounds across omissions" `Quick
+            test_usage_lower_bounds_survive_later_omissions;
+          Alcotest.test_case "retry transition without retained start" `Quick
+            test_retry_transition_matches_response_without_retained_start;
           Alcotest.test_case "one-sided attempt timing envelope" `Quick
             test_attempt_timing_uses_one_sided_envelope;
           Alcotest.test_case "aggregates, final session, cleanup, trace" `Quick
@@ -1866,6 +2109,8 @@ let () =
             test_error_classification;
           Alcotest.test_case "execution error coherence" `Quick
             test_execution_error_coherence;
+          Alcotest.test_case "post-execution dispatch status preservation"
+            `Quick test_post_execution_dispatch_failure_preserves_every_status;
           Alcotest.test_case "schema retry terminal failures" `Quick
             test_schema_retry_failure_shapes;
         ] );

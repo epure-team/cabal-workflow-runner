@@ -91,8 +91,9 @@ type terminal = Succeeded | Failed | Timed_out | Cancelled
 (** Safe normalized event vocabulary. [Agent_text_delta] is public assistant
     output and is subject to {!max_text_bytes}. [Usage_observed] values are
     cumulative snapshots within one attempt, not deltas: repeated known token or
-    cost dimensions must be non-decreasing. [Opaque_backend_observation]
-    deliberately has no payload. *)
+    cost dimensions must be non-decreasing, and an intervening snapshot that
+    omits a dimension does not reset its prior known value.
+    [Opaque_backend_observation] deliberately has no payload. *)
 type payload =
   | Task_started
   | Backend_selected of string

@@ -396,35 +396,6 @@ let validate_attempt_order attempts =
   in
   loop 1 attempts
 
-let known_dimension_matches observed retained =
-  match observed with None -> true | Some value -> retained = Some value
-
-let observed_usage_matches observed retained =
-  match observed with
-  | None -> true
-  | Some observed ->
-      let retained_field get = Option.bind retained get in
-      known_dimension_matches
-        (Execution_metrics.input_tokens observed)
-        (retained_field Execution_metrics.input_tokens)
-      && known_dimension_matches
-           (Execution_metrics.output_tokens observed)
-           (retained_field Execution_metrics.output_tokens)
-      && known_dimension_matches
-           (Execution_metrics.cache_creation_tokens observed)
-           (retained_field Execution_metrics.cache_creation_tokens)
-      && known_dimension_matches
-           (Execution_metrics.cache_read_tokens observed)
-           (retained_field Execution_metrics.cache_read_tokens)
-
-let observed_cost_matches observed retained =
-  match observed with
-  | None -> true
-  | Some observed ->
-      known_dimension_matches
-        (Execution_metrics.usd_micros observed)
-        (Option.bind retained Execution_metrics.usd_micros)
-
 let outcome_matches_status outcome status =
   match (outcome, status) with
   | Workflow_event.Attempt_succeeded, Success
@@ -456,11 +427,87 @@ let find_attempt attempts number =
 
 let attempt_timing_tolerance_s = 0.001
 
-type retained_usage_observation = {
-  usage : Execution_metrics.usage option;
-  cost : Execution_metrics.cost option;
-  mutable final_is_known : bool;
+type retained_metric_dimension = {
+  mutable lower_bound : int64 option;
+  mutable exact_final : int64 option;
 }
+
+type retained_usage_observation = {
+  input_tokens : retained_metric_dimension;
+  output_tokens : retained_metric_dimension;
+  cache_creation_tokens : retained_metric_dimension;
+  cache_read_tokens : retained_metric_dimension;
+  usd_micros : retained_metric_dimension;
+}
+
+let empty_retained_dimension () = { lower_bound = None; exact_final = None }
+
+let empty_retained_usage_observation () =
+  {
+    input_tokens = empty_retained_dimension ();
+    output_tokens = empty_retained_dimension ();
+    cache_creation_tokens = empty_retained_dimension ();
+    cache_read_tokens = empty_retained_dimension ();
+    usd_micros = empty_retained_dimension ();
+  }
+
+let clear_exact_usage observation =
+  observation.input_tokens.exact_final <- None;
+  observation.output_tokens.exact_final <- None;
+  observation.cache_creation_tokens.exact_final <- None;
+  observation.cache_read_tokens.exact_final <- None;
+  observation.usd_micros.exact_final <- None
+
+let retain_metric_dimension ~exact_is_known dimension value =
+  (match (dimension.lower_bound, value) with
+  | Some previous, Some current when Int64.compare current previous > 0 ->
+      dimension.lower_bound <- Some current
+  | None, Some current -> dimension.lower_bound <- Some current
+  | Some _, (Some _ | None) | None, None -> ());
+  dimension.exact_final <- if exact_is_known then value else None
+
+let retain_usage_observation ~exact_is_known observation ~usage ~cost =
+  let usage_field get = Option.bind usage get in
+  retain_metric_dimension ~exact_is_known observation.input_tokens
+    (usage_field Execution_metrics.input_tokens);
+  retain_metric_dimension ~exact_is_known observation.output_tokens
+    (usage_field Execution_metrics.output_tokens);
+  retain_metric_dimension ~exact_is_known observation.cache_creation_tokens
+    (usage_field Execution_metrics.cache_creation_tokens);
+  retain_metric_dimension ~exact_is_known observation.cache_read_tokens
+    (usage_field Execution_metrics.cache_read_tokens);
+  retain_metric_dimension ~exact_is_known observation.usd_micros
+    (Option.bind cost Execution_metrics.usd_micros)
+
+let retained_dimension_matches dimension aggregate =
+  let above_lower_bound =
+    match dimension.lower_bound with
+    | None -> true
+    | Some lower_bound -> (
+        match aggregate with
+        | Some value -> Int64.compare value lower_bound >= 0
+        | None -> false)
+  in
+  above_lower_bound
+  &&
+  match dimension.exact_final with
+  | None -> true
+  | Some exact -> aggregate = Some exact
+
+let retained_usage_matches observation retained =
+  let retained_field get = Option.bind retained get in
+  retained_dimension_matches observation.input_tokens
+    (retained_field Execution_metrics.input_tokens)
+  && retained_dimension_matches observation.output_tokens
+       (retained_field Execution_metrics.output_tokens)
+  && retained_dimension_matches observation.cache_creation_tokens
+       (retained_field Execution_metrics.cache_creation_tokens)
+  && retained_dimension_matches observation.cache_read_tokens
+       (retained_field Execution_metrics.cache_read_tokens)
+
+let retained_cost_matches observation retained =
+  retained_dimension_matches observation.usd_micros
+    (Option.bind retained Execution_metrics.usd_micros)
 
 let validate_trace ~attempts ~status ~total_elapsed_s trace =
   let starts = Hashtbl.create (List.length attempts) in
@@ -475,7 +522,7 @@ let validate_trace ~attempts ~status ~total_elapsed_s trace =
       let mark_usage_unknown attempt_number =
         match Hashtbl.find_opt usage_observations attempt_number with
         | None -> ()
-        | Some observation -> observation.final_is_known <- false
+        | Some observation -> clear_exact_usage observation
       in
       let note_sequence_gap event =
         (match !previous_event with
@@ -547,14 +594,44 @@ let validate_trace ~attempts ~status ~total_elapsed_s trace =
                         Error "event session disagrees with response telemetry"
                       else Ok ()
                   | Usage_observed { usage; cost } ->
-                      Hashtbl.replace usage_observations attempt.number
-                        { usage; cost; final_is_known = no_unlocated_omissions };
+                      let observation =
+                        match
+                          Hashtbl.find_opt usage_observations attempt.number
+                        with
+                        | Some observation -> observation
+                        | None ->
+                            let observation =
+                              empty_retained_usage_observation ()
+                            in
+                            Hashtbl.add usage_observations attempt.number
+                              observation;
+                            observation
+                      in
+                      retain_usage_observation
+                        ~exact_is_known:no_unlocated_omissions observation
+                        ~usage ~cost;
                       Ok ()
-                  | Retry_transition { reason = Schema_validation; _ } ->
-                      if attempt.schema_error = None then
-                        Error
-                          "schema retry event has no matching validation error"
-                      else Ok ()
+                  | Retry_transition { kind; reason } -> (
+                      match find_attempt attempts (attempt.number + 1) with
+                      | None ->
+                          Error
+                            "retry transition has no following response attempt"
+                      | Some next_attempt
+                        when next_attempt.kind
+                             <>
+                             (match kind with
+                             | Workflow_event.Fresh_retry -> Fresh_attempt
+                             | Resume_retry -> Resumed_attempt) ->
+                          Error
+                            "retry transition disagrees with response attempt \
+                             kind"
+                      | Some _
+                        when reason = Schema_validation
+                             && attempt.schema_error = None ->
+                          Error
+                            "schema retry event has no matching validation \
+                             error"
+                      | Some _ -> Ok ())
                   | Task_started | Backend_selected _ | Preflight_started
                   | Preflight_completed | Version_probe_started
                   | Version_probe_completed | Availability_check_started
@@ -568,10 +645,10 @@ let validate_trace ~attempts ~status ~total_elapsed_s trace =
                         > 0
                       then mark_usage_unknown attempt.number;
                       Ok ()
-                  | Retry_transition _ | Process_started
-                  | Process_termination_requested | Process_kill_escalated
-                  | Process_exited _ | Agent_text_delta _ | Tool_started _
-                  | Tool_finished _ | Opaque_backend_observation ->
+                  | Process_started | Process_termination_requested
+                  | Process_kill_escalated | Process_exited _
+                  | Agent_text_delta _ | Tool_started _ | Tool_finished _
+                  | Opaque_backend_observation ->
                       Ok ()
                   | Terminal _ -> Error "terminal event validation failed"))
       in
@@ -580,29 +657,21 @@ let validate_trace ~attempts ~status ~total_elapsed_s trace =
             Hashtbl.fold
               (fun attempt_number observation result ->
                 Result.bind result (fun () ->
-                    if not observation.final_is_known then Ok ()
-                    else
-                      match find_attempt attempts attempt_number with
-                      | None ->
-                          Error "usage event has no matching response attempt"
-                      | Some attempt ->
-                          if
-                            not
-                              (observed_usage_matches observation.usage
-                                 attempt.usage)
-                          then
-                            Error
-                              "final event usage disagrees with response \
-                               telemetry"
-                          else if
-                            not
-                              (observed_cost_matches observation.cost
-                                 attempt.cost)
-                          then
-                            Error
-                              "final event cost disagrees with response \
-                               telemetry"
-                          else Ok ()))
+                    match find_attempt attempts attempt_number with
+                    | None ->
+                        Error "usage event has no matching response attempt"
+                    | Some attempt ->
+                        if
+                          not
+                            (retained_usage_matches observation attempt.usage)
+                        then
+                          Error
+                            "event usage disagrees with response telemetry"
+                        else if
+                          not (retained_cost_matches observation attempt.cost)
+                        then
+                          Error "event cost disagrees with response telemetry"
+                        else Ok ()))
               usage_observations (Ok ())
         | event :: rest ->
             Result.bind (validate_event event) (fun () -> loop rest)
@@ -830,6 +899,11 @@ type execution_failure_kind =
 
 type error =
   | Dispatch_error of { kind : dispatch_failure_kind; message : string }
+  | Post_execution_dispatch_error of {
+      cause : dispatch_failure_kind;
+      message : string;
+      response : response;
+    }
   | Execution_error of {
       kind : execution_failure_kind;
       message : string;
@@ -838,6 +912,11 @@ type error =
 
 type error_view =
   | Dispatch_failure of { kind : dispatch_failure_kind; message : string }
+  | Post_execution_dispatch_failed of {
+      cause : dispatch_failure_kind;
+      message : string;
+      response : response;
+    }
   | Execution_failure of {
       kind : execution_failure_kind;
       message : string;
@@ -851,6 +930,12 @@ let make_dispatch_error ~kind ~message () =
 
 let redacted_dispatch_error kind =
   Dispatch_error { kind; message = "details unavailable" }
+
+let make_post_execution_dispatch_error ~cause ~message ~response () =
+  Result.map
+    (fun message ->
+      Post_execution_dispatch_error { cause; message; response })
+    (normalize_nonempty_diagnostic "post-execution dispatch diagnostic" message)
 
 let valid_execution_failure kind response =
   match
@@ -895,6 +980,8 @@ let make_execution_error ~kind ~message ~response () =
 
 let error_view = function
   | Dispatch_error { kind; message } -> Dispatch_failure { kind; message }
+  | Post_execution_dispatch_error { cause; message; response } ->
+      Post_execution_dispatch_failed { cause; message; response }
   | Execution_error { kind; message; response } ->
       Execution_failure { kind; message; response }
 
@@ -922,6 +1009,14 @@ let error_to_yojson = function
           ("schema_version", `String "cwr.agent-execution.error/v1");
           ("error_kind", `String "dispatch_failure");
           ("failure_kind", `String (string_of_dispatch_failure_kind kind));
+        ]
+  | Post_execution_dispatch_error { cause; message = _; response } ->
+      `Assoc
+        [
+          ("schema_version", `String "cwr.agent-execution.error/v1");
+          ("error_kind", `String "post_execution_dispatch_failed");
+          ("cause", `String (string_of_dispatch_failure_kind cause));
+          ("response", response_to_yojson response);
         ]
   | Execution_error { kind; message = _; response } ->
       `Assoc
