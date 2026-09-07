@@ -155,7 +155,11 @@ let max_json_bytes = 1024 * 1024
 let max_public_text_bytes = 256 * 1024
 let max_attempts = 8
 let max_response_projection_bytes = 24 * 1024 * 1024
-let max_error_projection_bytes = max_response_projection_bytes + 1024
+
+let max_error_projection_bytes =
+  max_response_projection_bytes
+  + Workflow_event.max_trace_projection_bytes
+  + 2048
 
 let validate_standard_json json =
   Canonical_json.validate_standard ~max_depth:max_json_depth
@@ -892,17 +896,28 @@ type dispatch_failure_kind =
   | Internal_dispatch_failure
 
 type execution_failure_kind =
-  | Native_schema_rejection
+  | Native_backend_failure_with_schema
   | Schema_retry_failed
   | Backend_execution_failed
   | Execution_contract_failed
 
 type error =
-  | Dispatch_error of { kind : dispatch_failure_kind; message : string }
+  | Dispatch_error of {
+      kind : dispatch_failure_kind;
+      message : string;
+      event_trace : Workflow_event.trace option;
+    }
+  | No_completed_attempt_error of {
+      status : status;
+      invocation_may_have_started : bool;
+      message : string;
+      event_trace : Workflow_event.trace option;
+    }
   | Post_execution_dispatch_error of {
       cause : dispatch_failure_kind;
       message : string;
       response : response;
+      outer_event_trace : Workflow_event.trace;
     }
   | Execution_error of {
       kind : execution_failure_kind;
@@ -911,11 +926,22 @@ type error =
     }
 
 type error_view =
-  | Dispatch_failure of { kind : dispatch_failure_kind; message : string }
+  | Dispatch_failure of {
+      kind : dispatch_failure_kind;
+      message : string;
+      event_trace : Workflow_event.trace option;
+    }
+  | No_completed_attempt of {
+      status : status;
+      invocation_may_have_started : bool;
+      message : string;
+      event_trace : Workflow_event.trace option;
+    }
   | Post_execution_dispatch_failed of {
       cause : dispatch_failure_kind;
       message : string;
       response : response;
+      outer_event_trace : Workflow_event.trace;
     }
   | Execution_failure of {
       kind : execution_failure_kind;
@@ -923,19 +949,88 @@ type error_view =
       response : response;
     }
 
-let make_dispatch_error ~kind ~message () =
-  Result.map
-    (fun message -> Dispatch_error { kind; message })
-    (normalize_nonempty_diagnostic "dispatch diagnostic" message)
+let validate_trace_terminal_status ~status trace =
+  match List.rev (Workflow_event.events trace) with
+  | terminal :: _ -> (
+      match Workflow_event.payload terminal with
+      | Workflow_event.Terminal observed
+        when terminal_matches_status observed status ->
+          Ok ()
+      | Terminal _ -> Error "event trace terminal disagrees with error status"
+      | _ -> Error "event trace terminal is missing")
+  | [] -> Error "event trace terminal is missing"
+
+let trace_has_attempt_evidence trace =
+  List.exists
+    (fun event -> Workflow_event.attempt event <> 0)
+    (Workflow_event.events trace)
+
+let validate_definitely_no_invocation_trace trace =
+  Result.bind
+    (validate_trace_terminal_status ~status:(Failed "dispatch failure") trace)
+    (fun () ->
+      if trace_has_attempt_evidence trace then
+        Error "no-invocation dispatch trace contains attempt evidence"
+      else Ok ())
+
+let make_dispatch_error ~kind ~message ?event_trace () =
+  Result.bind
+    (match event_trace with
+    | None -> Ok ()
+    | Some trace -> validate_definitely_no_invocation_trace trace)
+    (fun () ->
+      Result.map
+        (fun message -> Dispatch_error { kind; message; event_trace })
+        (normalize_nonempty_diagnostic "dispatch diagnostic" message))
 
 let redacted_dispatch_error kind =
-  Dispatch_error { kind; message = "details unavailable" }
+  Dispatch_error { kind; message = "details unavailable"; event_trace = None }
 
-let make_post_execution_dispatch_error ~cause ~message ~response () =
-  Result.map
-    (fun message ->
-      Post_execution_dispatch_error { cause; message; response })
-    (normalize_nonempty_diagnostic "post-execution dispatch diagnostic" message)
+let make_no_completed_attempt_error ~status ~invocation_may_have_started
+    ~message ?event_trace () =
+  Result.bind (normalize_status status) (fun status ->
+      if status = Success then
+        Error "no-completed-attempt status must not be successful"
+      else
+        Result.bind
+          (match event_trace with
+          | None -> Ok ()
+          | Some trace ->
+              Result.bind (validate_trace_terminal_status ~status trace)
+                (fun () ->
+                  if
+                    (not invocation_may_have_started)
+                    && trace_has_attempt_evidence trace
+                  then
+                    Error
+                      "definite no-invocation trace contains attempt evidence"
+                  else Ok ()))
+          (fun () ->
+            Result.map
+              (fun message ->
+                No_completed_attempt_error
+                  {
+                    status;
+                    invocation_may_have_started;
+                    message;
+                    event_trace;
+                  })
+              (normalize_nonempty_diagnostic
+                 "no-completed-attempt diagnostic" message)))
+
+let make_post_execution_dispatch_error ~cause ~message ~response
+    ~outer_event_trace () =
+  Result.bind
+    (validate_trace ~attempts:response.attempts
+       ~status:(Failed "post-execution dispatch failure")
+       ~total_elapsed_s:Float.max_float outer_event_trace)
+    (fun () ->
+      Result.map
+        (fun message ->
+          Post_execution_dispatch_error
+            { cause; message; response; outer_event_trace })
+        (normalize_nonempty_diagnostic "post-execution dispatch diagnostic"
+           message))
 
 let valid_execution_failure kind response =
   match
@@ -944,7 +1039,7 @@ let valid_execution_failure kind response =
       response.final_attempt.status,
       response.final_attempt.schema_error )
   with
-  | Native_schema_rejection, Failed _, Failed _, None
+  | Native_backend_failure_with_schema, Failed _, Failed _, None
   | Backend_execution_failed, Failed _, Failed _, None
   | Execution_contract_failed, Failed _, Failed _, None ->
       true
@@ -965,7 +1060,7 @@ let valid_execution_failure kind response =
               true
           | _ -> false)
       | _ -> false)
-  | Native_schema_rejection, _, _, _
+  | Native_backend_failure_with_schema, _, _, _
   | Backend_execution_failed, _, _, _
   | Execution_contract_failed, _, _, _ ->
       false
@@ -979,9 +1074,16 @@ let make_execution_error ~kind ~message ~response () =
       (normalize_nonempty_diagnostic "execution diagnostic" message)
 
 let error_view = function
-  | Dispatch_error { kind; message } -> Dispatch_failure { kind; message }
-  | Post_execution_dispatch_error { cause; message; response } ->
-      Post_execution_dispatch_failed { cause; message; response }
+  | Dispatch_error { kind; message; event_trace } ->
+      Dispatch_failure { kind; message; event_trace }
+  | No_completed_attempt_error
+      { status; invocation_may_have_started; message; event_trace } ->
+      No_completed_attempt
+        { status; invocation_may_have_started; message; event_trace }
+  | Post_execution_dispatch_error
+      { cause; message; response; outer_event_trace } ->
+      Post_execution_dispatch_failed
+        { cause; message; response; outer_event_trace }
   | Execution_error { kind; message; response } ->
       Execution_failure { kind; message; response }
 
@@ -997,26 +1099,48 @@ let string_of_dispatch_failure_kind = function
   | Internal_dispatch_failure -> "internal_dispatch_failure"
 
 let string_of_execution_failure_kind = function
-  | Native_schema_rejection -> "native_schema_rejection"
+  | Native_backend_failure_with_schema ->
+      "native_backend_failure_with_schema"
   | Schema_retry_failed -> "schema_retry_failed"
   | Backend_execution_failed -> "backend_execution_failed"
   | Execution_contract_failed -> "execution_contract_failed"
 
 let error_to_yojson = function
-  | Dispatch_error { kind; message = _ } ->
-      `Assoc
+  | Dispatch_error { kind; message = _; event_trace } ->
+      let fields =
         [
           ("schema_version", `String "cwr.agent-execution.error/v1");
           ("error_kind", `String "dispatch_failure");
           ("failure_kind", `String (string_of_dispatch_failure_kind kind));
         ]
-  | Post_execution_dispatch_error { cause; message = _; response } ->
+      in
+      `Assoc
+        (match event_trace with
+        | None -> fields
+        | Some trace ->
+            fields
+            @ [("event_trace", Workflow_event.trace_to_yojson trace)])
+  | No_completed_attempt_error
+      { status; invocation_may_have_started; message = _; event_trace } ->
+      `Assoc
+        [
+          ("schema_version", `String "cwr.agent-execution.error/v1");
+          ("error_kind", `String "no_completed_attempt");
+          ("status", `String (string_of_status status));
+          ("invocation_may_have_started", `Bool invocation_may_have_started);
+          ( "event_trace",
+            projection_option Workflow_event.trace_to_yojson event_trace );
+        ]
+  | Post_execution_dispatch_error
+      { cause; message = _; response; outer_event_trace } ->
       `Assoc
         [
           ("schema_version", `String "cwr.agent-execution.error/v1");
           ("error_kind", `String "post_execution_dispatch_failed");
           ("cause", `String (string_of_dispatch_failure_kind cause));
           ("response", response_to_yojson response);
+          ( "outer_event_trace",
+            Workflow_event.trace_to_yojson outer_event_trace );
         ]
   | Execution_error { kind; message = _; response } ->
       `Assoc

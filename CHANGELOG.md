@@ -59,12 +59,19 @@ corrective attempt and preserves a final schema rejection, backend/resume failur
 timeout, or cancellation coherently.
 
 Post-execution dispatch failures now have their own typed error shape. They retain any
-coherent non-empty response without rewriting its status or attempts, while their safe
-projection contains only a fixed dispatch-cause category and the already-redacted
-response. Pre-execution dispatch errors remain separate. The migration notes pin an
-exhaustive table for Cabal's current `Backend_completer.make_rich` detailed outcomes and
-identify only the zero-completed-attempt dispatch ambiguity and float-USD conversion
-policy still needing resolution in a future bridge.
+coherent non-empty response without rewriting its status or attempts, plus a separate
+normalized outer failed trace. This permits a successful completed task with
+`Cleanup_failed` to coexist with Cabal's outer failed terminal. A new
+`No_completed_attempt` shape retains failed/timed-out/cancelled status, explicit
+invocation uncertainty, and an optional safe trace without inventing an attempt. Pure
+pre-invocation dispatch errors remain distinct and may retain a no-attempt trace.
+
+The pre-release `Native_schema_rejection` category is renamed to the causally neutral
+`Native_backend_failure_with_schema`, matching Cabal's contract: the schema was in force,
+but is not asserted to have caused the backend failure. Error projections remain
+versioned/redacted/bounded and now account for an outer trace. The migration notes pin an
+exhaustive table for Cabal's current `Backend_completer.make_rich` outcomes and defer
+float-USD conversion until a checked deterministic micro-USD rounding policy is chosen.
 
 **Yojson 2.2 compatibility.** Canonical JSON validation now rejects Yojson's
 non-standard `Tuple`/`Variant` values explicitly and expression projection treats them

@@ -107,7 +107,8 @@ val max_response_projection_bytes : int
     serializing the projection. *)
 
 val max_error_projection_bytes : int
-(** Upper byte bound guaranteed for a serialized safe error projection. *)
+(** Upper byte bound guaranteed for a serialized safe error projection,
+    including a separately retained outer event trace. *)
 
 val make_request :
   id:string ->
@@ -355,9 +356,12 @@ type dispatch_failure_kind =
   | Deadline_before_dispatch
   | Internal_dispatch_failure
 
-(** Stable categories for failures after at least one backend invocation. *)
+(** Stable categories for failures after at least one backend invocation.
+    [Native_backend_failure_with_schema] means only that a native-schema backend
+    failed while a schema was in force; it does not attribute the failure to
+    schema rejection. *)
 type execution_failure_kind =
-  | Native_schema_rejection
+  | Native_backend_failure_with_schema
   | Schema_retry_failed
   | Backend_execution_failed
   | Execution_contract_failed
@@ -365,15 +369,27 @@ type execution_failure_kind =
 type error
 (** Opaque rich execution error. *)
 
-(** Exhaustive in-process view distinguishing a no-execution dispatch failure,
-    a dispatch-layer failure after completed execution exists, and an execution
-    failure. Both post-execution forms retain normalized attempt telemetry. *)
+(** Exhaustive in-process view distinguishing a proven no-invocation dispatch
+    failure, an outcome with no completed attempt and indeterminate invocation
+    progress, a dispatch-layer failure after completed execution exists, and an
+    execution failure. Completed-execution forms retain normalized attempts. *)
 type error_view =
-  | Dispatch_failure of { kind : dispatch_failure_kind; message : string }
+  | Dispatch_failure of {
+      kind : dispatch_failure_kind;
+      message : string;
+      event_trace : Workflow_event.trace option;
+    }
+  | No_completed_attempt of {
+      status : status;
+      invocation_may_have_started : bool;
+      message : string;
+      event_trace : Workflow_event.trace option;
+    }
   | Post_execution_dispatch_failed of {
       cause : dispatch_failure_kind;
       message : string;
       response : response;
+      outer_event_trace : Workflow_event.trace;
     }
   | Execution_failure of {
       kind : execution_failure_kind;
@@ -382,27 +398,56 @@ type error_view =
     }
 
 val make_dispatch_error :
-  kind:dispatch_failure_kind -> message:string -> unit -> (error, string) result
-(** Construct a pre-execution failure. The non-empty UTF-8 message is normalized
-    for in-process diagnostics but omitted from safe JSON persistence. *)
+  kind:dispatch_failure_kind ->
+  message:string ->
+  ?event_trace:Workflow_event.trace ->
+  unit ->
+  (error, string) result
+(** Construct a failure known to precede backend invocation. A supplied trace
+    must contain no nonzero attempt evidence and must terminate as failed. The
+    non-empty UTF-8 message is normalized for in-process diagnostics but omitted
+    from safe JSON persistence. *)
 
 val redacted_dispatch_error : dispatch_failure_kind -> error
 (** Construct a total, message-free dispatch error for adapter fallback paths
     that have no safe diagnostic. The in-process message is the fixed string
     [details unavailable]. *)
 
+val make_no_completed_attempt_error :
+  status:status ->
+  invocation_may_have_started:bool ->
+  message:string ->
+  ?event_trace:Workflow_event.trace ->
+  unit ->
+  (error, string) result
+(** Construct an outcome for which no complete backend result exists. [status]
+    must be [Failed _], [Timed_out], or [Cancelled].
+    [invocation_may_have_started] explicitly distinguishes uncertain/in-flight
+    progress from a caller that knows dispatch did not begin; pure registry,
+    capability, and preflight failures should normally use
+    {!make_dispatch_error}. A supplied trace must terminate with [status]; when
+    invocation is definitely absent, it must contain no nonzero attempt
+    evidence. No attempt is synthesized. Diagnostics are omitted from safe JSON.
+*)
+
 val make_post_execution_dispatch_error :
   cause:dispatch_failure_kind ->
   message:string ->
   response:response ->
+  outer_event_trace:Workflow_event.trace ->
   unit ->
   (error, string) result
 (** Construct a dispatch-layer failure that occurred after at least one backend
     attempt completed. Any coherent non-empty {!response} is accepted, including
     success, backend failure, timeout, cancellation, and schema rejection; the
     constructor never rewrites its status or fabricates telemetry. [cause] is a
-    fixed host-neutral category. The non-empty UTF-8 diagnostic remains
-    in-process and is omitted from safe JSON persistence. *)
+    fixed host-neutral category. [outer_event_trace] is retained separately from
+    the completed response, must terminate as failed, and is cross-checked
+    against response attempts without requiring its elapsed time or terminal to
+    equal the nested completed execution. Thus a successful nested transport can
+    coexist with a failed outer cleanup/dispatch terminal without weakening
+    ordinary {!make_response} trace fusion. The non-empty UTF-8 diagnostic
+    remains in-process and is omitted from safe JSON persistence. *)
 
 val make_execution_error :
   kind:execution_failure_kind ->
@@ -411,8 +456,10 @@ val make_execution_error :
   unit ->
   (error, string) result
 (** Construct a post-invocation failure retaining its full normalized response.
-    The failure kind must agree with the response. Native/backend/contract
-    failures retain a failed attempt. [Schema_retry_failed] requires exactly two
+    The failure kind must agree with the response. Native backend failures with
+    a schema in force, generic backend failures, and contract failures retain a
+    failed attempt; the native category does not claim schema causality.
+    [Schema_retry_failed] requires exactly two
     attempts: an initial schema-rejected transport success followed by a fresh
     or resumed corrective attempt. That corrective attempt may itself be
     schema-rejected after transport success, fail at transport/backend level,
@@ -431,6 +478,8 @@ val response_to_yojson : response -> Yojson.Safe.t
 
 val error_to_yojson : error -> Yojson.Safe.t
 (** Stable redacted JSON persistence projection with schema version
-    [cwr.agent-execution.error/v1]. Diagnostics are omitted. Post-execution
-    dispatch failures retain only their fixed cause plus the safe response;
-    execution failures likewise embed the safe response and retain attempts. *)
+    [cwr.agent-execution.error/v1]. Diagnostics are omitted. No-completed-attempt
+    outcomes retain only status, invocation uncertainty, and an optional safe
+    trace. Post-execution dispatch failures retain their fixed cause, safe
+    response, and separate safe outer trace; execution failures likewise embed
+    the safe response and retain attempts. *)

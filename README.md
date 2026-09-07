@@ -95,8 +95,13 @@ changing the workflow format or wiring it into `Engine.run`:
   beyond the documented one-sided tolerance. Schema-retry failures retain exactly the
   initial schema rejection and one fresh/resumed corrective attempt, including failed,
   timed-out, or cancelled corrective transports. Dispatch failures before execution,
-  post-execution dispatch failures retaining any coherent non-empty response, and
-  execution failures remain distinct typed shapes.
+  no-completed-attempt outcomes with explicit invocation uncertainty,
+  post-execution dispatch failures retaining any coherent non-empty response plus a
+  separate outer failed trace, and execution failures remain distinct typed shapes. A
+  successful completed transport therefore stays successful when later sealed-input
+  cleanup fails; its attempts/session/metrics/cleanup status are not rewritten to fit the
+  outer terminal. Native backend failure while a schema is in force is named neutrally
+  and does not claim that schema validation caused the failure.
 - `Workflow_event` is a typed, bounded agent-completion lifecycle trace, distinct from
   the deterministic engine's `Types.trace` and ledger. It cannot represent raw
   protocol lines, prompts, attachment paths/digests/bytes, argv, stdout/stderr, tool
@@ -122,7 +127,8 @@ separators, and delimiters without constructing unbounded attacker-controlled di
 paths. Canonical output is serialized into a buffer sized from that successful preflight;
 trace and response projections are likewise rejected from exact pre-serialization size.
 Public constants cap JSON depth, nodes/bytes, public attempt text, attempt count,
-restricted domains, canonical output, and serialized trace/response/error projections.
+restricted domains, canonical output, and serialized trace/response/error projections;
+the error bound includes a separately retained outer trace.
 See the [rich execution migration
 notes](docs/rich-agent-execution-migration.md) for adoption details and the exhaustive
 mapping from Cabal's current `Backend_completer.make_rich` outcomes.

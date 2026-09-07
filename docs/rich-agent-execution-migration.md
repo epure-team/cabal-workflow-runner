@@ -13,6 +13,19 @@ Callers adopting the new API must observe these fail-closed boundaries:
   corrective attempt. The corrective attempt may be another schema rejection,
   a backend failure (including resume rejection), a timeout, or cancellation;
   preserve that final transport status on the response.
+- Use `Native_backend_failure_with_schema` when a native-schema backend fails.
+  The name records only that a schema was in force; it does not claim the schema
+  caused the backend failure.
+- Keep a completed response independent from a later dispatch/cleanup failure's
+  outer event trace. `Post_execution_dispatch_failed` stores both. Its outer
+  trace terminates as failed while a nested completed response may remain
+  successful; do not attach that outer trace to `make_response` or rewrite the
+  successful attempt.
+- Use `No_completed_attempt` when no complete backend result exists and dispatch
+  may already have begun. Preserve its failed/timed-out/cancelled status,
+  explicit invocation uncertainty, and optional normalized trace without
+  inventing an attempt. Registry, capability, quarantine, and preflight errors
+  known to occur before invocation remain `Dispatch_failure`.
 - Treat `Workflow_event.make_trace` as a lifecycle validator, not only an order
   check. Retained events may be an omitted prefix/subsequence, but visible
   lifecycle contradictions are rejected. `Workflow_event.trace` is agent-call
@@ -62,53 +75,85 @@ not add a live event stream or wire the rich runtime into `Engine.run`.
 This table records the integration contract inspected in Cabal's current
 `Backend_completer.make_rich`, `Runtime_dispatch.detailed_error`, and
 `Backend_types.task_execution_error`. It is a bridge specification, not a Cabal
-dependency in this library.
+dependency in this library. Every row preserves Cabal's normalized outer trace;
+private/raw fields outside CWR's safe contract remain deliberately
+unrepresentable rather than being described as preserved.
 
 | Cabal `make_rich` outcome | Host-neutral CWR shape |
 |---|---|
 | Constructor `Error _` (the routing id is malformed) | `Dispatch_error Invalid_request` |
-| Callback `Ok { execution; event_trace; _ }` with one or more completed attempts | `Ok response`, preserving every attempt, final status, cleanup state, and mapped trace |
-| Callback `Ok` with zero completed attempts and final `Timeout` or `Cancelled` | Genuine bridge gap listed below; do not synthesize an attempt or claim that dispatch did not occur |
-| Callback `Error { cause = Dispatch_failure failure; _ }` where `failure` proves a pre-invocation failure | `Dispatch_error (map_dispatch_cause failure)` |
-| Callback `Error { cause = Dispatch_failure Backend_execution_failed; _ }` | Genuine bridge gap when no completed result exists: this cause does not reveal whether invocation began |
-| Callback `Error { cause = Dispatch_failure_with_execution { failure; execution }; _ }` | `Post_execution_dispatch_failed` built with `map_dispatch_cause failure` and the non-empty mapped response, regardless of whether its final status is success, failure, timeout, cancellation, or schema rejection |
-| Callback `Error { cause = Execution_failure (Native_backend_failure_with_schema { execution; _ }); _ }` | `Execution_failure Native_schema_rejection` with the mapped response |
-| Callback `Error { cause = Execution_failure (Schema_retry_failed { execution; _ }); _ }` | `Execution_failure Schema_retry_failed` with both mapped attempts |
+| Constructor `Ok rich_completer` | Preserve the callback; construction performs no dispatch |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Success` | `Ok response` with status `Success` and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Failed message` | `Ok response` with the same failed status/attempt diagnostic in process and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Timeout` | `Ok response` with status `Timed_out` and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Cancelled` | `Ok response` with status `Cancelled` and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, zero attempts, final `Timeout` | `No_completed_attempt { status = Timed_out; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
+| Callback `Ok { execution; event_trace; _ }`, zero attempts, final `Cancelled` | `No_completed_attempt { status = Cancelled; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
+| Callback `Error { cause = Dispatch_failure failure; event_trace }` | Use the exhaustive cause table below; preserve `event_trace` on the selected error shape |
+| Callback `Error { cause = Dispatch_failure_with_execution { failure; execution }; event_trace }` | `Post_execution_dispatch_failed` with `map_dispatch_cause failure`, the coherent non-empty response built from `execution` without attaching the outer trace, and `outer_event_trace = mapped_trace`. Preserve actual attempts/status/session/metrics/`Cleanup_failed`; the outer failed terminal remains separate |
+| Callback `Error { cause = Execution_failure (Native_backend_failure_with_schema { execution; _ }); event_trace }` | `Execution_failure Native_backend_failure_with_schema` with the mapped non-empty response and trace; this makes no schema-causality claim |
+| Callback `Error { cause = Execution_failure (Schema_retry_failed { execution; attempt_2_failure; _ }); event_trace }` | `Execution_failure Schema_retry_failed` with both mapped attempts, unchanged final status, and trace; `attempt_2_failure` maps as detailed below |
+
+The nested retry-failure algebra maps without rewriting attempt status:
+
+| Cabal `attempt_2_failure` | CWR evidence |
+|---|---|
+| `Schema_validation_failure error` | Corrective attempt remains transport `Success`, carries `schema_error`, and the outer response is `Failed _` |
+| `Transport_failure (Failed message)` | Corrective attempt and response remain `Failed message` |
+| `Transport_failure Timeout` | Corrective attempt and response remain `Timed_out` |
+| `Transport_failure Cancelled` | Corrective attempt and response remain `Cancelled` |
+| `Transport_failure Success` | Rejected as incoherent rather than rewritten |
+| `Resume_failure (Failed message)` | Corrective attempt remains `Resumed_attempt` with `Failed message` |
+| `Resume_failure Timeout` | Corrective attempt remains `Resumed_attempt` with `Timed_out` |
+| `Resume_failure Cancelled` | Corrective attempt remains `Resumed_attempt` with `Cancelled` |
+| `Resume_failure Success` | Rejected as incoherent rather than rewritten |
+
+The fixed host-neutral `Schema_retry_failed` category deliberately does not
+expose Cabal's backend-specific distinction between a recognized resume rejection
+and another failed resumed transport. It nevertheless preserves the resumed
+attempt kind and actual result status; the table does not claim to retain the
+discarded backend-specific label.
 
 Use Cabal's sanitized `render_rich_completion_error` output only as the
-in-process diagnostic. Safe CWR projection omits it. The fixed dispatch-cause
-mapping is exhaustive for the current `Runtime_dispatch.error` algebra:
+in-process diagnostic. Safe CWR projection omits it. The dispatch-cause mapping
+is exhaustive for the current `Runtime_dispatch.error` algebra:
 
-| Cabal dispatch cause | CWR `dispatch_failure_kind` |
-|---|---|
-| `Invalid_timeout` | `Invalid_request` |
-| `Backend_not_registered` | `Backend_unavailable` |
-| `Runtime_registration_untrusted` | `Capability_mismatch` |
-| `Backend_quarantined _` | `Capability_mismatch` |
-| `Preflight_failed _` | `Preflight_failed` |
-| `Backend_version_unsupported` | `Capability_mismatch` |
-| `Version_check_failed` | `Internal_dispatch_failure` |
-| `Backend_unavailable` | `Backend_unavailable` |
-| `Availability_check_failed` | `Internal_dispatch_failure` |
-| `Prepared_already_consumed` | `Internal_dispatch_failure` |
-| `Backend_execution_failed` | `Internal_dispatch_failure` once a response exists; without one, see the bridge gap below |
-| `Schema_enforcement_failed _` | `Internal_dispatch_failure`; the current detailed `make_rich` path does not emit this compatibility-only projection and instead exposes structured schema errors as `Execution_failure` |
+| Cabal dispatch cause | Invocation knowledge | CWR error shape |
+|---|---|---|
+| `Invalid_timeout` | Definitely not invoked | `Dispatch_failure Invalid_request` |
+| `Backend_not_registered` | Definitely not invoked | `Dispatch_failure Backend_unavailable` |
+| `Runtime_registration_untrusted` | Definitely not invoked | `Dispatch_failure Capability_mismatch` |
+| `Backend_quarantined _` | Definitely not invoked | `Dispatch_failure Capability_mismatch` |
+| `Preflight_failed _` | Definitely not invoked when carried by plain `Dispatch_failure`; post-execution cleanup uses `Dispatch_failure_with_execution` | `Dispatch_failure Preflight_failed`, or the post-execution shape in the table above |
+| `Backend_version_unsupported` | Definitely not invoked | `Dispatch_failure Capability_mismatch` |
+| `Version_check_failed` | Definitely not invoked | `Dispatch_failure Internal_dispatch_failure` |
+| `Backend_unavailable` | Definitely not invoked | `Dispatch_failure Backend_unavailable` |
+| `Availability_check_failed` | Definitely not invoked | `Dispatch_failure Internal_dispatch_failure` |
+| `Prepared_already_consumed` | Definitely not invoked by this call | `Dispatch_failure Internal_dispatch_failure` |
+| `Backend_execution_failed` in plain `Dispatch_failure` | May have started, no completed result | `No_completed_attempt { status = Failed _; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
+| `Backend_execution_failed` in `Dispatch_failure_with_execution` | Completed progress exists | `Post_execution_dispatch_failed` with cause `Internal_dispatch_failure`, response, and separate outer trace |
+| `Schema_enforcement_failed _` | The current detailed `make_rich` path does not emit this compatibility projection; structured cases are `Execution_failure` | If received defensively, `No_completed_attempt { status = Failed _; invocation_may_have_started = true; event_trace = Some mapped_trace }`; never claim pre-invocation |
 
-Straightforward field conversions are not bridge gaps: Cabal attempt kinds,
-statuses, token counts, delivery modes, media references, web levels, cleanup
-states, sessions, and normalized events all have conservative CWR projections.
-Opaque retry reasons map to `Other_redacted`, process-exit text that cannot be
-classified maps to `Unknown`, and process ids are discarded.
+Attempt kinds, result statuses, token counts, delivery modes, media counts, web
+levels, cleanup states, sessions, and normalized events have direct conservative
+projections. Opaque retry reasons map to `Other_redacted`; process-exit text that
+cannot be classified maps to `Unknown`; process ids and raw process streams are
+deliberately outside the safe host-neutral projection. These are explicit
+redactions, not rewritten telemetry.
 
-The genuine remaining conversion-policy gaps are:
+One conversion policy remains deliberately deferred: Cabal's optional
+`cost_usd : float` cannot be losslessly assigned to CWR's integer micro-USD field
+without a specified finite-range and rounding rule. A future bridge must reject
+non-finite/negative/out-of-range values and apply an approved deterministic
+rounding policy. Until then it must fail conversion rather than silently drop the
+cost, set it to unknown, truncate it, or overflow it. The same rule applies to
+cost carried by normalized usage events.
 
-1. Cabal can return a zero-completed-attempt `Timeout`/`Cancelled`, or a bare
-   `Dispatch_failure Backend_execution_failed`, after an invocation may already
-   have started but before any backend result was committed. CWR intentionally
-   reserves `Dispatch_error` for proven no-invocation failures and requires every
-   `response` to contain complete telemetry for an actual invocation. The Cabal
-   values therefore lack enough evidence to select either shape without
-   fabricating an attempt or making a false pre-dispatch claim.
-2. Cabal reports USD cost as an optional float, while CWR requires integer
-   micro-USD. The future bridge must adopt a checked finite range and rounding
-   policy rather than silently truncating or overflowing.
+### Pre-release native error rename
+
+The unreleased `Native_schema_rejection` name and
+`"native_schema_rejection"` projection tag were replaced by
+`Native_backend_failure_with_schema` and
+`"native_backend_failure_with_schema"`. Exhaustive adopters of the pre-release
+API must rename that match arm. No compatibility alias is kept because it would
+continue to expose the incorrect schema-causality claim.
