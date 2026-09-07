@@ -33,6 +33,7 @@ let validate_with ~restricted json =
     | `Float _ when restricted -> Error (path ^ ": floats are not canonical; use an integer")
     | `Intlit _ when restricted -> Error (path ^ ": integer literals outside native range are not canonical")
     | `Float _ | `Intlit _ -> Ok ()
+    | `Tuple _ | `Variant _ -> Error (path ^ ": non-standard JSON value")
   in
   go "$" json
 
@@ -44,6 +45,7 @@ let rec normalize = function
       `Assoc (fields |> List.map (fun (k, v) -> k, normalize v)
               |> List.sort (fun (a, _) (b, _) -> String.compare a b))
   | `List values -> `List (List.map normalize values)
+  | (`Tuple _ | `Variant _) as value -> value
   | value -> value
 
 let to_string json =

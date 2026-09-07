@@ -41,6 +41,7 @@ let rec value_of_json (j : Yojson.Safe.t) : value =
   | `String s -> String s
   | `List l -> List (List.map value_of_json l)
   | `Assoc _ -> Null (* objects are not comparable scalars; treat as Null *)
+  | `Tuple _ | `Variant _ -> Null
 
 (* ---- path resolution (total) ------------------------------------------- *)
 
