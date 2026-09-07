@@ -57,7 +57,9 @@ behind library-owned contracts such as `Backend.t` or the additive rich `Runtime
 The rich execution DTOs are not part of workflow input: do not wire them into
 `Engine.run`, workflow JSON/schema, or workflow ledgers without a separately reviewed
 compatibility change. Normalized event traces are post-completion values in this batch;
-do not document the API as live streaming.
+do not document the API as live streaming. Keep their opaque-constructor resource bounds,
+event/response cross-validation, and pre-dispatch legacy-adapter rejections covered when
+extending the contract.
 
 ## Safety floor must not regress
 

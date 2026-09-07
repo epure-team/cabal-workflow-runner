@@ -90,6 +90,9 @@ val max_events : int
 val max_text_bytes : int
 (** Maximum UTF-8 byte length of one {!Agent_text_delta}. *)
 
+val max_trace_projection_bytes : int
+(** Maximum byte length guaranteed for a serialized safe trace projection. *)
+
 val make :
   seq:int64 -> attempt:int -> elapsed_s:float -> payload -> (t, string) result
 (** [make ~seq ~attempt ~elapsed_s payload] validates one safe event.
@@ -112,15 +115,23 @@ val payload : t -> payload
 
 type trace
 (** Opaque validated completed trace. A present trace always contains exactly
-    one terminal event and that terminal is last. *)
+    one terminal event and that terminal is last. Retained lifecycle events form
+    a valid subsequence of a complete execution lifecycle. *)
 
 val make_trace : ?omitted_count:int64 -> t list -> (trace, string) result
 (** [make_trace ?omitted_count events] validates a completed trace. Events must
     be non-empty, contain at most {!max_events} entries, have strictly
     increasing sequence numbers, non-decreasing attempt numbers and elapsed
     times, and have exactly one terminal as the final entry. [omitted_count]
-    defaults to zero and must be non-negative. Gaps in sequence numbers are
-    allowed because they may represent bounded delivery omissions. *)
+    defaults to zero and must be non-negative. Gaps in sequence numbers and
+    omitted lifecycle prefixes are allowed: an absent start/completion/process
+    event is treated as unknown, not as proof it did not occur. Visible
+    contradictions are rejected, including repeated starts/finishes, completion
+    before a later start, attempt activity after finish/exit/retry, process
+    termination out of order, a retry kind inconsistent with the next retained
+    attempt start, and pre-dispatch events carrying nonzero attempt numbers. The
+    retained trace must also fit {!max_trace_projection_bytes}, accounting for
+    JSON escaping of public text. *)
 
 val events : trace -> t list
 (** Retained events in chronological order. *)

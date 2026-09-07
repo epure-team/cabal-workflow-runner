@@ -60,6 +60,7 @@ type t = { seq : int64; attempt : int; elapsed_s : float; payload : payload }
 
 let max_events = 256
 let max_text_bytes = 16 * 1024
+let max_trace_projection_bytes = 8 * 1024 * 1024
 
 let finite_nonnegative value =
   match classify_float value with
@@ -178,6 +179,295 @@ let validate_terminal events =
     | last :: _ when is_terminal last -> Ok ()
     | _ -> Error "event trace terminal must be last"
 
+let validate_projection_bound events =
+  let fixed_overhead = (List.length events + 1) * 1024 in
+  let text_bytes =
+    List.fold_left
+      (fun total event ->
+        match event.payload with
+        | Agent_text_delta text ->
+            total + String.length (Yojson.Safe.to_string (`String text))
+        | _ -> total)
+      0 events
+  in
+  if fixed_overhead + text_bytes > max_trace_projection_bytes then
+    Error "event trace exceeds the serialized projection byte limit"
+  else Ok ()
+
+type phase_state = Not_seen | Started | Completed
+
+type attempt_state = {
+  number : int;
+  mutable started_kind : attempt_kind option;
+  mutable activity_seen : bool;
+  mutable finished : attempt_outcome option;
+  mutable retry : retry_kind option;
+  mutable process_started : bool;
+  mutable observation_seen : bool;
+  mutable termination_requested : bool;
+  mutable kill_escalated : bool;
+  mutable process_exited : bool;
+}
+
+let fresh_attempt_state number =
+  {
+    number;
+    started_kind = None;
+    activity_seen = false;
+    finished = None;
+    retry = None;
+    process_started = false;
+    observation_seen = false;
+    termination_requested = false;
+    kill_escalated = false;
+    process_exited = false;
+  }
+
+let retry_attempt_kind = function
+  | Fresh_retry -> Fresh_attempt
+  | Resume_retry -> Resumed_attempt
+
+let validate_phase name state payload =
+  match (payload, !state) with
+  | `Start, Not_seen ->
+      state := Started;
+      Ok ()
+  | `Complete, (Not_seen | Started) ->
+      state := Completed;
+      Ok ()
+  | `Start, Started -> Error (name ^ " started more than once")
+  | `Start, Completed -> Error (name ^ " started after completion")
+  | `Complete, Completed -> Error (name ^ " completed more than once")
+
+let validate_lifecycle events =
+  let task_started = ref false in
+  let backend_selected = ref false in
+  let preflight = ref Not_seen in
+  let version_probe = ref Not_seen in
+  let availability_check = ref Not_seen in
+  let current_attempt = ref None in
+  let expected_attempt_kind = ref None in
+  let seen_any = ref false in
+  let lifecycle_rank = ref (-1) in
+  let advance_lifecycle rank name =
+    if rank < !lifecycle_rank then Error (name ^ " is out of lifecycle order")
+    else (
+      lifecycle_rank := rank;
+      Ok ())
+  in
+  let attempt_state number =
+    match !current_attempt with
+    | Some state when state.number = number -> Ok state
+    | Some state when state.number > number ->
+        Error "event attempts must be non-decreasing"
+    | _ ->
+        (match !expected_attempt_kind with
+        | Some (expected_number, _) when number > expected_number ->
+            expected_attempt_kind := None
+        | _ -> ());
+        let state = fresh_attempt_state number in
+        current_attempt := Some state;
+        Ok state
+  in
+  let require_attempt event =
+    if event.attempt = 0 then
+      Error "attempt lifecycle event requires an attempt"
+    else attempt_state event.attempt
+  in
+  let before_attempt_end state =
+    match (state.finished, state.retry) with
+    | None, None -> Ok ()
+    | Some _, _ -> Error "attempt activity observed after attempt completion"
+    | None, Some _ -> Error "attempt activity observed after retry transition"
+  in
+  let before_process_exit state =
+    if state.process_exited then
+      Error "attempt activity observed after process exit"
+    else before_attempt_end state
+  in
+  let validate_attempt_started state kind =
+    if state.started_kind <> None then Error "attempt started more than once"
+    else if state.activity_seen then
+      Error "attempt start observed after attempt activity"
+    else if state.number = 1 && kind <> Initial_attempt then
+      Error "the first attempt must be initial"
+    else if state.number > 1 && kind = Initial_attempt then
+      Error "only the first attempt may be initial"
+    else
+      match !expected_attempt_kind with
+      | Some (number, expected) when number = state.number && expected <> kind
+        ->
+          Error "retry transition disagrees with the next attempt kind"
+      | _ ->
+          state.started_kind <- Some kind;
+          Ok ()
+  in
+  let validate_attempt_event event =
+    Result.bind (require_attempt event) (fun state ->
+        match event.payload with
+        | Attempt_started kind -> validate_attempt_started state kind
+        | Attempt_finished outcome ->
+            if state.finished <> None then
+              Error "attempt finished more than once"
+            else if state.retry <> None then
+              Error "attempt finished after retry transition"
+            else (
+              state.activity_seen <- true;
+              state.finished <- Some outcome;
+              Ok ())
+        | Retry_transition { kind; reason } ->
+            if state.retry <> None then Error "attempt retried more than once"
+            else if state.number = max_int then
+              Error "attempt number cannot advance"
+            else if
+              reason = Schema_validation
+              &&
+              match state.finished with
+              | Some outcome -> outcome <> Attempt_succeeded
+              | None -> false
+            then
+              Error
+                "schema-validation retry requires a successful transport \
+                 attempt"
+            else (
+              state.activity_seen <- true;
+              state.retry <- Some kind;
+              expected_attempt_kind :=
+                Some (state.number + 1, retry_attempt_kind kind);
+              Ok ())
+        | Process_started ->
+            if state.process_started then Error "process started more than once"
+            else if
+              state.termination_requested || state.kill_escalated
+              || state.process_exited || state.observation_seen
+            then Error "process started after process termination"
+            else
+              Result.map
+                (fun () ->
+                  state.activity_seen <- true;
+                  state.process_started <- true)
+                (before_attempt_end state)
+        | Process_termination_requested ->
+            if state.termination_requested then
+              Error "process termination requested more than once"
+            else if state.kill_escalated || state.process_exited then
+              Error "process termination requested after escalation or exit"
+            else
+              Result.map
+                (fun () ->
+                  state.activity_seen <- true;
+                  state.termination_requested <- true)
+                (before_attempt_end state)
+        | Process_kill_escalated ->
+            if state.kill_escalated then
+              Error "process kill escalated more than once"
+            else if state.process_exited then
+              Error "process kill escalated after exit"
+            else
+              Result.map
+                (fun () ->
+                  state.activity_seen <- true;
+                  state.kill_escalated <- true)
+                (before_attempt_end state)
+        | Process_exited _ ->
+            if state.process_exited then Error "process exited more than once"
+            else
+              Result.map
+                (fun () ->
+                  state.activity_seen <- true;
+                  state.process_exited <- true)
+                (before_attempt_end state)
+        | Session_id _ | Agent_text_delta _ | Tool_started _ | Tool_finished _
+        | Usage_observed _ ->
+            Result.map
+              (fun () ->
+                state.activity_seen <- true;
+                state.observation_seen <- true)
+              (before_process_exit state)
+        | Delivery_truncated _ | Opaque_backend_observation -> Ok ()
+        | Task_started | Backend_selected _ | Preflight_started
+        | Preflight_completed | Version_probe_started | Version_probe_completed
+        | Availability_check_started | Availability_check_completed | Terminal _
+          ->
+            Ok ())
+  in
+  let validate_event event =
+    let result =
+      match event.payload with
+      | Task_started ->
+          if event.attempt <> 0 then Error "task start must precede attempts"
+          else if !task_started then Error "task started more than once"
+          else if !seen_any then
+            Error "task start must be the first retained event"
+          else (
+            task_started := true;
+            advance_lifecycle 0 "task start")
+      | Backend_selected _ ->
+          if event.attempt <> 0 then
+            Error "backend selection must precede attempts"
+          else if !backend_selected then Error "backend selected more than once"
+          else (
+            backend_selected := true;
+            advance_lifecycle 1 "backend selection")
+      | Preflight_started ->
+          if event.attempt <> 0 then Error "preflight must precede attempts"
+          else
+            Result.bind (advance_lifecycle 2 "preflight start") (fun () ->
+                validate_phase "preflight" preflight `Start)
+      | Preflight_completed ->
+          if event.attempt <> 0 then Error "preflight must precede attempts"
+          else
+            Result.bind (advance_lifecycle 3 "preflight completion") (fun () ->
+                validate_phase "preflight" preflight `Complete)
+      | Version_probe_started ->
+          if event.attempt <> 0 then Error "version probe must precede attempts"
+          else
+            Result.bind (advance_lifecycle 4 "version probe start") (fun () ->
+                validate_phase "version probe" version_probe `Start)
+      | Version_probe_completed ->
+          if event.attempt <> 0 then Error "version probe must precede attempts"
+          else
+            Result.bind (advance_lifecycle 5 "version probe completion")
+              (fun () -> validate_phase "version probe" version_probe `Complete)
+      | Availability_check_started ->
+          if event.attempt <> 0 then
+            Error "availability check must precede attempts"
+          else
+            Result.bind (advance_lifecycle 6 "availability check start")
+              (fun () ->
+                validate_phase "availability check" availability_check `Start)
+      | Availability_check_completed ->
+          if event.attempt <> 0 then
+            Error "availability check must precede attempts"
+          else
+            Result.bind (advance_lifecycle 7 "availability check completion")
+              (fun () ->
+                validate_phase "availability check" availability_check `Complete)
+      | Terminal _ ->
+          Result.bind (advance_lifecycle 9 "terminal event") (fun () ->
+              match !current_attempt with
+              | Some state
+                when state.number = event.attempt && state.retry <> None ->
+                  Error
+                    "terminal event cannot end an attempt with a pending retry"
+              | _ -> Ok ())
+      | Attempt_started _ | Attempt_finished _ | Retry_transition _
+      | Process_started | Process_termination_requested | Process_kill_escalated
+      | Process_exited _ | Session_id _ | Agent_text_delta _ | Tool_started _
+      | Tool_finished _ | Usage_observed _ ->
+          Result.bind (advance_lifecycle 8 "attempt event") (fun () ->
+              validate_attempt_event event)
+      | Delivery_truncated _ | Opaque_backend_observation -> Ok ()
+    in
+    seen_any := true;
+    result
+  in
+  let rec loop = function
+    | [] -> Ok ()
+    | event :: rest -> Result.bind (validate_event event) (fun () -> loop rest)
+  in
+  loop events
+
 let make_trace ?(omitted_count = 0L) events =
   if Int64.compare omitted_count 0L < 0 then
     Error "omitted event count must be non-negative"
@@ -186,9 +476,11 @@ let make_trace ?(omitted_count = 0L) events =
     Error "event trace exceeds the retained event limit"
   else
     Result.bind (validate_order events) (fun () ->
-        Result.map
-          (fun () -> { events; omitted_count })
-          (validate_terminal events))
+        Result.bind (validate_terminal events) (fun () ->
+            Result.bind (validate_lifecycle events) (fun () ->
+                Result.map
+                  (fun () -> { events; omitted_count })
+                  (validate_projection_bound events))))
 
 let events trace = trace.events
 let omitted_count trace = trace.omitted_count

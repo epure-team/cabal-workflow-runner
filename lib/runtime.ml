@@ -67,7 +67,8 @@ let legacy_capabilities =
   make_capabilities ~read_only:true ~routing:true ~model_selection:true ()
 
 let unsupported_legacy_request request =
-  Option.is_some (Agent_execution.json_schema request)
+  Option.is_none (Agent_execution.read_only request)
+  || Option.is_some (Agent_execution.json_schema request)
   || Option.is_some (Agent_execution.resume_session request)
   || Agent_execution.attachments request <> []
   || Agent_execution.web_level (Agent_execution.web_policy request)
@@ -122,6 +123,7 @@ let make_legacy_response ~elapsed_s ~status ~structured_json =
       | Ok attempt -> (
           match
             Agent_execution.make_response ~attempts:[ attempt ]
+              ~status:(Agent_execution.attempt_status attempt)
               ~total_elapsed_s:elapsed_s
               ~cleanup_status:Agent_execution.Cleanup_not_required ()
           with
@@ -149,23 +151,25 @@ let of_legacy_backend ?(now = Unix.gettimeofday) backend =
       | Ok error -> Error error
       | Error _ -> Error (internal_dispatch_error ())
     else
-      let started = now () in
-      let success, structured_json =
-        backend.Backend.run_agent
-          ~id:(Agent_execution.id request)
-          ~prompt:(compose_legacy_prompt request)
-          ~read_only:
-            (Option.value ~default:false (Agent_execution.read_only request))
-          ~agent_type:(Agent_execution.routing request)
-          ~model:(Agent_execution.model request)
-          ~output_schema:None
-      in
-      let elapsed_s = safe_elapsed ~started ~finished:(now ()) in
-      let status =
-        if success then Agent_execution.Success
-        else Agent_execution.Failed "legacy backend reported failure"
-      in
-      make_legacy_response ~elapsed_s ~status ~structured_json
+      match Agent_execution.read_only request with
+      | None -> Error (internal_dispatch_error ())
+      | Some read_only ->
+          let started = now () in
+          let success, structured_json =
+            backend.Backend.run_agent
+              ~id:(Agent_execution.id request)
+              ~prompt:(compose_legacy_prompt request)
+              ~read_only
+              ~agent_type:(Agent_execution.routing request)
+              ~model:(Agent_execution.model request)
+              ~output_schema:None
+          in
+          let elapsed_s = safe_elapsed ~started ~finished:(now ()) in
+          let status =
+            if success then Agent_execution.Success
+            else Agent_execution.Failed "legacy backend reported failure"
+          in
+          make_legacy_response ~elapsed_s ~status ~structured_json
   in
   {
     identity = Some "legacy-backend";

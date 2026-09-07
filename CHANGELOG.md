@@ -18,6 +18,20 @@ This is not integrated into the deterministic engine. `Backend.t`, `Backend.stub
 encodings. `Runtime.of_legacy_backend` provides an explicit one-attempt adapter without
 inferring session IDs from model JSON. The library still has no Cabal dependency.
 
+**Rich-contract review closure.** Response status is now explicit and validated against
+the final transport attempt, schema-validation outcome, normalized event terminal,
+attempt kinds/outcomes/durations, sessions, metrics, and total elapsed time. Execution
+error kinds reject incoherent successful/timeout/cancelled telemetry. Event traces now
+enforce phase, attempt/retry, and process lifecycle order while treating absent retained
+events conservatively as an unknown prefix/subsequence. JSON traversal is iterative and
+bounded by depth/node/serialized-byte limits; attempt text/count and trace/response/error
+projections are bounded as well.
+
+The legacy adapter no longer weakens unspecified read-only intent to `false`: `None` and
+each unrepresentable rich field are rejected before any callback, while explicit
+`true`/`false`, routing, and model values are forwarded exactly. Migration details are in
+`docs/rich-agent-execution-migration.md`.
+
 **Yojson 2.2 compatibility.** Canonical JSON validation now rejects Yojson's
 non-standard `Tuple`/`Variant` values explicitly and expression projection treats them
 as non-comparable, restoring exhaustive compilation without changing standard workflow

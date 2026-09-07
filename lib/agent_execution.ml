@@ -111,10 +111,14 @@ let valid_domain domain =
   && String.length domain <= 253
   && List.for_all valid_domain_label (String.split_on_char '.' domain)
 
+let max_restricted_domains = 128
+
 let make_restricted_web_policy ~level ~domains () =
   if level = Web_disabled then
     Error "disabled web access cannot have restricted domains"
   else if domains = [] then Error "restricted web domains must not be empty"
+  else if List.length domains > max_restricted_domains then
+    Error "restricted web domain limit exceeded"
   else if not (List.for_all valid_domain domains) then
     Error "restricted web domain is invalid"
   else if
@@ -145,45 +149,23 @@ let finite value =
   | FP_normal | FP_subnormal | FP_zero -> true
   | FP_infinite | FP_nan -> false
 
-let valid_json_integer_literal literal =
-  let length = String.length literal in
-  let first_digit = if length > 0 && literal.[0] = '-' then 1 else 0 in
-  if first_digit = length then false
-  else
-    let digit_count = length - first_digit in
-    (digit_count = 1 || literal.[first_digit] <> '0')
-    &&
-    let rec all_digits index =
-      index = length
-      ||
-      match literal.[index] with
-      | '0' .. '9' -> all_digits (index + 1)
-      | _ -> false
-    in
-    all_digits first_digit
+let max_json_depth = 64
+let max_json_nodes = 10_000
+let max_json_bytes = 1024 * 1024
+let max_public_text_bytes = 256 * 1024
+let max_attempts = 8
+let max_response_projection_bytes = 24 * 1024 * 1024
+let max_error_projection_bytes = max_response_projection_bytes + 1024
 
 let validate_standard_json json =
-  let rec validate = function
-    | `Null | `Bool _ | `Int _ -> true
-    | `Intlit literal -> valid_json_integer_literal literal
-    | `Float value -> finite value
-    | `String value -> String.is_valid_utf_8 value
-    | `List values -> List.for_all validate values
-    | `Assoc fields ->
-        let keys = List.map fst fields in
-        List.for_all
-          (fun (key, value) -> String.is_valid_utf_8 key && validate value)
-          fields
-        && List.length keys = List.length (List.sort_uniq String.compare keys)
-    | `Tuple _ | `Variant _ -> false
-  in
-  validate json
+  Canonical_json.validate_standard ~max_depth:max_json_depth
+    ~max_nodes:max_json_nodes ~max_bytes:max_json_bytes json
 
 let validate_json_schema = function
   | (`Assoc _ | `Bool _) as schema -> validate_standard_json schema
   | `Null | `Int _ | `Intlit _ | `Float _ | `String _ | `List _ | `Tuple _
   | `Variant _ ->
-      false
+      Error "JSON Schema root must be an object or boolean"
 
 let valid_hint value =
   value <> ""
@@ -195,6 +177,10 @@ let valid_hint value =
 let validate_optional condition error = function
   | Some value when not (condition value) -> Error error
   | _ -> Ok ()
+
+let validate_optional_result validate = function
+  | None -> Ok ()
+  | Some value -> validate value
 
 let attachment_ids_unique attachments =
   let ids = List.map attachment_id attachments in
@@ -209,9 +195,8 @@ let make_request ~id ~system_prompt ~user_prompt ~timeout_s ?json_schema
   else if not (finite timeout_s && timeout_s > 0.0) then
     Error "request timeout must be finite and positive"
   else
-    Result.bind
-      (validate_optional validate_json_schema "JSON Schema is invalid"
-         json_schema) (fun () ->
+    Result.bind (validate_optional_result validate_json_schema json_schema)
+      (fun () ->
         Result.bind
           (validate_optional safe_identifier "resume session is invalid"
              resume_session) (fun () ->
@@ -347,11 +332,12 @@ let make_attempt ~number ~kind ~status ~elapsed_s ~delivery ?schema_error
                  session_id) (fun () ->
                 let text = normalize_line_endings text in
                 if not (valid_text text) then Error "attempt text is invalid"
+                else if String.length text > max_public_text_bytes then
+                  Error "attempt text exceeds the public output byte limit"
                 else
                   Result.bind
-                    (validate_optional validate_standard_json
-                       "attempt structured JSON is invalid" structured_json)
-                    (fun () ->
+                    (validate_optional_result validate_standard_json
+                       structured_json) (fun () ->
                       Ok
                         {
                           number;
@@ -386,6 +372,7 @@ type cleanup_status =
 
 type response = {
   attempts : attempt list;
+  status : status;
   final_attempt : attempt;
   total_elapsed_s : float;
   total_usage : Execution_metrics.usage option;
@@ -409,44 +396,219 @@ let validate_attempt_order attempts =
   in
   loop 1 attempts
 
-let make_response ~attempts ~total_elapsed_s ~cleanup_status ?event_trace () =
+let same_usage left right =
+  Execution_metrics.input_tokens left = Execution_metrics.input_tokens right
+  && Execution_metrics.output_tokens left
+     = Execution_metrics.output_tokens right
+  && Execution_metrics.cache_creation_tokens left
+     = Execution_metrics.cache_creation_tokens right
+  && Execution_metrics.cache_read_tokens left
+     = Execution_metrics.cache_read_tokens right
+
+let same_cost left right =
+  Execution_metrics.usd_micros left = Execution_metrics.usd_micros right
+
+let observed_matches equal observed retained =
+  match observed with
+  | None -> true
+  | Some observed -> (
+      match retained with
+      | Some retained -> equal observed retained
+      | None -> false)
+
+let outcome_matches_status outcome status =
+  match (outcome, status) with
+  | Workflow_event.Attempt_succeeded, Success
+  | Attempt_failed, Failed _
+  | Attempt_timed_out, Timed_out
+  | Attempt_cancelled, Cancelled ->
+      true
+  | Attempt_succeeded, (Failed _ | Timed_out | Cancelled)
+  | Attempt_failed, (Success | Timed_out | Cancelled)
+  | Attempt_timed_out, (Success | Failed _ | Cancelled)
+  | Attempt_cancelled, (Success | Failed _ | Timed_out) ->
+      false
+
+let terminal_matches_status terminal status =
+  match (terminal, status) with
+  | Workflow_event.Succeeded, Success
+  | Failed, Failed _
+  | Timed_out, Timed_out
+  | Cancelled, Cancelled ->
+      true
+  | Succeeded, (Failed _ | Timed_out | Cancelled)
+  | Failed, (Success | Timed_out | Cancelled)
+  | Timed_out, (Success | Failed _ | Cancelled)
+  | Cancelled, (Success | Failed _ | Timed_out) ->
+      false
+
+let find_attempt attempts number =
+  List.find_opt (fun attempt -> attempt.number = number) attempts
+
+let close_float left right = Float.abs (left -. right) <= 1e-9
+
+let validate_trace ~attempts ~status ~total_elapsed_s trace =
+  let starts = Hashtbl.create (List.length attempts) in
+  match List.rev attempts with
+  | [] -> Error "event trace requires a response attempt"
+  | final_attempt :: _ ->
+      let validate_event event =
+        if Workflow_event.elapsed_s event > total_elapsed_s then
+          Error "event trace exceeds the response elapsed time"
+        else
+          match Workflow_event.payload event with
+          | Workflow_event.Terminal terminal ->
+              if Workflow_event.attempt event <> final_attempt.number then
+                Error "event terminal disagrees with the final attempt"
+              else if not (terminal_matches_status terminal status) then
+                Error "event terminal disagrees with the response status"
+              else Ok ()
+          | payload when Workflow_event.attempt event = 0 -> (
+              match payload with
+              | Workflow_event.Task_started | Backend_selected _
+              | Preflight_started | Preflight_completed | Version_probe_started
+              | Version_probe_completed | Availability_check_started
+              | Availability_check_completed | Delivery_truncated _
+              | Opaque_backend_observation ->
+                  Ok ()
+              | Attempt_started _ | Attempt_finished _ | Retry_transition _
+              | Process_started | Process_termination_requested
+              | Process_kill_escalated | Process_exited _ | Session_id _
+              | Agent_text_delta _ | Tool_started _ | Tool_finished _
+              | Usage_observed _ | Terminal _ ->
+                  Error "attempt event has no matching response attempt")
+          | payload -> (
+              match find_attempt attempts (Workflow_event.attempt event) with
+              | None -> Error "event refers to an unknown response attempt"
+              | Some attempt -> (
+                  match payload with
+                  | Workflow_event.Attempt_started kind ->
+                      if kind <> attempt.kind then
+                        Error
+                          "event attempt kind disagrees with response telemetry"
+                      else (
+                        Hashtbl.replace starts attempt.number
+                          (Workflow_event.elapsed_s event);
+                        Ok ())
+                  | Attempt_finished outcome -> (
+                      if not (outcome_matches_status outcome attempt.status)
+                      then
+                        Error
+                          "event attempt outcome disagrees with response \
+                           telemetry"
+                      else
+                        match Hashtbl.find_opt starts attempt.number with
+                        | Some started
+                          when not
+                                 (close_float
+                                    (Workflow_event.elapsed_s event -. started)
+                                    attempt.elapsed_s) ->
+                            Error
+                              "event attempt timing disagrees with response \
+                               telemetry"
+                        | Some _ | None -> Ok ())
+                  | Session_id session_id ->
+                      if attempt.session_id <> Some session_id then
+                        Error "event session disagrees with response telemetry"
+                      else Ok ()
+                  | Usage_observed { usage; cost } ->
+                      if not (observed_matches same_usage usage attempt.usage)
+                      then Error "event usage disagrees with response telemetry"
+                      else if not (observed_matches same_cost cost attempt.cost)
+                      then Error "event cost disagrees with response telemetry"
+                      else Ok ()
+                  | Retry_transition { reason = Schema_validation; _ } ->
+                      if attempt.schema_error = None then
+                        Error
+                          "schema retry event has no matching validation error"
+                      else Ok ()
+                  | Task_started | Backend_selected _ | Preflight_started
+                  | Preflight_completed | Version_probe_started
+                  | Version_probe_completed | Availability_check_started
+                  | Availability_check_completed ->
+                      Error "pre-dispatch event refers to a response attempt"
+                  | Retry_transition _ | Process_started
+                  | Process_termination_requested | Process_kill_escalated
+                  | Process_exited _ | Agent_text_delta _ | Tool_started _
+                  | Tool_finished _ | Delivery_truncated _
+                  | Opaque_backend_observation ->
+                      Ok ()
+                  | Terminal _ -> Error "terminal event validation failed"))
+      in
+      let rec loop = function
+        | [] -> Ok ()
+        | event :: rest ->
+            Result.bind (validate_event event) (fun () -> loop rest)
+      in
+      loop (Workflow_event.events trace)
+
+let validate_response_status status (final_attempt : attempt) =
+  match (final_attempt.status, final_attempt.schema_error, status) with
+  | Success, None, Success -> Ok ()
+  | Failed left, None, Failed right when left = right -> Ok ()
+  | Timed_out, None, Timed_out | Cancelled, None, Cancelled -> Ok ()
+  | Success, Some _, Failed _ -> Ok ()
+  | _ -> Error "response status disagrees with the final attempt"
+
+let durations_fit total_elapsed_s attempts =
+  let rec loop remaining = function
+    | [] -> true
+    | attempt :: rest ->
+        attempt.elapsed_s <= remaining +. 1e-9
+        && loop (remaining -. attempt.elapsed_s) rest
+  in
+  loop total_elapsed_s attempts
+
+let make_response ~attempts ~status ~total_elapsed_s ~cleanup_status
+    ?event_trace () =
   if not (finite total_elapsed_s && total_elapsed_s >= 0.0) then
     Error "response elapsed time must be finite and non-negative"
-  else if
-    List.exists (fun attempt -> attempt.elapsed_s > total_elapsed_s) attempts
-  then Error "response elapsed time cannot be shorter than an attempt"
+  else if List.length attempts > max_attempts then
+    Error "response attempt limit exceeded"
+  else if not (durations_fit total_elapsed_s attempts) then
+    Error "response elapsed time cannot be shorter than its attempts"
   else
     match List.rev attempts with
     | [] -> Error "response must contain at least one attempt"
     | final_attempt :: _ ->
-        Result.map
-          (fun () ->
-            let final_session_id =
-              List.fold_left
-                (fun current attempt ->
-                  match attempt.session_id with
-                  | Some _ as found -> found
-                  | None -> current)
-                None attempts
-            in
-            {
-              attempts;
-              final_attempt;
-              total_elapsed_s;
-              total_usage =
-                Execution_metrics.aggregate_usages
-                  (List.map attempt_usage attempts);
-              total_cost =
-                Execution_metrics.aggregate_costs
-                  (List.map attempt_cost attempts);
-              final_session_id;
-              cleanup_status;
-              event_trace;
-            })
-          (validate_attempt_order attempts)
+        Result.bind (normalize_status status) (fun status ->
+            Result.bind (validate_attempt_order attempts) (fun () ->
+                Result.bind (validate_response_status status final_attempt)
+                  (fun () ->
+                    Result.bind
+                      (match event_trace with
+                      | None -> Ok ()
+                      | Some trace ->
+                          validate_trace ~attempts ~status ~total_elapsed_s
+                            trace)
+                      (fun () ->
+                        let final_session_id =
+                          List.fold_left
+                            (fun current attempt ->
+                              match attempt.session_id with
+                              | Some _ as found -> found
+                              | None -> current)
+                            None attempts
+                        in
+                        Ok
+                          {
+                            attempts;
+                            status;
+                            final_attempt;
+                            total_elapsed_s;
+                            total_usage =
+                              Execution_metrics.aggregate_usages
+                                (List.map attempt_usage attempts);
+                            total_cost =
+                              Execution_metrics.aggregate_costs
+                                (List.map attempt_cost attempts);
+                            final_session_id;
+                            cleanup_status;
+                            event_trace;
+                          }))))
 
 let attempts response = response.attempts
-let final_status response = response.final_attempt.status
+let final_status response = response.status
 let final_text response = response.final_attempt.text
 let final_structured_json response = response.final_attempt.structured_json
 let total_elapsed_s response = response.total_elapsed_s
@@ -495,10 +657,35 @@ let make_dispatch_error ~kind ~message () =
 let redacted_dispatch_error kind =
   Dispatch_error { kind; message = "details unavailable" }
 
+let valid_execution_failure kind response =
+  match
+    ( kind,
+      response.status,
+      response.final_attempt.status,
+      response.final_attempt.schema_error )
+  with
+  | Native_schema_rejection, Failed _, Failed _, None
+  | Backend_execution_failed, Failed _, Failed _, None
+  | Execution_contract_failed, Failed _, Failed _, None ->
+      true
+  | Schema_retry_failed, Failed _, Success, Some _ -> (
+      match List.rev response.attempts with
+      | _final :: earlier ->
+          List.exists (fun attempt -> attempt.schema_error <> None) earlier
+      | [] -> false)
+  | Native_schema_rejection, _, _, _
+  | Schema_retry_failed, _, _, _
+  | Backend_execution_failed, _, _, _
+  | Execution_contract_failed, _, _, _ ->
+      false
+
 let make_execution_error ~kind ~message ~response () =
-  Result.map
-    (fun message -> Execution_error { kind; message; response })
-    (normalize_nonempty_diagnostic "execution diagnostic" message)
+  if not (valid_execution_failure kind response) then
+    Error "execution failure kind disagrees with response telemetry"
+  else
+    Result.map
+      (fun message -> Execution_error { kind; message; response })
+      (normalize_nonempty_diagnostic "execution diagnostic" message)
 
 let error_view = function
   | Dispatch_error { kind; message } -> Dispatch_failure { kind; message }
@@ -593,7 +780,7 @@ let response_to_yojson response =
   `Assoc
     [
       ("schema_version", `String "cwr.agent-execution.response/v1");
-      ("status", `String (string_of_status response.final_attempt.status));
+      ("status", `String (string_of_status response.status));
       ("final_text", `String response.final_attempt.text);
       ( "final_structured_json",
         option_json Fun.id response.final_attempt.structured_json );

@@ -85,16 +85,28 @@ changing the workflow format or wiring it into `Engine.run`:
 - Rich results retain structured status, normalized public text/JSON, every initial/
   fresh/resumed attempt, path-free delivery intent, exact optional usage and integer
   micro-USD cost, aggregate telemetry, final session, cleanup status, and an optional
-  bounded event trace. Dispatch failures before execution are distinct from execution
+  bounded event trace. Response construction cross-validates overall/final status,
+  trace terminal, attempt kinds/outcomes/durations, sessions, metrics, and whole-call
+  elapsed time. Dispatch failures before execution are distinct from coherent execution
   failures that retain attempts.
 - `Workflow_event` is a typed, bounded post-completion trace. It cannot represent raw
   protocol lines, prompts, attachment paths/digests/bytes, argv, stdout/stderr, tool
   arguments, chain-of-thought, or private backend JSON. Unknown observations become a
-  payload-free opaque event. This batch does **not** claim live event streaming.
+  payload-free opaque event. Its lifecycle validator permits omitted prefixes/events but
+  rejects visible phase, attempt, retry, and process-order contradictions. This batch
+  does **not** claim live event streaming.
 - `Runtime` wraps one completion function. `Runtime.of_legacy_backend` adapts the
   unchanged `Backend.t` honestly as one synthetic attempt with unknown usage/cost, no
-  events, no inferred session, and no cleanup requirement. Unsupported rich inputs are
-  rejected before legacy dispatch.
+  events, no inferred session, and no cleanup requirement. It requires explicit
+  read-only intent and rejects schema, resume, attachment, web, and max-turn inputs
+  before legacy dispatch; `true` and `false` read-only values plus routing/model hints
+  are forwarded unchanged.
+
+JSON validation uses bounded iterative traversal. Public constants cap JSON depth,
+nodes/bytes, public attempt text, attempt count, restricted domains, canonical output,
+and serialized trace/response/error projections. See
+[`docs/rich-agent-execution-migration.md`](docs/rich-agent-execution-migration.md) for
+adoption details.
 
 Versioned response/error/event-trace Yojson projections are redacted persistence
 surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`, workflow JSON/schema,

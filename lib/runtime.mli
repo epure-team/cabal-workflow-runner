@@ -83,12 +83,15 @@ val of_legacy_backend : ?now:(unit -> float) -> Backend.t -> t
 
     The adapter combines the separate prompts in a documented system/user
     envelope, forwards id/read-only/routing/model, and calls [run_agent] once.
-    Its synthetic response contains exactly one initial attempt, unknown
-    usage/cost, no event trace, [Cleanup_not_required], and no session id. It
-    never scans or mutates model JSON to infer or inject a session id.
+    Read-only intent must be explicit: both [Some true] and [Some false] are
+    forwarded exactly, while [None] is rejected before dispatch rather than
+    being silently weakened to write-enabled access. Its synthetic response
+    contains exactly one initial attempt, unknown usage/cost, no event trace,
+    [Cleanup_not_required], and no session id. It never scans or mutates model
+    JSON to infer or inject a session id.
 
     Legacy [bool = false] becomes an execution failure retaining that attempt.
-    Schema, resume, attachment, web, and max-turn requests are rejected as
+    Schema, resume, attachment, web, and max-turn requests are each rejected as
     [Unsupported_request] before dispatch because {!Backend.t} cannot carry
     them. The legacy interface also cannot enforce the request timeout; its
     [hard_timeout] capability is therefore false. [now] is an injectable

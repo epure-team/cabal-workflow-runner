@@ -57,12 +57,16 @@ val web_search : web_policy
 val web_search_and_fetch : web_policy
 (** Unrestricted search-and-fetch policy. *)
 
+val max_restricted_domains : int
+(** Maximum number of domains accepted in one restricted web policy. *)
+
 val make_restricted_web_policy :
   level:web_level -> domains:string list -> unit -> (web_policy, string) result
 (** [make_restricted_web_policy ~level ~domains ()] validates a
     domain-restricted policy. [level] must not be [Web_disabled]; domains must
-    be non-empty, canonical lowercase DNS names, and duplicate-free. Diagnostics
-    never quote rejected domains. *)
+    be non-empty, canonical lowercase DNS names, duplicate-free, and contain at
+    most {!max_restricted_domains} entries. Diagnostics never quote rejected
+    domains. *)
 
 val web_level : web_policy -> web_level
 (** Requested hierarchical access level. *)
@@ -72,6 +76,29 @@ val restricted_domains : web_policy -> string list option
 
 type request
 (** Opaque validated rich agent request. *)
+
+val max_json_depth : int
+(** Maximum nesting depth accepted for schema and structured-output JSON. *)
+
+val max_json_nodes : int
+(** Maximum number of JSON values accepted for one schema or structured output.
+*)
+
+val max_json_bytes : int
+(** Maximum serialized byte length of one schema or structured output. *)
+
+val max_public_text_bytes : int
+(** Maximum UTF-8 byte length of one attempt's public final text. *)
+
+val max_attempts : int
+(** Maximum number of complete attempts retained in one response. *)
+
+val max_response_projection_bytes : int
+(** Upper byte bound guaranteed for a serialized safe response projection by the
+    component limits enforced by the opaque constructors. *)
+
+val max_error_projection_bytes : int
+(** Upper byte bound guaranteed for a serialized safe error projection. *)
 
 val make_request :
   id:string ->
@@ -94,8 +121,9 @@ val make_request :
     Defaults are explicit: no schema, no resume session, no attachments,
     {!web_disabled}, no maximum turns, no routing or model hint, and unspecified
     read-only intent. A supplied maximum turn count must be positive. Attachment
-    identifiers must be unique. Construction validates only DTO syntax and does
-    no filesystem, capability, or backend work. *)
+    identifiers must be unique. Schema JSON is constrained by {!max_json_depth},
+    {!max_json_nodes}, and {!max_json_bytes}. Construction validates only DTO
+    syntax and does no filesystem, capability, or backend work. *)
 
 val id : request -> string
 (** Stable request identifier. *)
@@ -191,7 +219,8 @@ val make_attempt :
     finite and non-negative. [schema_error] is accepted only for a transport
     [Success] that was rejected by schema validation. Text line endings are
     normalized to LF. Optional usage/cost/session values remain optional rather
-    than being zero-filled. JSON must be a standard finite JSON value. *)
+    than being zero-filled. Text and structured JSON are bounded by the public
+    limits above; JSON must be a standard finite JSON value. *)
 
 val attempt_number : attempt -> int
 (** One-based invocation number. *)
@@ -238,28 +267,36 @@ type response
 
 val make_response :
   attempts:attempt list ->
+  status:status ->
   total_elapsed_s:float ->
   cleanup_status:cleanup_status ->
   ?event_trace:Workflow_event.trace ->
   unit ->
   (response, string) result
-(** [make_response ~attempts ~total_elapsed_s ~cleanup_status ()] validates and
-    constructs a response. Attempts must be in exact invocation order: number 1
-    is [Initial_attempt], subsequent numbers are contiguous and are
-    [Fresh_attempt] or [Resumed_attempt]. Total elapsed time is finite and
-    non-negative, and cannot be shorter than any individual attempt.
+(** [make_response ~attempts ~status ~total_elapsed_s ~cleanup_status ()]
+    validates and constructs a response. Attempts must be in exact invocation
+    order: number 1 is [Initial_attempt], subsequent numbers are contiguous and
+    are [Fresh_attempt] or [Resumed_attempt]. Total elapsed time is finite and
+    non-negative, and cannot be shorter than the sum of sequential attempts. At
+    most {!max_attempts} attempts are accepted. [status] must match the final
+    attempt, except that a transport-successful final attempt carrying
+    [schema_error] requires an overall [Failed _] status.
 
-    Final status/text/JSON come from the last attempt. Final session is the last
+    Final text/JSON come from the last attempt. Final session is the last
     reported session across all attempts. Usage and cost are independently
-    aggregated with saturating integer arithmetic. [event_trace] defaults to
-    [None], preserving the distinction between no collected trace and a trace
+    aggregated with saturating integer arithmetic. A supplied trace is
+    cross-validated against attempt kinds, outcomes, durations, sessions,
+    metrics, total elapsed time, final attempt number, and overall status.
+    Missing trace events remain permitted as omissions. [event_trace] defaults
+    to [None], preserving the distinction between no collected trace and a trace
     with omissions. *)
 
 val attempts : response -> attempt list
 (** Ordered complete attempt list. *)
 
 val final_status : response -> status
-(** Status of the final attempt. *)
+(** Overall normalized status. This differs from the final transport attempt
+    only when schema validation rejects a transport-successful result. *)
 
 val final_text : response -> string
 (** Normalized final assistant text from the final attempt. *)
@@ -333,7 +370,12 @@ val make_execution_error :
   unit ->
   (error, string) result
 (** Construct a post-invocation failure retaining its full normalized response.
-    The non-empty UTF-8 message is omitted from safe JSON persistence. *)
+    The failure kind must agree with the response: native/backend/contract
+    failures retain a failed attempt, while schema retry exhaustion retains at
+    least one earlier schema-rejected attempt and a transport-successful final
+    attempt with a schema error. Successful, timed-out, or cancelled responses
+    cannot be wrapped as execution failures. The non-empty UTF-8 message is
+    omitted from safe JSON persistence. *)
 
 val error_view : error -> error_view
 (** Inspect the error classification and retained in-process diagnostic. *)

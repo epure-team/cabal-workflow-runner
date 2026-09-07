@@ -18,10 +18,10 @@ let contains haystack needle =
 let check_absent label serialized sentinel =
   Alcotest.(check bool) label false (contains serialized sentinel)
 
-let default_request () =
+let default_request ?read_only () =
   ok
     (Agent_execution.make_request ~id:"review-1" ~system_prompt:"system"
-       ~user_prompt:"user" ~timeout_s:30.0 ())
+       ~user_prompt:"user" ~timeout_s:30.0 ?read_only ())
 
 let no_delivery () =
   ok
@@ -37,11 +37,19 @@ let attempt ?(number = 1) ?(kind = Workflow_event.Initial_attempt)
        ~delivery:(no_delivery ()) ?schema_error ?session_id ?usage ?cost ~text
        ?structured_json ())
 
-let response ?(attempts = [ attempt () ]) ?(total_elapsed_s = 0.5)
+let response ?(attempts = [ attempt () ]) ?status ?(total_elapsed_s = 0.5)
     ?(cleanup_status = Agent_execution.Cleanup_not_required) ?event_trace () =
+  let status =
+    match status with
+    | Some status -> status
+    | None -> (
+        match List.rev attempts with
+        | final_attempt :: _ -> Agent_execution.attempt_status final_attempt
+        | [] -> Agent_execution.Success)
+  in
   ok
-    (Agent_execution.make_response ~attempts ~total_elapsed_s ~cleanup_status
-       ?event_trace ())
+    (Agent_execution.make_response ~attempts ~status ~total_elapsed_s
+       ~cleanup_status ?event_trace ())
 
 let event ~seq ~attempt ~elapsed_s payload =
   ok (Workflow_event.make ~seq ~attempt ~elapsed_s payload)
@@ -51,12 +59,41 @@ let terminal_trace () =
     (Workflow_event.make_trace
        [
          event ~seq:1L ~attempt:0 ~elapsed_s:0.0 Workflow_event.Task_started;
-         event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+         event ~seq:2L ~attempt:1 ~elapsed_s:0.05
            (Workflow_event.Attempt_started Workflow_event.Initial_attempt);
-         event ~seq:3L ~attempt:1 ~elapsed_s:0.2
+         event ~seq:3L ~attempt:1 ~elapsed_s:0.3
            (Workflow_event.Attempt_finished Workflow_event.Attempt_succeeded);
-         event ~seq:4L ~attempt:1 ~elapsed_s:0.3
+         event ~seq:4L ~attempt:1 ~elapsed_s:0.4
            (Workflow_event.Terminal Workflow_event.Succeeded);
+       ])
+
+let two_attempt_trace ?(second_kind = Workflow_event.Resumed_attempt)
+    ?(first_outcome = Workflow_event.Attempt_succeeded)
+    ?(second_outcome = Workflow_event.Attempt_succeeded)
+    ?(terminal = Workflow_event.Succeeded) () =
+  let retry_kind =
+    match second_kind with
+    | Workflow_event.Fresh_attempt -> Workflow_event.Fresh_retry
+    | Resumed_attempt -> Resume_retry
+    | Initial_attempt -> Alcotest.fail "second attempt cannot be initial"
+  in
+  ok
+    (Workflow_event.make_trace
+       [
+         event ~seq:1L ~attempt:0 ~elapsed_s:0.0 Workflow_event.Task_started;
+         event ~seq:2L ~attempt:1 ~elapsed_s:0.05
+           (Workflow_event.Attempt_started Workflow_event.Initial_attempt);
+         event ~seq:3L ~attempt:1 ~elapsed_s:0.3
+           (Workflow_event.Attempt_finished first_outcome);
+         event ~seq:4L ~attempt:1 ~elapsed_s:0.31
+           (Workflow_event.Retry_transition
+              { kind = retry_kind; reason = Workflow_event.Schema_validation });
+         event ~seq:5L ~attempt:2 ~elapsed_s:0.35
+           (Workflow_event.Attempt_started second_kind);
+         event ~seq:6L ~attempt:2 ~elapsed_s:0.6
+           (Workflow_event.Attempt_finished second_outcome);
+         event ~seq:7L ~attempt:2 ~elapsed_s:0.65
+           (Workflow_event.Terminal terminal);
        ])
 
 let test_request_defaults () =
@@ -179,6 +216,49 @@ let test_invalid_max_turns_and_metadata () =
     (Agent_execution.make_request ~id:"x" ~system_prompt:"s" ~user_prompt:"u"
        ~timeout_s:1.0 ~json_schema:(`Float Float.nan) ())
 
+let nested_json depth =
+  let value = ref `Null in
+  for _ = 1 to depth do
+    value := `List [ !value ]
+  done;
+  !value
+
+let test_json_resource_bounds () =
+  let too_deep = nested_json (Agent_execution.max_json_depth + 1) in
+  expect_error
+    (Agent_execution.make_request ~id:"x" ~system_prompt:"s" ~user_prompt:"u"
+       ~timeout_s:1.0
+       ~json_schema:(`Assoc [ ("allOf", too_deep) ])
+       ());
+  expect_error
+    (Agent_execution.make_attempt ~number:1 ~kind:Initial_attempt
+       ~status:Success ~elapsed_s:0.0 ~delivery:(no_delivery ())
+       ~structured_json:too_deep ());
+  let too_many_nodes =
+    `List (List.init Agent_execution.max_json_nodes (fun _ -> `Null))
+  in
+  expect_error
+    (Agent_execution.make_attempt ~number:1 ~kind:Initial_attempt
+       ~status:Success ~elapsed_s:0.0 ~delivery:(no_delivery ())
+       ~structured_json:too_many_nodes ());
+  let too_many_bytes = String.make Agent_execution.max_json_bytes 'x' in
+  expect_error
+    (Agent_execution.make_attempt ~number:1 ~kind:Initial_attempt
+       ~status:Success ~elapsed_s:0.0 ~delivery:(no_delivery ())
+       ~structured_json:(`String too_many_bytes) ());
+  let too_much_text =
+    String.make (Agent_execution.max_public_text_bytes + 1) 'x'
+  in
+  expect_error
+    (Agent_execution.make_attempt ~number:1 ~kind:Initial_attempt
+       ~status:Success ~elapsed_s:0.0 ~delivery:(no_delivery ())
+       ~text:too_much_text ());
+  expect_error
+    (Canonical_json.validate (nested_json (Canonical_json.max_depth + 1)));
+  expect_error
+    (Canonical_json.to_string
+       (`String (String.make Canonical_json.max_canonical_bytes 'x')))
+
 let test_invalid_attachment_values () =
   let make ?(id = "a") ?(path = "a.png") ?(mime_type = "image/png")
       ?(sha256 =
@@ -231,6 +311,13 @@ let test_invalid_domains_sessions_and_duplicates () =
   expect_error
     (Agent_execution.make_restricted_web_policy
        ~level:Agent_execution.Web_disabled ~domains:[ "example.com" ] ());
+  expect_error
+    (Agent_execution.make_restricted_web_policy
+       ~level:Agent_execution.Web_search
+       ~domains:
+         (List.init (Agent_execution.max_restricted_domains + 1) (fun index ->
+              Printf.sprintf "domain-%d.example" index))
+       ());
   expect_error
     (Agent_execution.make_request ~id:"x" ~system_prompt:"s" ~user_prompt:"u"
        ~timeout_s:1.0 ~resume_session:"bad/session" ());
@@ -337,24 +424,156 @@ let test_response_attempt_ordering () =
   let first = attempt () in
   let fresh = attempt ~number:2 ~kind:Workflow_event.Fresh_attempt () in
   let resumed = attempt ~number:3 ~kind:Workflow_event.Resumed_attempt () in
-  ignore (response ~attempts:[ first; fresh; resumed ] ());
+  ignore (response ~attempts:[ first; fresh; resumed ] ~total_elapsed_s:1.0 ());
   expect_error
-    (Agent_execution.make_response ~attempts:[] ~total_elapsed_s:0.0
-       ~cleanup_status:Cleanup_not_required ());
+    (Agent_execution.make_response ~attempts:[] ~status:Success
+       ~total_elapsed_s:0.0 ~cleanup_status:Cleanup_not_required ());
   expect_error
-    (Agent_execution.make_response ~attempts:[ fresh ] ~total_elapsed_s:1.0
-       ~cleanup_status:Cleanup_not_required ());
+    (Agent_execution.make_response ~attempts:[ fresh ] ~status:Success
+       ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required ());
   expect_error
     (Agent_execution.make_response
        ~attempts:[ first; attempt ~number:3 ~kind:Fresh_attempt () ]
-       ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required ());
+       ~status:Success ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required
+       ());
   expect_error
     (Agent_execution.make_response
        ~attempts:[ first; attempt ~number:2 ~kind:Initial_attempt () ]
-       ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required ());
+       ~status:Success ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required
+       ());
   expect_error
-    (Agent_execution.make_response ~attempts:[ first ] ~total_elapsed_s:0.1
-       ~cleanup_status:Cleanup_not_required ())
+    (Agent_execution.make_response ~attempts:[ first ] ~status:Success
+       ~total_elapsed_s:0.1 ~cleanup_status:Cleanup_not_required ());
+  expect_error
+    (Agent_execution.make_response ~attempts:[ first; fresh ] ~status:Success
+       ~total_elapsed_s:0.4 ~cleanup_status:Cleanup_not_required ());
+  expect_error
+    (Agent_execution.make_response
+       ~attempts:
+         [
+           attempt ~elapsed_s:Float.max_float ();
+           attempt ~number:2 ~kind:Fresh_attempt ~elapsed_s:Float.max_float ();
+         ]
+       ~status:Success ~total_elapsed_s:Float.max_float
+       ~cleanup_status:Cleanup_not_required ());
+  let too_many_attempts =
+    List.init (Agent_execution.max_attempts + 1) (fun index ->
+        let number = index + 1 in
+        attempt ~number
+          ~kind:
+            (if number = 1 then Workflow_event.Initial_attempt
+             else Fresh_attempt)
+          ())
+  in
+  expect_error
+    (Agent_execution.make_response ~attempts:too_many_attempts ~status:Success
+       ~total_elapsed_s:10.0 ~cleanup_status:Cleanup_not_required ())
+
+let test_response_status_and_trace_coherence () =
+  let first = attempt () in
+  expect_error
+    (Agent_execution.make_response ~attempts:[ first ]
+       ~status:(Failed "incoherent") ~total_elapsed_s:0.5
+       ~cleanup_status:Cleanup_not_required ());
+  let schema_attempt = attempt ~schema_error:"not an object" () in
+  ignore
+    (response ~attempts:[ schema_attempt ]
+       ~status:(Failed "schema validation failed") ());
+  let mismatched_terminal =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.4 (Terminal Failed);
+         ])
+  in
+  expect_error
+    (Agent_execution.make_response ~attempts:[ first ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:mismatched_terminal ());
+  let wrong_kind = two_attempt_trace ~second_kind:Fresh_attempt () in
+  let resumed = attempt ~number:2 ~kind:Resumed_attempt () in
+  expect_error
+    (Agent_execution.make_response ~attempts:[ first; resumed ] ~status:Success
+       ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required
+       ~event_trace:wrong_kind ());
+  let wrong_outcome =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_failed);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  expect_error
+    (Agent_execution.make_response ~attempts:[ first ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:wrong_outcome ());
+  let late_trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.6 (Terminal Succeeded);
+         ])
+  in
+  expect_error
+    (Agent_execution.make_response ~attempts:[ first ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:late_trace ());
+  let second = attempt ~number:2 ~kind:Fresh_attempt () in
+  expect_error
+    (Agent_execution.make_response ~attempts:[ first; second ] ~status:Success
+       ~total_elapsed_s:1.0 ~cleanup_status:Cleanup_not_required
+       ~event_trace:(two_attempt_trace ~second_kind:Fresh_attempt ())
+       ())
+
+let test_response_trace_sessions_metrics_and_timing () =
+  let usage = ok (Execution_metrics.make_usage ~input_tokens:3L ()) in
+  let other_usage = ok (Execution_metrics.make_usage ~input_tokens:4L ()) in
+  let cost = ok (Execution_metrics.make_cost ~usd_micros:5L ()) in
+  let attempt = attempt ~session_id:"session-1" ~usage ~cost () in
+  let make_trace ?(session = "session-1") ?(observed_usage = usage)
+      ?(observed_cost = cost) ?(finished_at = 0.3) () =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1 (Session_id session);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.2
+             (Usage_observed
+                { usage = Some observed_usage; cost = Some observed_cost });
+           event ~seq:4L ~attempt:1 ~elapsed_s:finished_at
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:5L ~attempt:1 ~elapsed_s:0.4 (Terminal Succeeded);
+         ])
+  in
+  ignore (response ~attempts:[ attempt ] ~event_trace:(make_trace ()) ());
+  expect_error
+    (Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:(make_trace ~session:"session-2" ())
+       ());
+  expect_error
+    (Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:(make_trace ~observed_usage:other_usage ())
+       ());
+  expect_error
+    (Agent_execution.make_response ~attempts:[ attempt ] ~status:Success
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~event_trace:(make_trace ~finished_at:0.31 ())
+       ())
 
 let test_response_aggregates_and_final_session () =
   let usage_1 =
@@ -367,7 +586,8 @@ let test_response_aggregates_and_final_session () =
   let cost_2 = ok (Execution_metrics.make_cost ~usd_micros:11L ()) in
   let attempts =
     [
-      attempt ~session_id:"session-1" ~usage:usage_1 ~cost:cost_1 ();
+      attempt ~session_id:"session-1" ~usage:usage_1 ~cost:cost_1
+        ~schema_error:"schema" ();
       attempt ~number:2 ~kind:Workflow_event.Resumed_attempt
         ~session_id:"session-2" ~usage:usage_2 ~cost:cost_2 ();
     ]
@@ -375,7 +595,7 @@ let test_response_aggregates_and_final_session () =
   let response =
     response ~attempts ~total_elapsed_s:2.0
       ~cleanup_status:Agent_execution.Cleanup_succeeded
-      ~event_trace:(terminal_trace ()) ()
+      ~event_trace:(two_attempt_trace ()) ()
   in
   Alcotest.(check (option string))
     "last session" (Some "session-2")
@@ -446,6 +666,99 @@ let test_event_terminal_invariants () =
          event ~seq:3L ~attempt:0 ~elapsed_s:0.2 (Terminal Cancelled);
        ])
 
+let trace_of_payloads payloads =
+  payloads
+  |> List.mapi (fun index (attempt, payload) ->
+      event
+        ~seq:(Int64.of_int (index + 1))
+        ~attempt
+        ~elapsed_s:(float_of_int index /. 10.0)
+        payload)
+  |> Workflow_event.make_trace
+
+let test_event_lifecycle_invariants () =
+  let rejects payloads = expect_error (trace_of_payloads payloads) in
+  rejects [ (0, Task_started); (0, Task_started); (0, Terminal Succeeded) ];
+  rejects
+    [
+      (0, Preflight_completed); (0, Preflight_started); (0, Terminal Succeeded);
+    ];
+  rejects
+    [
+      (0, Version_probe_completed);
+      (0, Preflight_completed);
+      (0, Terminal Succeeded);
+    ];
+  rejects
+    [
+      (0, Task_started);
+      (1, Attempt_started Initial_attempt);
+      (1, Attempt_started Initial_attempt);
+      (1, Terminal Succeeded);
+    ];
+  rejects
+    [
+      (1, Attempt_finished Attempt_succeeded);
+      (1, Process_started);
+      (1, Terminal Succeeded);
+    ];
+  rejects
+    [
+      (1, Process_exited (Exited 0));
+      (1, Process_termination_requested);
+      (1, Terminal Succeeded);
+    ];
+  rejects
+    [
+      (1, Agent_text_delta "answer");
+      (1, Process_started);
+      (1, Terminal Succeeded);
+    ];
+  rejects
+    [
+      (1, Attempt_started Initial_attempt);
+      (1, Attempt_finished Attempt_succeeded);
+      (1, Retry_transition { kind = Resume_retry; reason = Schema_validation });
+      (2, Attempt_started Fresh_attempt);
+      (2, Terminal Succeeded);
+    ];
+  rejects
+    [
+      (1, Attempt_finished Attempt_failed);
+      (1, Retry_transition { kind = Fresh_retry; reason = Schema_validation });
+      (2, Terminal Failed);
+    ];
+  rejects
+    [
+      (1, Attempt_finished Attempt_succeeded);
+      (1, Retry_transition { kind = Fresh_retry; reason = Transport_retry });
+      (1, Terminal Succeeded);
+    ];
+  rejects [ (0, Process_started); (0, Terminal Failed) ];
+  rejects [ (1, Preflight_started); (1, Terminal Failed) ]
+
+let test_event_omitted_subsequence_is_conservative () =
+  ignore
+    (ok
+       (trace_of_payloads
+          [
+            (0, Preflight_completed);
+            (1, Process_exited (Exited 0));
+            (1, Attempt_finished Attempt_succeeded);
+            (1, Terminal Succeeded);
+          ]));
+  ignore
+    (ok
+       (trace_of_payloads
+          [
+            (1, Attempt_finished Attempt_succeeded);
+            ( 1,
+              Retry_transition { kind = Fresh_retry; reason = Transport_retry }
+            );
+            (3, Attempt_finished Attempt_succeeded);
+            (3, Terminal Succeeded);
+          ]))
+
 let test_event_bounds () =
   expect_error
     (Workflow_event.make ~seq:1L ~attempt:0 ~elapsed_s:Float.infinity
@@ -485,7 +798,24 @@ let test_event_bounds () =
           ~attempt:0 ~elapsed_s:0.0 (Terminal Succeeded);
       ]
   in
-  expect_error (Workflow_event.make_trace too_many)
+  expect_error (Workflow_event.make_trace too_many);
+  let escaped_text = String.make Workflow_event.max_text_bytes '\000' in
+  let rec text_events seq count acc =
+    if count = 0 then List.rev acc
+    else
+      text_events (Int64.succ seq) (count - 1)
+        (event ~seq ~attempt:1 ~elapsed_s:0.0 (Agent_text_delta escaped_text)
+        :: acc)
+  in
+  let oversized_projection =
+    text_events 1L (Workflow_event.max_events - 1) []
+    @ [
+        event
+          ~seq:(Int64.of_int Workflow_event.max_events)
+          ~attempt:1 ~elapsed_s:0.1 (Terminal Succeeded);
+      ]
+  in
+  expect_error (Workflow_event.make_trace oversized_projection)
 
 let test_event_vocabulary_and_safe_opaque () =
   let usage = ok (Execution_metrics.make_usage ~output_tokens:2L ()) in
@@ -502,39 +832,42 @@ let test_event_vocabulary_and_safe_opaque () =
   in
   let payloads =
     [
-      Workflow_event.Backend_selected "backend-1";
-      Preflight_started;
-      Preflight_completed;
-      Version_probe_started;
-      Version_probe_completed;
-      Availability_check_started;
-      Availability_check_completed;
-      Attempt_started Initial_attempt;
-      Attempt_finished Attempt_succeeded;
-      Retry_transition { kind = Fresh_retry; reason = Schema_validation };
-      Process_started;
-      Process_termination_requested;
-      Process_kill_escalated;
-      Process_exited (Exited 0);
-      Session_id "session-1";
-      Agent_text_delta "public output";
-      Tool_started { id = Some "tool-1"; name = "reader" };
-      Tool_finished { id = Some "tool-1"; name = Some "reader" };
-      Usage_observed { usage = Some usage; cost = Some cost };
-      Delivery_truncated omissions;
-      Opaque_backend_observation;
+      (0, Workflow_event.Task_started);
+      (0, Backend_selected "backend-1");
+      (0, Preflight_started);
+      (0, Preflight_completed);
+      (0, Version_probe_started);
+      (0, Version_probe_completed);
+      (0, Availability_check_started);
+      (0, Availability_check_completed);
+      (1, Attempt_started Initial_attempt);
+      (1, Process_started);
+      (1, Session_id "session-1");
+      (1, Agent_text_delta "public output");
+      (1, Tool_started { id = Some "tool-1"; name = "reader" });
+      (1, Tool_finished { id = Some "tool-1"; name = Some "reader" });
+      (1, Usage_observed { usage = Some usage; cost = Some cost });
+      (1, Delivery_truncated omissions);
+      (1, Opaque_backend_observation);
+      (1, Process_termination_requested);
+      (1, Process_kill_escalated);
+      (1, Process_exited (Exited 0));
+      (1, Attempt_finished Attempt_succeeded);
+      (1, Retry_transition { kind = Fresh_retry; reason = Schema_validation });
+      (2, Attempt_started Fresh_attempt);
+      (2, Attempt_finished Attempt_succeeded);
     ]
   in
   let events =
     List.mapi
-      (fun index payload ->
-        event ~seq:(Int64.of_int (index + 1)) ~attempt:1 ~elapsed_s:0.0 payload)
+      (fun index (attempt, payload) ->
+        event ~seq:(Int64.of_int (index + 1)) ~attempt ~elapsed_s:0.0 payload)
       payloads
   in
   let terminal =
     event
       ~seq:(Int64.of_int (List.length events + 1))
-      ~attempt:1 ~elapsed_s:0.1 (Terminal Succeeded)
+      ~attempt:2 ~elapsed_s:0.1 (Terminal Succeeded)
   in
   let trace = ok (Workflow_event.make_trace (events @ [ terminal ])) in
   let serialized =
@@ -610,7 +943,7 @@ let test_serialization_redaction () =
   let execution_error =
     ok
       (Agent_execution.make_execution_error
-         ~kind:Agent_execution.Schema_retry_failed
+         ~kind:Agent_execution.Backend_execution_failed
          ~message:private_json_sentinel ~response ())
   in
   let serialized_error =
@@ -634,6 +967,38 @@ let test_serialization_redaction () =
     "public final text retained" true
     (contains serialized_response "public final text")
 
+let test_serialized_projection_bounds () =
+  let successful_response = response ~event_trace:(terminal_trace ()) () in
+  let response_bytes =
+    successful_response |> Agent_execution.response_to_yojson
+    |> Yojson.Safe.to_string |> String.length
+  in
+  Alcotest.(check bool)
+    "response projection bounded" true
+    (response_bytes <= Agent_execution.max_response_projection_bytes);
+  let error =
+    let response =
+      response ~attempts:[ attempt ~status:(Failed "failure") () ] ()
+    in
+    ok
+      (Agent_execution.make_execution_error ~kind:Backend_execution_failed
+         ~message:"failure" ~response ())
+  in
+  let error_bytes =
+    error |> Agent_execution.error_to_yojson |> Yojson.Safe.to_string
+    |> String.length
+  in
+  Alcotest.(check bool)
+    "error projection bounded" true
+    (error_bytes <= Agent_execution.max_error_projection_bytes);
+  let trace_bytes =
+    terminal_trace () |> Workflow_event.trace_to_yojson |> Yojson.Safe.to_string
+    |> String.length
+  in
+  Alcotest.(check bool)
+    "trace projection bounded" true
+    (trace_bytes <= Workflow_event.max_trace_projection_bytes)
+
 let test_error_classification () =
   let dispatch =
     ok
@@ -641,10 +1006,13 @@ let test_error_classification () =
          ~kind:Agent_execution.Backend_unavailable ~message:"not installed" ())
   in
   let execution =
+    let failed_response =
+      response ~attempts:[ attempt ~status:(Failed "failed") () ] ()
+    in
     ok
       (Agent_execution.make_execution_error
          ~kind:Agent_execution.Backend_execution_failed ~message:"failed"
-         ~response:(response ()) ())
+         ~response:failed_response ())
   in
   (match Agent_execution.error_view dispatch with
   | Dispatch_failure { kind = Backend_unavailable; _ } -> ()
@@ -682,25 +1050,87 @@ let test_error_classification () =
         "error version" true
         (contains serialized "cwr.agent-execution.error/v1"))
     dispatch_kinds;
+  let failed_response =
+    response ~attempts:[ attempt ~status:(Failed "failed") () ] ()
+  in
+  let schema_response =
+    response
+      ~attempts:
+        [
+          attempt ~schema_error:"schema" ();
+          attempt ~number:2 ~kind:Fresh_attempt ~schema_error:"schema" ();
+        ]
+      ~status:(Failed "schema validation failed") ()
+  in
   let execution_kinds =
     [
-      (Agent_execution.Native_schema_rejection, "native_schema_rejection");
-      (Schema_retry_failed, "schema_retry_failed");
-      (Backend_execution_failed, "backend_execution_failed");
-      (Execution_contract_failed, "execution_contract_failed");
+      ( Agent_execution.Native_schema_rejection,
+        "native_schema_rejection",
+        failed_response );
+      (Schema_retry_failed, "schema_retry_failed", schema_response);
+      (Backend_execution_failed, "backend_execution_failed", failed_response);
+      (Execution_contract_failed, "execution_contract_failed", failed_response);
     ]
   in
   List.iter
-    (fun (kind, tag) ->
+    (fun (kind, tag, response) ->
       let serialized =
         ok
-          (Agent_execution.make_execution_error ~kind ~message:"safe"
-             ~response:(response ()) ())
+          (Agent_execution.make_execution_error ~kind ~message:"safe" ~response
+             ())
         |> Agent_execution.error_to_yojson |> Yojson.Safe.to_string
       in
       Alcotest.(check bool)
         ("execution kind " ^ tag) true (contains serialized tag))
     execution_kinds
+
+let test_execution_error_coherence () =
+  let success = response () in
+  let failed =
+    response ~attempts:[ attempt ~status:(Failed "backend") () ] ()
+  in
+  let schema_failed =
+    response
+      ~attempts:
+        [
+          attempt ~schema_error:"schema" ();
+          attempt ~number:2 ~kind:Fresh_attempt ~schema_error:"schema" ();
+        ]
+      ~status:(Failed "schema validation failed") ()
+  in
+  List.iter
+    (fun kind ->
+      expect_error
+        (Agent_execution.make_execution_error ~kind ~message:"incoherent"
+           ~response:success ()))
+    [
+      Agent_execution.Native_schema_rejection;
+      Schema_retry_failed;
+      Backend_execution_failed;
+      Execution_contract_failed;
+    ];
+  expect_error
+    (Agent_execution.make_execution_error ~kind:Native_schema_rejection
+       ~message:"wrong failure shape" ~response:schema_failed ());
+  expect_error
+    (Agent_execution.make_execution_error ~kind:Schema_retry_failed
+       ~message:"wrong failure shape" ~response:failed ());
+  let no_retry =
+    response
+      ~attempts:[ attempt ~schema_error:"schema" () ]
+      ~status:(Failed "schema validation failed") ()
+  in
+  expect_error
+    (Agent_execution.make_execution_error ~kind:Schema_retry_failed
+       ~message:"no retry telemetry" ~response:no_retry ());
+  ignore
+    (ok
+       (Agent_execution.make_execution_error ~kind:Native_schema_rejection
+          ~message:"native rejection" ~response:failed ()));
+  ignore
+    (ok
+       (Agent_execution.make_execution_error ~kind:Schema_retry_failed
+          ~message:"retry exhausted" ~response:schema_failed ()))
 
 let test_runtime_seam_and_capabilities () =
   let calls = ref 0 in
@@ -742,9 +1172,11 @@ let test_legacy_runtime_success () =
         Alcotest.(check bool)
           "prompts composed" true
           (contains prompt "system" && contains prompt "user");
-        Alcotest.(check bool) "legacy read-only default" false read_only;
-        Alcotest.(check (option string)) "legacy routing" None agent_type;
-        Alcotest.(check (option string)) "legacy model" None model;
+        Alcotest.(check bool) "legacy read-only" true read_only;
+        Alcotest.(check (option string))
+          "legacy routing" (Some "reviewer") agent_type;
+        Alcotest.(check (option string))
+          "legacy model" (Some "vendor/model") model;
         Alcotest.(check bool)
           "legacy schema absent" true
           (Option.is_none output_schema);
@@ -752,7 +1184,13 @@ let test_legacy_runtime_success () =
       ()
   in
   let runtime = Runtime.of_legacy_backend ~now:(fun () -> 10.0) backend in
-  let response = ok (Runtime.complete runtime (default_request ())) in
+  let request =
+    ok
+      (Agent_execution.make_request ~id:"review-1" ~system_prompt:"system"
+         ~user_prompt:"user" ~timeout_s:30.0 ~read_only:true ~routing:"reviewer"
+         ~model:"vendor/model" ())
+  in
+  let response = ok (Runtime.complete runtime request) in
   Alcotest.(check int) "legacy called once" 1 !calls;
   Alcotest.(check int)
     "one synthetic attempt" 1
@@ -793,7 +1231,7 @@ let test_legacy_runtime_failure_and_unsupported () =
       ()
   in
   let runtime = Runtime.of_legacy_backend ~now:(fun () -> 1.0) backend in
-  (match Runtime.complete runtime (default_request ()) with
+  (match Runtime.complete runtime (default_request ~read_only:false ()) with
   | Error error -> (
       match Agent_execution.error_view error with
       | Execution_failure { response; _ } ->
@@ -815,6 +1253,82 @@ let test_legacy_runtime_failure_and_unsupported () =
       | _ -> Alcotest.fail "unsupported legacy request misclassified")
   | Ok _ -> Alcotest.fail "legacy schema request must fail before dispatch");
   Alcotest.(check int) "unsupported request did not dispatch" 1 !calls
+
+let test_legacy_read_only_is_explicit () =
+  let calls = ref [] in
+  let backend =
+    Backend.stub
+      ~agent:(fun
+          ~id:_ ~prompt:_ ~read_only ~agent_type:_ ~model:_ ~output_schema:_ ->
+        calls := read_only :: !calls;
+        (true, `Null))
+      ()
+  in
+  let runtime = Runtime.of_legacy_backend ~now:(fun () -> 1.0) backend in
+  let expect_unsupported request =
+    match Runtime.complete runtime request with
+    | Error error -> (
+        match Agent_execution.error_view error with
+        | Dispatch_failure { kind = Unsupported_request; _ } -> ()
+        | _ -> Alcotest.fail "unspecified read-only was misclassified")
+    | Ok _ -> Alcotest.fail "unspecified read-only must fail before dispatch"
+  in
+  expect_unsupported (default_request ());
+  ignore (ok (Runtime.complete runtime (default_request ~read_only:false ())));
+  ignore (ok (Runtime.complete runtime (default_request ~read_only:true ())));
+  Alcotest.(check (list bool)) "false and true forwarded" [ true; false ] !calls
+
+let test_legacy_rejects_each_unsupported_field_before_dispatch () =
+  let calls = ref 0 in
+  let backend =
+    Backend.stub
+      ~agent:(fun
+          ~id:_
+          ~prompt:_
+          ~read_only:_
+          ~agent_type:_
+          ~model:_
+          ~output_schema:_
+        ->
+        incr calls;
+        (true, `Null))
+      ()
+  in
+  let runtime = Runtime.of_legacy_backend backend in
+  let attachment =
+    ok
+      (Agent_execution.make_attachment ~id:"a" ~path:"a.png"
+         ~mime_type:"image/png"
+         ~sha256:
+           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+         ~size_bytes:1L ())
+  in
+  let make ?json_schema ?resume_session ?(attachments = []) ?web_policy
+      ?max_turns () =
+    ok
+      (Agent_execution.make_request ~id:"review-1" ~system_prompt:"system"
+         ~user_prompt:"user" ~timeout_s:30.0 ~read_only:false ?json_schema
+         ?resume_session ~attachments ?web_policy ?max_turns ())
+  in
+  let requests =
+    [
+      make ~json_schema:(`Assoc []) ();
+      make ~resume_session:"session-1" ();
+      make ~attachments:[ attachment ] ();
+      make ~web_policy:Agent_execution.web_search ();
+      make ~max_turns:2 ();
+    ]
+  in
+  List.iter
+    (fun request ->
+      match Runtime.complete runtime request with
+      | Error error -> (
+          match Agent_execution.error_view error with
+          | Dispatch_failure { kind = Unsupported_request; _ } -> ()
+          | _ -> Alcotest.fail "unsupported field was misclassified")
+      | Ok _ -> Alcotest.fail "unsupported field reached legacy dispatch")
+    requests;
+  Alcotest.(check int) "no unsupported request dispatched" 0 !calls
 
 let test_legacy_backend_and_engine_compatibility () =
   let calls = ref 0 in
@@ -889,6 +1403,8 @@ let () =
             test_invalid_timeouts;
           Alcotest.test_case "invalid max turns and metadata" `Quick
             test_invalid_max_turns_and_metadata;
+          Alcotest.test_case "bounded JSON inputs" `Quick
+            test_json_resource_bounds;
           Alcotest.test_case "invalid attachment fields" `Quick
             test_invalid_attachment_values;
           Alcotest.test_case "invalid domains, sessions, duplicate IDs" `Quick
@@ -907,6 +1423,10 @@ let () =
             test_attempt_statuses_and_normalization;
           Alcotest.test_case "ordered attempts" `Quick
             test_response_attempt_ordering;
+          Alcotest.test_case "response status and trace coherence" `Quick
+            test_response_status_and_trace_coherence;
+          Alcotest.test_case "trace sessions, metrics, and timing" `Quick
+            test_response_trace_sessions_metrics_and_timing;
           Alcotest.test_case "aggregates, final session, cleanup, trace" `Quick
             test_response_aggregates_and_final_session;
         ] );
@@ -918,6 +1438,10 @@ let () =
             test_event_sequence_invariants;
           Alcotest.test_case "terminal exactly once and last" `Quick
             test_event_terminal_invariants;
+          Alcotest.test_case "lifecycle state machine" `Quick
+            test_event_lifecycle_invariants;
+          Alcotest.test_case "omitted-event subsequences" `Quick
+            test_event_omitted_subsequence_is_conservative;
           Alcotest.test_case "event, trace, omission, and text bounds" `Quick
             test_event_bounds;
           Alcotest.test_case "typed vocabulary and safe opaque fallback" `Quick
@@ -929,8 +1453,12 @@ let () =
             test_serialization_versions_and_statuses;
           Alcotest.test_case "sentinel redaction" `Quick
             test_serialization_redaction;
+          Alcotest.test_case "bounded safe projections" `Quick
+            test_serialized_projection_bounds;
           Alcotest.test_case "dispatch vs execution errors" `Quick
             test_error_classification;
+          Alcotest.test_case "execution error coherence" `Quick
+            test_execution_error_coherence;
         ] );
       ( "runtime",
         [
@@ -940,6 +1468,10 @@ let () =
             test_legacy_runtime_success;
           Alcotest.test_case "legacy adapter failure and unsupported request"
             `Quick test_legacy_runtime_failure_and_unsupported;
+          Alcotest.test_case "legacy read-only intent must be explicit" `Quick
+            test_legacy_read_only_is_explicit;
+          Alcotest.test_case "legacy rejects every unsupported rich field"
+            `Quick test_legacy_rejects_each_unsupported_field_before_dispatch;
           Alcotest.test_case "legacy Backend/Engine source and behavior" `Quick
             test_legacy_backend_and_engine_compatibility;
           Alcotest.test_case "non-standard Yojson values fail closed" `Quick
