@@ -66,7 +66,15 @@ let append_diagnostic_path path component =
 
 let diagnostic path message = Error (path ^ ": " ^ message)
 
-let validate_and_measure ~restricted ~max_depth ~max_nodes ~max_bytes json =
+(* Yojson 3 removed these extensions from [Safe.t]; widening preserves the
+   fail-closed check when building against Yojson 2. *)
+type json_with_legacy_extensions =
+  [ Yojson.Safe.t
+  | `Tuple of Yojson.Safe.t list
+  | `Variant of string * Yojson.Safe.t option ]
+
+let validate_and_measure ~restricted ~max_depth ~max_nodes ~max_bytes
+    (json : Yojson.Safe.t) =
   if max_depth <= 0 || max_nodes <= 0 then Error "invalid JSON resource limit"
   else if max_bytes < 0 then Error "invalid JSON byte limit"
   else
@@ -148,7 +156,7 @@ let validate_and_measure ~restricted ~max_depth ~max_nodes ~max_bytes json =
           if depth > max_depth then Error "$: JSON nesting limit exceeded"
           else (
             incr seen;
-            match value with
+            match (value :> json_with_legacy_extensions) with
             | `Null ->
                 if add_bytes 4 then loop ()
                 else Error "$: JSON byte limit exceeded"
@@ -222,7 +230,8 @@ let validate_standard ~max_depth ~max_nodes ~max_bytes json =
     (validate_and_measure ~restricted:false ~max_depth ~max_nodes ~max_bytes
        json)
 
-let rec normalize = function
+let rec normalize (json : Yojson.Safe.t) : Yojson.Safe.t =
+  match json with
   | `Assoc fields ->
       `Assoc
         (fields
@@ -230,7 +239,6 @@ let rec normalize = function
         |> List.rev
         |> List.sort (fun (a, _) (b, _) -> String.compare a b))
   | `List values -> `List (values |> List.rev_map normalize |> List.rev)
-  | (`Tuple _ | `Variant _) as value -> value
   | value -> value
 
 let to_string json =

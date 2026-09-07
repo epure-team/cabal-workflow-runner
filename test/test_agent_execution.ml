@@ -305,12 +305,13 @@ let test_json_size_preflight_is_iterative_and_escape_aware () =
        (nested_json 100_000));
   let private_key = String.make (2 * 1024 * 1024) 'k' in
   (match
-     validate ~max_bytes:(3 * 1024 * 1024) (`Assoc [ (private_key, `Tuple []) ])
+     validate ~max_bytes:(3 * 1024 * 1024)
+       (`Assoc [ (private_key, `Intlit "01") ])
    with
   | Error diagnostic ->
       check_absent "diagnostic does not copy a hostile key" diagnostic
         private_key
-  | Ok _ -> Alcotest.fail "non-standard JSON value accepted");
+  | Ok _ -> Alcotest.fail "invalid JSON value accepted");
   expect_error_message "$: canonical JSON byte limit exceeded"
     (try
        Canonical_json.to_string
@@ -2919,11 +2920,20 @@ let test_legacy_backend_and_engine_compatibility () =
   Alcotest.(check int) "legacy trace" 1 (List.length trace)
 
 let test_nonstandard_yojson_is_rejected () =
-  expect_error (Canonical_json.validate (`Tuple [ `Int 1 ]));
-  expect_error
-    (Canonical_json.validate_no_duplicates
-       (`Variant ("private", Some (`String "payload"))));
-  expect_error (Canonical_json.to_string (`Tuple []))
+  let if_parser_accepts raw check =
+    match Yojson.Safe.from_string raw with
+    | json -> check json
+    | exception Yojson.Json_error _ -> ()
+  in
+  if_parser_accepts "(1)" (fun json ->
+      expect_error (Canonical_json.validate json);
+      Alcotest.(check bool)
+        "extension is not a comparable DSL value" true
+        (Expr.value_of_json json = Expr.Null));
+  if_parser_accepts "<private:\"payload\">" (fun json ->
+      expect_error (Canonical_json.validate_no_duplicates json));
+  if_parser_accepts "()" (fun json ->
+      expect_error (Canonical_json.to_string json))
 
 let () =
   Alcotest.run "rich agent execution"
