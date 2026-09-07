@@ -106,6 +106,10 @@ val max_response_projection_bytes : int
     Response construction performs exact compact-encoding size preflight without
     serializing the projection. *)
 
+val max_incomplete_execution_projection_bytes : int
+(** Upper byte bound guaranteed for one serialized safe incomplete-execution
+    projection, including its complete outer normalized trace. *)
+
 val max_error_projection_bytes : int
 (** Upper byte bound guaranteed for a serialized safe error projection,
     including a separately retained outer event trace. *)
@@ -206,6 +210,41 @@ type attempt_kind = Workflow_event.attempt_kind =
 (** Structured attempt status. A failed status retains its normalized diagnostic
     in memory; safe persistence projections retain only the [failed] class. *)
 type status = Success | Failed of string | Timed_out | Cancelled
+
+(** Evidence about an invoked-but-uncommitted corrective continuation.
+    [Invocation_may_have_started] is conservative when retained lifecycle events
+    do not prove entry into the continuation. [Invocation_started] records known
+    invocation without requiring that its start event survived bounded event
+    delivery. *)
+type continuation_invocation =
+  | Invocation_may_have_started
+  | Invocation_started
+
+type incomplete_continuation
+(** Opaque identity of at most one invoked-but-uncommitted continuation. It
+    deliberately has no result, elapsed duration, output, session, or aggregate
+    fields. *)
+
+val make_incomplete_continuation :
+  number:int ->
+  kind:attempt_kind ->
+  invocation:continuation_invocation ->
+  unit ->
+  (incomplete_continuation, string) result
+(** Construct a potential or known continuation. Its number must be greater
+    than one and its kind must be [Fresh_attempt] or [Resumed_attempt]. Exact
+    contiguity and prior retry context are checked by
+    {!make_incomplete_execution}. *)
+
+val continuation_number : incomplete_continuation -> int
+(** One-based number of the uncommitted continuation. *)
+
+val continuation_kind : incomplete_continuation -> attempt_kind
+(** Fresh or resumed continuation kind. *)
+
+val continuation_invocation :
+  incomplete_continuation -> continuation_invocation
+(** Whether invocation may have begun or is known to have begun. *)
 
 type attempt
 (** Opaque complete normalized telemetry for one actually invoked backend call.
@@ -343,6 +382,85 @@ val cleanup_status : response -> cleanup_status
 val event_trace : response -> Workflow_event.trace option
 (** Optional bounded post-completion event trace. *)
 
+type incomplete_execution
+(** Opaque interrupted execution with one or more complete attempts and at most
+    one invoked-but-uncommitted continuation. No attempt or backend result is
+    synthesized for the continuation. *)
+
+val make_incomplete_execution :
+  completed_attempts:attempt list ->
+  outer_status:status ->
+  total_elapsed_s:float ->
+  cleanup_status:cleanup_status ->
+  ?continuation:incomplete_continuation ->
+  outer_event_trace:Workflow_event.trace ->
+  unit ->
+  (incomplete_execution, string) result
+(** Construct interrupted execution evidence. [completed_attempts] must be
+    non-empty, contiguous, coherent completed results. [outer_status] must be
+    [Failed _], [Timed_out], or [Cancelled] and must exactly match the terminal
+    of [outer_event_trace].
+
+    A continuation, when present, must be numbered immediately after the last
+    completed attempt, be fresh or resumed, and follow retained schema/retry
+    context. The outer trace may contain lifecycle evidence only through that
+    one continuation. A retained continuation finish must be failed, timed out,
+    or cancelled consistently with [outer_status]; success and evidence for a
+    second continuation are rejected. An uncertain continuation cannot coexist
+    with explicit invocation lifecycle evidence.
+
+    Aggregate usage/cost and final session are derived exclusively from
+    [completed_attempts]. Usage/cost observations for the incomplete
+    continuation remain in the bounded outer trace and are additionally exposed
+    as separate lower bounds; they are never folded into completed aggregates.
+    Ordinary {!make_response} trace/status fusion remains unchanged. *)
+
+val incomplete_completed_attempts : incomplete_execution -> attempt list
+(** Exact ordered list of committed complete attempts. *)
+
+val incomplete_outer_status : incomplete_execution -> status
+(** Failed, timed-out, or cancelled outer operation status. *)
+
+val incomplete_total_elapsed_s : incomplete_execution -> float
+(** Finite non-negative outer operation elapsed time. *)
+
+val incomplete_completed_usage :
+  incomplete_execution -> Execution_metrics.usage option
+(** Saturating aggregate based only on completed attempt results. *)
+
+val incomplete_completed_cost :
+  incomplete_execution -> Execution_metrics.cost option
+(** Saturating cost aggregate based only on completed attempt results. *)
+
+val incomplete_final_session_id : incomplete_execution -> string option
+(** Last session identifier among completed attempts only. *)
+
+val incomplete_cleanup_status : incomplete_execution -> cleanup_status
+(** Sanitized outer cleanup outcome. *)
+
+val incomplete_continuation :
+  incomplete_execution -> incomplete_continuation option
+(** Optional single invoked-but-uncommitted continuation identity. *)
+
+val incomplete_continuation_usage_lower_bound :
+  incomplete_execution -> Execution_metrics.usage option
+(** Field-wise lower bound derived only from bounded usage observations for the
+    incomplete continuation. It is not part of completed usage. *)
+
+val incomplete_continuation_cost_lower_bound :
+  incomplete_execution -> Execution_metrics.cost option
+(** Lower bound derived only from bounded cost observations for the incomplete
+    continuation. It is not part of completed cost. *)
+
+val incomplete_outer_event_trace :
+  incomplete_execution -> Workflow_event.trace
+(** Complete bounded normalized outer trace, including retained continuation
+    lifecycle/observation evidence and omission metadata. *)
+
+val incomplete_execution_to_yojson : incomplete_execution -> Yojson.Safe.t
+(** Stable redacted projection with schema version
+    [cwr.agent-execution.incomplete/v1]. *)
+
 (** Stable host-neutral dispatch-layer cause categories. {!Dispatch_failure}
     uses them only when no backend invocation occurred;
     {!Post_execution_dispatch_failed} uses them when completed execution exists.
@@ -371,8 +489,9 @@ type error
 
 (** Exhaustive in-process view distinguishing a proven no-invocation dispatch
     failure, an outcome with no completed attempt and indeterminate invocation
-    progress, a dispatch-layer failure after completed execution exists, and an
-    execution failure. Completed-execution forms retain normalized attempts. *)
+    progress, an interrupted execution with completed progress, a dispatch-layer
+    failure strictly after a completed execution, and an execution failure.
+    Completed-progress forms retain normalized attempts. *)
 type error_view =
   | Dispatch_failure of {
       kind : dispatch_failure_kind;
@@ -384,6 +503,10 @@ type error_view =
       invocation_may_have_started : bool;
       message : string;
       event_trace : Workflow_event.trace option;
+    }
+  | Incomplete_execution of {
+      message : string;
+      execution : incomplete_execution;
     }
   | Post_execution_dispatch_failed of {
       cause : dispatch_failure_kind;
@@ -429,6 +552,15 @@ val make_no_completed_attempt_error :
     invocation is definitely absent, it must contain no nonzero attempt
     evidence. No attempt is synthesized. Diagnostics are omitted from safe JSON.
 *)
+
+val make_incomplete_execution_error :
+  message:string ->
+  execution:incomplete_execution ->
+  unit ->
+  (error, string) result
+(** Wrap validated partial execution evidence as its distinct error shape. The
+    normalized non-empty diagnostic remains in process and is omitted from safe
+    persistence. *)
 
 val make_post_execution_dispatch_error :
   cause:dispatch_failure_kind ->
@@ -480,6 +612,8 @@ val error_to_yojson : error -> Yojson.Safe.t
 (** Stable redacted JSON persistence projection with schema version
     [cwr.agent-execution.error/v1]. Diagnostics are omitted. No-completed-attempt
     outcomes retain only status, invocation uncertainty, and an optional safe
-    trace. Post-execution dispatch failures retain their fixed cause, safe
-    response, and separate safe outer trace; execution failures likewise embed
-    the safe response and retain attempts. *)
+    trace. Incomplete execution embeds exact completed attempts, outer status,
+    separate incomplete-observation lower bounds, and the safe outer trace, but
+    no synthetic continuation result. Post-execution dispatch failures retain
+    their fixed cause, safe response, and separate safe outer trace; execution
+    failures likewise embed the safe response and retain attempts. *)

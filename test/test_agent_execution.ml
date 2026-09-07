@@ -1886,6 +1886,367 @@ let test_no_completed_attempt_error_shapes () =
        ~invocation_may_have_started:true ~message:"terminal mismatch"
        ~event_trace:(failed_outer_trace ()) ())
 
+let incomplete_continuation ~number ~kind ~invocation =
+  ok
+    (Agent_execution.make_incomplete_continuation ~number ~kind ~invocation ())
+
+let incomplete_execution ~completed_attempts ~outer_status ~total_elapsed_s
+    ~cleanup_status ~continuation ~outer_event_trace =
+  ok
+    (Agent_execution.make_incomplete_execution ~completed_attempts ~outer_status
+       ~total_elapsed_s ~cleanup_status ~continuation ~outer_event_trace ())
+
+let test_incomplete_fresh_retry_deadline () =
+  let completed_usage =
+    ok (Execution_metrics.make_usage ~input_tokens:7L ~output_tokens:3L ())
+  in
+  let completed_cost = ok (Execution_metrics.make_cost ~usd_micros:11L ()) in
+  let incomplete_usage =
+    ok (Execution_metrics.make_usage ~input_tokens:50L ~output_tokens:2L ())
+  in
+  let incomplete_cost = ok (Execution_metrics.make_cost ~usd_micros:70L ()) in
+  let first =
+    attempt ~schema_error:"PRIVATE_FIRST_SCHEMA_ERROR" ~session_id:"session-1"
+      ~usage:completed_usage ~cost:completed_cost ()
+  in
+  let outer_event_trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:0 ~elapsed_s:0.0 Task_started;
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.15
+             (Usage_observed
+                { usage = Some completed_usage; cost = Some completed_cost });
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.2 (Session_id "session-1");
+           event ~seq:5L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:6L ~attempt:1 ~elapsed_s:0.31
+             (Retry_transition
+                { kind = Fresh_retry; reason = Schema_validation });
+           event ~seq:7L ~attempt:2 ~elapsed_s:0.35
+             (Attempt_started Fresh_attempt);
+           event ~seq:8L ~attempt:2 ~elapsed_s:0.45
+             (Usage_observed
+                { usage = Some incomplete_usage; cost = Some incomplete_cost });
+           event ~seq:9L ~attempt:2 ~elapsed_s:0.55
+             Process_termination_requested;
+           event ~seq:10L ~attempt:2 ~elapsed_s:0.6
+             (Attempt_finished Attempt_timed_out);
+           event ~seq:11L ~attempt:2 ~elapsed_s:0.7 (Terminal Timed_out);
+         ])
+  in
+  let continuation =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_started
+  in
+  let execution =
+    incomplete_execution ~completed_attempts:[ first ] ~outer_status:Timed_out
+      ~total_elapsed_s:0.7 ~cleanup_status:Cleanup_succeeded ~continuation
+      ~outer_event_trace
+  in
+  let error =
+    ok
+      (Agent_execution.make_incomplete_execution_error
+         ~message:"PRIVATE_DEADLINE_DIAGNOSTIC" ~execution ())
+  in
+  (match Agent_execution.error_view error with
+  | Incomplete_execution { message; execution = retained } ->
+      Alcotest.(check string)
+        "diagnostic retained in process" "PRIVATE_DEADLINE_DIAGNOSTIC" message;
+      Alcotest.(check int)
+        "only committed attempt retained" 1
+        (List.length
+           (Agent_execution.incomplete_completed_attempts retained));
+      Alcotest.(check bool)
+        "outer timeout retained" true
+        (Agent_execution.incomplete_outer_status retained = Timed_out);
+      Alcotest.(check (option int64))
+        "completed usage excludes incomplete observation" (Some 7L)
+        (Option.bind
+           (Agent_execution.incomplete_completed_usage retained)
+           Execution_metrics.input_tokens);
+      Alcotest.(check (option int64))
+        "completed cost excludes incomplete observation" (Some 11L)
+        (Option.bind
+           (Agent_execution.incomplete_completed_cost retained)
+           Execution_metrics.usd_micros);
+      Alcotest.(check (option int64))
+        "incomplete usage is a separate lower bound" (Some 50L)
+        (Option.bind
+           (Agent_execution.incomplete_continuation_usage_lower_bound retained)
+           Execution_metrics.input_tokens);
+      Alcotest.(check (option int64))
+        "incomplete cost is a separate lower bound" (Some 70L)
+        (Option.bind
+           (Agent_execution.incomplete_continuation_cost_lower_bound retained)
+           Execution_metrics.usd_micros);
+      Alcotest.(check (option string))
+        "session derives only from completed attempts" (Some "session-1")
+        (Agent_execution.incomplete_final_session_id retained);
+      Alcotest.(check bool)
+        "cleanup retained" true
+        (Agent_execution.incomplete_cleanup_status retained = Cleanup_succeeded);
+      let retained_continuation =
+        match Agent_execution.incomplete_continuation retained with
+        | Some value -> value
+        | None -> Alcotest.fail "incomplete continuation lost"
+      in
+      Alcotest.(check int)
+        "continuation number" 2
+        (Agent_execution.continuation_number retained_continuation);
+      Alcotest.(check bool)
+        "continuation kind" true
+        (Agent_execution.continuation_kind retained_continuation = Fresh_attempt);
+      Alcotest.(check bool)
+        "invocation known started" true
+        (Agent_execution.continuation_invocation retained_continuation
+        = Invocation_started);
+      Alcotest.(check int)
+        "complete outer trace retained" 11
+        (List.length
+           (Workflow_event.events
+              (Agent_execution.incomplete_outer_event_trace retained)))
+  | _ -> Alcotest.fail "deadline interruption lost incomplete classification");
+  let serialized =
+    Agent_execution.error_to_yojson error |> Yojson.Safe.to_string
+  in
+  Alcotest.(check bool)
+    "partial error kind projected" true
+    (contains serialized "\"error_kind\":\"incomplete_execution\"");
+  Alcotest.(check bool)
+    "outer timeout projected" true
+    (contains serialized "\"outer_status\":\"timed_out\"");
+  Alcotest.(check bool)
+    "separate lower bound projected" true
+    (contains serialized "\"continuation_usage_lower_bound\"");
+  check_absent "partial diagnostic redacted" serialized
+    "PRIVATE_DEADLINE_DIAGNOSTIC";
+  check_absent "schema diagnostic redacted" serialized
+    "PRIVATE_FIRST_SCHEMA_ERROR";
+  Alcotest.(check bool)
+    "partial projection bounded" true
+    (String.length serialized <= Agent_execution.max_error_projection_bytes);
+  let execution_projection =
+    Agent_execution.incomplete_execution_to_yojson execution
+    |> Yojson.Safe.to_string
+  in
+  Alcotest.(check bool)
+    "incomplete projection version" true
+    (contains execution_projection "cwr.agent-execution.incomplete/v1");
+  Alcotest.(check bool)
+    "incomplete execution projection bounded" true
+    (String.length execution_projection
+    <= Agent_execution.max_incomplete_execution_projection_bytes)
+
+let test_incomplete_resumed_retry_cancellation () =
+  let first =
+    attempt ~schema_error:"schema rejected" ~session_id:"resume-session" ()
+  in
+  let outer_event_trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.31
+             (Retry_transition
+                { kind = Resume_retry; reason = Schema_validation });
+           event ~seq:4L ~attempt:2 ~elapsed_s:0.35
+             (Attempt_started Resumed_attempt);
+           event ~seq:5L ~attempt:2 ~elapsed_s:0.5 (Terminal Cancelled);
+         ])
+  in
+  let continuation =
+    incomplete_continuation ~number:2 ~kind:Resumed_attempt
+      ~invocation:Agent_execution.Invocation_started
+  in
+  let execution =
+    incomplete_execution ~completed_attempts:[ first ] ~outer_status:Cancelled
+      ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_failed ~continuation
+      ~outer_event_trace
+  in
+  Alcotest.(check bool)
+    "cancellation retained" true
+    (Agent_execution.incomplete_outer_status execution = Cancelled);
+  Alcotest.(check (option string))
+    "completed session retained" (Some "resume-session")
+    (Agent_execution.incomplete_final_session_id execution)
+
+let test_incomplete_retry_exception_after_finish_event () =
+  let first = attempt ~schema_error:"schema rejected" () in
+  let outer_event_trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.31
+             (Retry_transition
+                { kind = Fresh_retry; reason = Schema_validation });
+           event ~seq:4L ~attempt:2 ~elapsed_s:0.35
+             (Attempt_started Fresh_attempt);
+           event ~seq:5L ~attempt:2 ~elapsed_s:0.45
+             (Attempt_finished Attempt_failed);
+           event ~seq:6L ~attempt:2 ~elapsed_s:0.5 (Terminal Failed);
+         ])
+  in
+  let continuation =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_started
+  in
+  let execution =
+    incomplete_execution ~completed_attempts:[ first ]
+      ~outer_status:(Failed "PRIVATE_RETRY_EXCEPTION") ~total_elapsed_s:0.5
+      ~cleanup_status:Cleanup_not_required ~continuation ~outer_event_trace
+  in
+  let serialized =
+    ok
+      (Agent_execution.make_incomplete_execution_error
+         ~message:"PRIVATE_OUTER_EXCEPTION" ~execution ())
+    |> Agent_execution.error_to_yojson |> Yojson.Safe.to_string
+  in
+  Alcotest.(check bool)
+    "failed continuation projected without result" true
+    (contains serialized "\"invocation\":\"started\"");
+  check_absent "outer status diagnostic redacted" serialized
+    "PRIVATE_RETRY_EXCEPTION";
+  check_absent "outer error diagnostic redacted" serialized
+    "PRIVATE_OUTER_EXCEPTION"
+
+let test_incomplete_execution_rejects_contradictions () =
+  let first = attempt ~schema_error:"schema rejected" () in
+  let trace ?(retry_kind = Workflow_event.Fresh_retry)
+      ?(attempt_kind = Workflow_event.Fresh_attempt) ?finish ?third_attempt
+      terminal =
+    let finish =
+      match finish with
+      | None -> []
+      | Some outcome ->
+          [
+            event ~seq:5L ~attempt:2 ~elapsed_s:0.45
+              (Attempt_finished outcome);
+          ]
+    in
+    let third =
+      match third_attempt with
+      | None -> []
+      | Some kind ->
+          [
+            event ~seq:6L ~attempt:3 ~elapsed_s:0.47 (Attempt_started kind);
+          ]
+    in
+    let terminal_seq = if third = [] then 6L else 7L in
+    let terminal_attempt = if third = [] then 2 else 3 in
+    ok
+      (Workflow_event.make_trace
+         ([
+            event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+              (Attempt_started Initial_attempt);
+            event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+              (Attempt_finished Attempt_succeeded);
+            event ~seq:3L ~attempt:1 ~elapsed_s:0.31
+              (Retry_transition { kind = retry_kind; reason = Schema_validation });
+            event ~seq:4L ~attempt:2 ~elapsed_s:0.35
+              (Attempt_started attempt_kind);
+          ]
+         @ finish @ third
+         @ [ event ~seq:terminal_seq ~attempt:terminal_attempt ~elapsed_s:0.5
+               (Terminal terminal) ]))
+  in
+  let make continuation outer_event_trace =
+    Agent_execution.make_incomplete_execution ~completed_attempts:[ first ]
+      ~outer_status:Timed_out ~total_elapsed_s:0.5
+      ~cleanup_status:Cleanup_not_required ~continuation ~outer_event_trace ()
+  in
+  let fresh_started =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_started
+  in
+  expect_error
+    (make
+       (incomplete_continuation ~number:3 ~kind:Fresh_attempt
+          ~invocation:Invocation_started)
+       (trace Timed_out));
+  expect_error
+    (make
+       (incomplete_continuation ~number:2 ~kind:Resumed_attempt
+          ~invocation:Invocation_started)
+       (trace Timed_out));
+  expect_error
+    (Agent_execution.make_incomplete_continuation ~number:2
+       ~kind:Initial_attempt ~invocation:Invocation_started ());
+  expect_error
+    (make fresh_started (trace ~finish:Attempt_succeeded Timed_out));
+  expect_error
+    (make fresh_started
+       (trace ~third_attempt:Fresh_attempt Timed_out));
+  let may_have_started =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_may_have_started
+  in
+  expect_error (make may_have_started (trace Timed_out));
+  expect_error (make fresh_started (trace Cancelled));
+  let no_retry_context_trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.5 (Terminal Timed_out);
+         ])
+  in
+  expect_error
+    (Agent_execution.make_incomplete_execution
+       ~completed_attempts:[ attempt () ] ~outer_status:Timed_out
+       ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+       ~continuation:may_have_started ~outer_event_trace:no_retry_context_trace
+       ());
+  let omitted_start_trace =
+    ok
+      (Workflow_event.make_trace ~omitted_count:1L
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.31
+             (Retry_transition
+                { kind = Fresh_retry; reason = Schema_validation });
+           event ~seq:4L ~attempt:2 ~elapsed_s:0.5 (Terminal Timed_out);
+         ])
+  in
+  ignore (ok (make may_have_started omitted_start_trace));
+  let before_retry_trace =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.5 (Terminal Timed_out);
+         ])
+  in
+  let before_retry =
+    ok
+      (Agent_execution.make_incomplete_execution
+         ~completed_attempts:[ first ] ~outer_status:Timed_out
+         ~total_elapsed_s:0.5 ~cleanup_status:Cleanup_not_required
+         ~outer_event_trace:before_retry_trace ())
+  in
+  Alcotest.(check bool)
+    "interruption before retry has no synthetic continuation" true
+    (Option.is_none (Agent_execution.incomplete_continuation before_retry));
+  expect_error
+    (Agent_execution.make_incomplete_execution ~completed_attempts:[ first ]
+       ~outer_status:Success ~total_elapsed_s:0.5
+       ~cleanup_status:Cleanup_not_required ~continuation:fresh_started
+       ~outer_event_trace:(trace Succeeded) ())
+
 let test_schema_retry_failure_shapes () =
   let first = attempt ~schema_error:"first schema rejection" () in
   let check ?(kind = Workflow_event.Fresh_attempt) status =
@@ -2088,6 +2449,9 @@ let test_legacy_runtime_failure_and_unsupported () =
           Alcotest.fail
             "legacy bool=false returned a completed result, not an indeterminate \
              invocation"
+      | Incomplete_execution _ ->
+          Alcotest.fail
+            "legacy bool=false returned a completed result, not partial execution"
       | Dispatch_failure _ ->
           Alcotest.fail "legacy bool=false is execution, not dispatch failure")
   | Ok _ -> Alcotest.fail "legacy bool=false must be an execution error");
@@ -2358,6 +2722,14 @@ let () =
             test_post_execution_cleanup_failure_keeps_success_and_outer_trace;
           Alcotest.test_case "no completed attempt error shapes" `Quick
             test_no_completed_attempt_error_shapes;
+          Alcotest.test_case "deadline during fresh retry" `Quick
+            test_incomplete_fresh_retry_deadline;
+          Alcotest.test_case "cancellation during resumed retry" `Quick
+            test_incomplete_resumed_retry_cancellation;
+          Alcotest.test_case "retry exception after finish event" `Quick
+            test_incomplete_retry_exception_after_finish_event;
+          Alcotest.test_case "incomplete execution contradictions" `Quick
+            test_incomplete_execution_rejects_contradictions;
           Alcotest.test_case "schema retry terminal failures" `Quick
             test_schema_retry_failure_shapes;
         ] );

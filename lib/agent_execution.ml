@@ -156,10 +156,13 @@ let max_public_text_bytes = 256 * 1024
 let max_attempts = 8
 let max_response_projection_bytes = 24 * 1024 * 1024
 
-let max_error_projection_bytes =
+let max_incomplete_execution_projection_bytes =
   max_response_projection_bytes
   + Workflow_event.max_trace_projection_bytes
-  + 2048
+  + 1024
+
+let max_error_projection_bytes =
+  max_incomplete_execution_projection_bytes + 1024
 
 let validate_standard_json json =
   Canonical_json.validate_standard ~max_depth:max_json_depth
@@ -270,6 +273,27 @@ type attempt_kind = Workflow_event.attempt_kind =
   | Resumed_attempt
 
 type status = Success | Failed of string | Timed_out | Cancelled
+
+type continuation_invocation =
+  | Invocation_may_have_started
+  | Invocation_started
+
+type incomplete_continuation = {
+  number : int;
+  kind : attempt_kind;
+  invocation : continuation_invocation;
+}
+
+let make_incomplete_continuation ~number ~kind ~invocation () =
+  if number <= 1 then
+    Error "incomplete continuation number must follow a completed attempt"
+  else if kind = Initial_attempt then
+    Error "incomplete continuation must be fresh or resumed"
+  else Ok { number; kind; invocation }
+
+let continuation_number continuation = continuation.number
+let continuation_kind continuation = continuation.kind
+let continuation_invocation continuation = continuation.invocation
 
 type attempt = {
   number : int;
@@ -886,6 +910,421 @@ let final_session_id response = response.final_session_id
 let cleanup_status response = response.cleanup_status
 let event_trace response = response.event_trace
 
+type incomplete_execution = {
+  completed_attempts : attempt list;
+  outer_status : status;
+  total_elapsed_s : float;
+  completed_usage : Execution_metrics.usage option;
+  completed_cost : Execution_metrics.cost option;
+  final_session_id : string option;
+  cleanup_status : cleanup_status;
+  continuation : incomplete_continuation option;
+  continuation_usage_lower_bound : Execution_metrics.usage option;
+  continuation_cost_lower_bound : Execution_metrics.cost option;
+  outer_event_trace : Workflow_event.trace;
+}
+
+let retry_kind_matches_attempt_kind retry_kind attempt_kind =
+  match (retry_kind, attempt_kind) with
+  | Workflow_event.Fresh_retry, Fresh_attempt
+  | Resume_retry, Resumed_attempt ->
+      true
+  | Fresh_retry, (Initial_attempt | Resumed_attempt)
+  | Resume_retry, (Initial_attempt | Fresh_attempt) ->
+      false
+
+let usage_lower_bound_of_observation ~seen observation =
+  if not seen then Ok None
+  else
+    Result.map Option.some
+      (Execution_metrics.make_usage
+         ?input_tokens:observation.input_tokens.lower_bound
+         ?output_tokens:observation.output_tokens.lower_bound
+         ?cache_creation_tokens:observation.cache_creation_tokens.lower_bound
+         ?cache_read_tokens:observation.cache_read_tokens.lower_bound ())
+
+let cost_lower_bound_of_observation ~seen observation =
+  if not seen then Ok None
+  else
+    Result.map Option.some
+      (Execution_metrics.make_cost ?usd_micros:observation.usd_micros.lower_bound
+         ())
+
+let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
+    ~(continuation : incomplete_continuation option) trace =
+  let starts = Hashtbl.create (List.length completed_attempts) in
+  let usage_observations = Hashtbl.create (List.length completed_attempts) in
+  let continuation_observation = empty_retained_usage_observation () in
+  let continuation_usage_seen = ref false in
+  let continuation_cost_seen = ref false in
+  let continuation_evidence_seen = ref false in
+  let previous_event = ref None in
+  let no_unlocated_omissions =
+    Int64.compare (Workflow_event.omitted_count trace) 0L = 0
+  in
+  let mark_usage_unknown attempt_number =
+    match Hashtbl.find_opt usage_observations attempt_number with
+    | Some observation -> clear_exact_usage observation
+    | None -> ()
+  in
+  let note_sequence_gap event =
+    (match !previous_event with
+    | Some previous
+      when Int64.compare (Workflow_event.seq event)
+             (Int64.succ (Workflow_event.seq previous))
+           > 0 ->
+        mark_usage_unknown (Workflow_event.attempt previous)
+    | None | Some _ -> ());
+    previous_event := Some event
+  in
+  let next_attempt_kind number =
+    match find_attempt completed_attempts (number + 1) with
+    | Some attempt -> Some attempt.kind
+    | None -> (
+        match continuation with
+        | Some value when value.number = number + 1 -> Some value.kind
+        | None | Some _ -> None)
+  in
+  let validate_completed_event attempt payload event =
+    match payload with
+    | Workflow_event.Attempt_started kind ->
+        if kind <> attempt.kind then
+          Error "event attempt kind disagrees with completed telemetry"
+        else (
+          Hashtbl.replace starts attempt.number (Workflow_event.elapsed_s event);
+          Ok ())
+    | Attempt_finished outcome ->
+        if not (outcome_matches_status outcome attempt.status) then
+          Error "event attempt outcome disagrees with completed telemetry"
+        else (
+          match Hashtbl.find_opt starts attempt.number with
+          | Some started
+            when attempt.elapsed_s
+                 > Workflow_event.elapsed_s event -. started
+                   +. attempt_timing_tolerance_s ->
+              Error "event attempt timing disagrees with completed telemetry"
+          | Some _ | None -> Ok ())
+    | Session_id session_id ->
+        if attempt.session_id <> Some session_id then
+          Error "event session disagrees with completed telemetry"
+        else Ok ()
+    | Usage_observed { usage; cost } ->
+        let observation =
+          match Hashtbl.find_opt usage_observations attempt.number with
+          | Some observation -> observation
+          | None ->
+              let observation = empty_retained_usage_observation () in
+              Hashtbl.add usage_observations attempt.number observation;
+              observation
+        in
+        retain_usage_observation ~exact_is_known:no_unlocated_omissions
+          observation ~usage ~cost;
+        Ok ()
+    | Retry_transition { kind; reason } -> (
+        match next_attempt_kind attempt.number with
+        | None -> Error "retry transition has no following attempt evidence"
+        | Some next_kind when not (retry_kind_matches_attempt_kind kind next_kind)
+          ->
+            Error "retry transition disagrees with the next attempt kind"
+        | Some _ when reason = Schema_validation && attempt.schema_error = None
+          ->
+            Error "schema retry event has no matching validation error"
+        | Some _ -> Ok ())
+    | Task_started | Backend_selected _ | Preflight_started
+    | Preflight_completed | Version_probe_started | Version_probe_completed
+    | Availability_check_started | Availability_check_completed ->
+        Error "pre-dispatch event refers to a completed attempt"
+    | Delivery_truncated counts ->
+        if Int64.compare (Workflow_event.omitted_usage_events counts) 0L > 0
+        then mark_usage_unknown attempt.number;
+        Ok ()
+    | Process_started | Process_termination_requested | Process_kill_escalated
+    | Process_exited _ | Agent_text_delta _ | Tool_started _ | Tool_finished _
+    | Opaque_backend_observation ->
+        Ok ()
+    | Terminal _ -> Error "terminal event validation failed"
+  in
+  let validate_continuation_event (expected : incomplete_continuation) payload =
+    match payload with
+    | Workflow_event.Attempt_started kind ->
+        continuation_evidence_seen := true;
+        if kind = expected.kind then Ok ()
+        else Error "incomplete continuation kind disagrees with its start event"
+    | Attempt_finished Attempt_succeeded ->
+        Error "incomplete continuation cannot finish successfully"
+    | Attempt_finished outcome ->
+        continuation_evidence_seen := true;
+        if outcome_matches_status outcome outer_status then Ok ()
+        else Error "incomplete continuation outcome disagrees with outer status"
+    | Retry_transition _ ->
+        Error "incomplete continuation cannot schedule another continuation"
+    | Usage_observed { usage; cost } ->
+        continuation_evidence_seen := true;
+        if Option.is_some usage then continuation_usage_seen := true;
+        if Option.is_some cost then continuation_cost_seen := true;
+        retain_usage_observation ~exact_is_known:false continuation_observation
+          ~usage ~cost;
+        Ok ()
+    | Session_id _ | Agent_text_delta _ | Tool_started _ | Tool_finished _
+    | Process_started | Process_termination_requested | Process_kill_escalated
+    | Process_exited _ | Opaque_backend_observation ->
+        continuation_evidence_seen := true;
+        Ok ()
+    | Delivery_truncated _ -> Ok ()
+    | Task_started | Backend_selected _ | Preflight_started
+    | Preflight_completed | Version_probe_started | Version_probe_completed
+    | Availability_check_started | Availability_check_completed ->
+        Error "pre-dispatch event refers to the incomplete continuation"
+    | Terminal _ -> Error "terminal event validation failed"
+  in
+  match List.rev completed_attempts with
+  | [] -> Error "incomplete execution requires a completed attempt"
+  | final_completed :: _ ->
+      let terminal_attempt_matches event =
+        match continuation with
+        | None -> Workflow_event.attempt event = final_completed.number
+        | Some value ->
+            Workflow_event.attempt event = value.number
+            || (value.invocation = Invocation_may_have_started
+               && Workflow_event.attempt event = final_completed.number)
+      in
+      let validate_event event =
+        note_sequence_gap event;
+        if Workflow_event.elapsed_s event > total_elapsed_s then
+          Error "outer trace exceeds the incomplete execution elapsed time"
+        else
+          match Workflow_event.payload event with
+          | Workflow_event.Terminal terminal ->
+              if not (terminal_attempt_matches event) then
+                Error "outer terminal disagrees with incomplete attempt progress"
+              else if not (terminal_matches_status terminal outer_status) then
+                Error "outer terminal disagrees with incomplete execution status"
+              else Ok ()
+          | payload when Workflow_event.attempt event = 0 -> (
+              match payload with
+              | Workflow_event.Task_started | Backend_selected _
+              | Preflight_started | Preflight_completed | Version_probe_started
+              | Version_probe_completed | Availability_check_started
+              | Availability_check_completed | Delivery_truncated _
+              | Opaque_backend_observation ->
+                  Ok ()
+              | Attempt_started _ | Attempt_finished _ | Retry_transition _
+              | Process_started | Process_termination_requested
+              | Process_kill_escalated | Process_exited _ | Session_id _
+              | Agent_text_delta _ | Tool_started _ | Tool_finished _
+              | Usage_observed _ | Terminal _ ->
+                  Error "attempt event has no matching attempt evidence")
+          | payload -> (
+              match find_attempt completed_attempts (Workflow_event.attempt event) with
+              | Some attempt -> validate_completed_event attempt payload event
+              | None -> (
+                  match continuation with
+                  | Some expected
+                    when expected.number = Workflow_event.attempt event ->
+                      validate_continuation_event expected payload
+                  | None | Some _ ->
+                      Error "outer trace refers beyond the incomplete continuation"))
+      in
+      let rec loop = function
+        | [] ->
+            Hashtbl.fold
+              (fun attempt_number observation result ->
+                Result.bind result (fun () ->
+                    match find_attempt completed_attempts attempt_number with
+                    | None -> Error "usage event has no matching completed attempt"
+                    | Some attempt ->
+                        if
+                          not
+                            (retained_usage_matches observation attempt.usage)
+                        then
+                          Error "event usage disagrees with completed telemetry"
+                        else if
+                          not (retained_cost_matches observation attempt.cost)
+                        then Error "event cost disagrees with completed telemetry"
+                        else Ok ()))
+              usage_observations (Ok ())
+        | event :: rest ->
+            Result.bind (validate_event event) (fun () -> loop rest)
+      in
+      Result.bind (loop (Workflow_event.events trace)) (fun () ->
+          Result.bind
+            (match continuation with
+            | Some value
+              when value.invocation = Invocation_may_have_started
+                   && !continuation_evidence_seen ->
+                Error
+                  "continuation marked uncertain has explicit invocation evidence"
+            | None | Some _ -> Ok ())
+            (fun () ->
+              Result.bind
+                (usage_lower_bound_of_observation
+                   ~seen:!continuation_usage_seen continuation_observation)
+                (fun usage_lower_bound ->
+                  Result.map
+                    (fun cost_lower_bound ->
+                      (usage_lower_bound, cost_lower_bound))
+                    (cost_lower_bound_of_observation
+                       ~seen:!continuation_cost_seen continuation_observation))))
+
+let incomplete_continuation_projection
+    (continuation : incomplete_continuation) =
+  `Assoc
+    [
+      ("number", `Int continuation.number);
+      ("kind", `String (string_of_attempt_kind continuation.kind));
+      ( "invocation",
+        `String
+          (match continuation.invocation with
+          | Invocation_may_have_started -> "may_have_started"
+          | Invocation_started -> "started") );
+    ]
+
+let incomplete_execution_projection execution =
+  `Assoc
+    [
+      ("schema_version", `String "cwr.agent-execution.incomplete/v1");
+      ("outer_status", `String (string_of_status execution.outer_status));
+      ( "completed_attempts",
+        `List (List.map attempt_projection execution.completed_attempts) );
+      ("total_elapsed_s", `Float execution.total_elapsed_s);
+      ( "completed_usage",
+        projection_option usage_projection execution.completed_usage );
+      ( "completed_cost",
+        projection_option cost_projection execution.completed_cost );
+      ( "final_session_id",
+        projection_option (fun value -> `String value) execution.final_session_id
+      );
+      ( "cleanup_status",
+        `String (string_of_cleanup_status execution.cleanup_status) );
+      ( "continuation",
+        projection_option incomplete_continuation_projection
+          execution.continuation );
+      ( "continuation_usage_lower_bound",
+        projection_option usage_projection
+          execution.continuation_usage_lower_bound );
+      ( "continuation_cost_lower_bound",
+        projection_option cost_projection
+          execution.continuation_cost_lower_bound );
+      ( "outer_event_trace",
+        Workflow_event.trace_to_yojson execution.outer_event_trace );
+    ]
+
+let validate_incomplete_execution_projection execution =
+  match
+    Canonical_json.validate_standard ~max_depth:Canonical_json.max_depth
+      ~max_nodes:Canonical_json.max_nodes
+      ~max_bytes:max_incomplete_execution_projection_bytes
+      (incomplete_execution_projection execution)
+  with
+  | Ok () -> Ok ()
+  | Error _ ->
+      Error "incomplete execution exceeds the serialized projection byte limit"
+
+let make_incomplete_execution ~completed_attempts ~outer_status ~total_elapsed_s
+    ~cleanup_status ?continuation ~outer_event_trace () =
+  let continuation : incomplete_continuation option = continuation in
+  if not (finite total_elapsed_s && total_elapsed_s >= 0.0) then
+    Error "incomplete execution elapsed time must be finite and non-negative"
+  else if completed_attempts = [] then
+    Error "incomplete execution requires a completed attempt"
+  else if
+    List.length completed_attempts + (if Option.is_some continuation then 1 else 0)
+    > max_attempts
+  then Error "incomplete execution attempt limit exceeded"
+  else if not (durations_fit total_elapsed_s completed_attempts) then
+    Error "incomplete execution elapsed time cannot be shorter than its attempts"
+  else
+    Result.bind (normalize_status outer_status) (fun outer_status ->
+        if outer_status = Success then
+          Error "incomplete execution status must not be successful"
+        else
+          Result.bind (validate_attempt_order completed_attempts) (fun () ->
+              match List.rev completed_attempts with
+              | [] -> Error "incomplete execution requires a completed attempt"
+              | final_completed :: _ ->
+                  Result.bind
+                    (match continuation with
+                    | None -> Ok ()
+                    | Some value ->
+                        if value.number <> final_completed.number + 1 then
+                          Error
+                            "incomplete continuation must immediately follow the \
+                             completed attempts"
+                        else
+                          let retry_context =
+                            final_completed.schema_error <> None
+                            || List.exists
+                                 (fun event ->
+                                   Workflow_event.attempt event
+                                   = final_completed.number
+                                   &&
+                                   match Workflow_event.payload event with
+                                   | Workflow_event.Retry_transition { kind; _ } ->
+                                       retry_kind_matches_attempt_kind kind
+                                         value.kind
+                                   | _ -> false)
+                                 (Workflow_event.events outer_event_trace)
+                          in
+                          if retry_context then Ok ()
+                          else
+                            Error
+                              "incomplete continuation lacks prior retry context")
+                    (fun () ->
+                      Result.bind
+                        (validate_incomplete_trace ~completed_attempts
+                           ~outer_status ~total_elapsed_s ~continuation
+                           outer_event_trace)
+                        (fun
+                          ( continuation_usage_lower_bound,
+                            continuation_cost_lower_bound ) ->
+                          let final_session_id =
+                            List.fold_left
+                              (fun current attempt ->
+                                match attempt.session_id with
+                                | Some _ as found -> found
+                                | None -> current)
+                              None completed_attempts
+                          in
+                          let execution =
+                            {
+                              completed_attempts;
+                              outer_status;
+                              total_elapsed_s;
+                              completed_usage =
+                                Execution_metrics.aggregate_usages
+                                  (List.map attempt_usage completed_attempts);
+                              completed_cost =
+                                Execution_metrics.aggregate_costs
+                                  (List.map attempt_cost completed_attempts);
+                              final_session_id;
+                              cleanup_status;
+                              continuation;
+                              continuation_usage_lower_bound;
+                              continuation_cost_lower_bound;
+                              outer_event_trace;
+                            }
+                          in
+                          Result.map (fun () -> execution)
+                            (validate_incomplete_execution_projection execution)))))
+
+let incomplete_completed_attempts execution = execution.completed_attempts
+let incomplete_outer_status execution = execution.outer_status
+let incomplete_total_elapsed_s execution = execution.total_elapsed_s
+let incomplete_completed_usage execution = execution.completed_usage
+let incomplete_completed_cost execution = execution.completed_cost
+let incomplete_final_session_id execution = execution.final_session_id
+let incomplete_cleanup_status execution = execution.cleanup_status
+let incomplete_continuation execution = execution.continuation
+
+let incomplete_continuation_usage_lower_bound execution =
+  execution.continuation_usage_lower_bound
+
+let incomplete_continuation_cost_lower_bound execution =
+  execution.continuation_cost_lower_bound
+
+let incomplete_outer_event_trace execution = execution.outer_event_trace
+let incomplete_execution_to_yojson = incomplete_execution_projection
+
 type dispatch_failure_kind =
   | Invalid_request
   | Backend_unavailable
@@ -913,6 +1352,10 @@ type error =
       message : string;
       event_trace : Workflow_event.trace option;
     }
+  | Incomplete_execution_error of {
+      message : string;
+      execution : incomplete_execution;
+    }
   | Post_execution_dispatch_error of {
       cause : dispatch_failure_kind;
       message : string;
@@ -936,6 +1379,10 @@ type error_view =
       invocation_may_have_started : bool;
       message : string;
       event_trace : Workflow_event.trace option;
+    }
+  | Incomplete_execution of {
+      message : string;
+      execution : incomplete_execution;
     }
   | Post_execution_dispatch_failed of {
       cause : dispatch_failure_kind;
@@ -1018,6 +1465,11 @@ let make_no_completed_attempt_error ~status ~invocation_may_have_started
               (normalize_nonempty_diagnostic
                  "no-completed-attempt diagnostic" message)))
 
+let make_incomplete_execution_error ~message ~execution () =
+  Result.map
+    (fun message -> Incomplete_execution_error { message; execution })
+    (normalize_nonempty_diagnostic "incomplete execution diagnostic" message)
+
 let make_post_execution_dispatch_error ~cause ~message ~response
     ~outer_event_trace () =
   Result.bind
@@ -1080,6 +1532,8 @@ let error_view = function
       { status; invocation_may_have_started; message; event_trace } ->
       No_completed_attempt
         { status; invocation_may_have_started; message; event_trace }
+  | Incomplete_execution_error { message; execution } ->
+      Incomplete_execution { message; execution }
   | Post_execution_dispatch_error
       { cause; message; response; outer_event_trace } ->
       Post_execution_dispatch_failed
@@ -1130,6 +1584,13 @@ let error_to_yojson = function
           ("invocation_may_have_started", `Bool invocation_may_have_started);
           ( "event_trace",
             projection_option Workflow_event.trace_to_yojson event_trace );
+        ]
+  | Incomplete_execution_error { message = _; execution } ->
+      `Assoc
+        [
+          ("schema_version", `String "cwr.agent-execution.error/v1");
+          ("error_kind", `String "incomplete_execution");
+          ("execution", incomplete_execution_to_yojson execution);
         ]
   | Post_execution_dispatch_error
       { cause; message = _; response; outer_event_trace } ->

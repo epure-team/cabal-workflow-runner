@@ -66,6 +66,20 @@ normalized outer failed trace. This permits a successful completed task with
 invocation uncertainty, and an optional safe trace without inventing an attempt. Pure
 pre-invocation dispatch errors remain distinct and may retain a no-attempt trace.
 
+Interrupted outcomes after completed progress now use `Incomplete_execution`. The shape
+retains exact committed attempts, failed/timed-out/cancelled outer status, cleanup,
+completed-only aggregate metrics and final session, and the complete bounded outer trace.
+It records at most one immediately following fresh/resumed continuation as either
+possibly or known started, but never invents its `task_result` or complete attempt.
+Continuation usage/cost observations remain separate bounded lower bounds and are not
+folded into completed aggregates. Validation rejects skipped/wrong continuation kinds,
+successful incomplete outcomes, and evidence for more than one uncommitted continuation;
+ordinary response fusion and successful-execution-plus-cleanup-failure semantics remain
+strict.
+Exhaustive pre-release `error_view` consumers must add the new constructor, and
+projection consumers must accept the new `incomplete_execution` error kind and nested
+`cwr.agent-execution.incomplete/v1` value.
+
 The pre-release `Native_schema_rejection` category is renamed to the causally neutral
 `Native_backend_failure_with_schema`, matching Cabal's contract: the schema was in force,
 but is not asserted to have caused the backend failure. Error projections remain

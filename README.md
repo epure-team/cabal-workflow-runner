@@ -96,9 +96,15 @@ changing the workflow format or wiring it into `Engine.run`:
   initial schema rejection and one fresh/resumed corrective attempt, including failed,
   timed-out, or cancelled corrective transports. Dispatch failures before execution,
   no-completed-attempt outcomes with explicit invocation uncertainty,
+  incomplete executions with exact completed attempts plus at most one
+  invoked-but-uncommitted fresh/resumed continuation,
   post-execution dispatch failures retaining any coherent non-empty response plus a
-  separate outer failed trace, and execution failures remain distinct typed shapes. A
-  successful completed transport therefore stays successful when later sealed-input
+  separate outer failed trace, and execution failures remain distinct typed shapes.
+  Incomplete execution never fabricates a continuation result: its failed/timed-out/
+  cancelled outer status and complete bounded outer trace remain separate from committed
+  attempts. Aggregate metrics and final session use committed results only; bounded
+  usage/cost observations from the continuation are exposed separately as lower bounds.
+  A successful completed transport therefore stays successful when later sealed-input
   cleanup fails; its attempts/session/metrics/cleanup status are not rewritten to fit the
   outer terminal. Native backend failure while a schema is in force is named neutrally
   and does not claim that schema validation caused the failure.
@@ -127,15 +133,17 @@ separators, and delimiters without constructing unbounded attacker-controlled di
 paths. Canonical output is serialized into a buffer sized from that successful preflight;
 trace and response projections are likewise rejected from exact pre-serialization size.
 Public constants cap JSON depth, nodes/bytes, public attempt text, attempt count,
-restricted domains, canonical output, and serialized trace/response/error projections;
-the error bound includes a separately retained outer trace.
+restricted domains, canonical output, and serialized trace/response/incomplete/error
+projections; incomplete and post-execution error bounds include a separately retained
+outer trace.
 See the [rich execution migration
 notes](docs/rich-agent-execution-migration.md) for adoption details and the exhaustive
 mapping from Cabal's current `Backend_completer.make_rich` outcomes.
 
-Versioned response/error/event-trace Yojson projections are redacted persistence
-surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`, workflow JSON/schema,
-and workflow ledgers remain unchanged; the new runtime is not yet an engine dependency.
+Versioned response/incomplete-execution/error/event-trace Yojson projections are
+redacted persistence surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`,
+workflow JSON/schema, and workflow ledgers remain unchanged; the new runtime is not yet
+an engine dependency.
 
 ## Build & test
 

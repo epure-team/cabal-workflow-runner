@@ -6,10 +6,11 @@
     an unknown future backend event must use {!Opaque_backend_observation}.
 
     Despite the module name, {!trace} is not the deterministic engine's
-    {!Types.trace}: it is optional backend-execution telemetry nested in an
-    {!Agent_execution.response}, is not persisted by {!Ledger}, and is not
-    consumed by {!Engine.replay}. Batch 1 stores only completed traces; it does
-    not provide live streaming. *)
+    {!Types.trace}: it is backend-execution telemetry nested in a completed
+    {!Agent_execution.response} or retained by a typed execution error, is not
+    persisted by {!Ledger}, and is not consumed by {!Engine.replay}. Batch 1
+    stores only bounded traces after an outcome; it does not provide live
+    streaming. *)
 
 (** Stable kind of an actually invoked backend attempt. *)
 type attempt_kind = Initial_attempt | Fresh_attempt | Resumed_attempt

@@ -26,6 +26,15 @@ Callers adopting the new API must observe these fail-closed boundaries:
   explicit invocation uncertainty, and optional normalized trace without
   inventing an attempt. Registry, capability, quarantine, and preflight errors
   known to occur before invocation remain `Dispatch_failure`.
+- Use `Incomplete_execution` when at least one backend result was committed but
+  the outer failed/timed-out/cancelled outcome is not a complete result for the
+  latest invocation. Preserve committed attempts exactly and record at most one
+  immediately following fresh/resumed continuation. Mark it
+  `Invocation_started` when lifecycle evidence proves entry, otherwise
+  `Invocation_may_have_started`; never manufacture its result, duration, output,
+  or session. Completed aggregate usage/cost and final session exclude the
+  continuation. Its retained bounded usage/cost observations are exposed only
+  as separate lower bounds and remain present in the complete outer trace.
 - Treat `Workflow_event.make_trace` as a lifecycle validator, not only an order
   check. Retained events may be an omitted prefix/subsequence, but visible
   lifecycle contradictions are rejected. `Workflow_event.trace` is agent-call
@@ -67,32 +76,54 @@ Callers adopting the new API must observe these fail-closed boundaries:
   web access is disabled. Legacy read-only/routing/model capability claims are
   false unless the caller opts in through the corresponding `attested_*` flag.
 
-The event trace remains a bounded post-completion value. This migration does
-not add a live event stream or wire the rich runtime into `Engine.run`.
+The event trace remains a bounded post-outcome value. This migration does not
+add a live event stream or wire the rich runtime into `Engine.run`.
 
 ## Current Cabal `make_rich` outcome map
 
 This table records the integration contract inspected in Cabal's current
 `Backend_completer.make_rich`, `Runtime_dispatch.detailed_error`, and
 `Backend_types.task_execution_error`. It is a bridge specification, not a Cabal
-dependency in this library. Every row preserves Cabal's normalized outer trace;
-private/raw fields outside CWR's safe contract remain deliberately
-unrepresentable rather than being described as preserved.
+dependency in this library. Every callback row preserves Cabal's complete
+bounded normalized outer trace; private/raw fields outside CWR's safe contract
+remain deliberately unrepresentable rather than being described as preserved.
+
+Select the shape from committed evidence, not only from Cabal's synthetic
+`final_result`: a value is an ordinary `response` only when its final result is
+the last committed attempt result (allowing the documented schema-validation
+projection). A nonempty committed prefix followed by an unrepresented outer
+failure/timeout/cancellation is `Incomplete_execution`. A failure strictly after
+a coherent completed execution, notably successful execution followed by sealed
+input cleanup failure, is `Post_execution_dispatch_failed` and keeps the
+completed response independent from the outer failed trace.
 
 | Cabal `make_rich` outcome | Host-neutral CWR shape |
 |---|---|
 | Constructor `Error _` (the routing id is malformed) | `Dispatch_error Invalid_request` |
 | Constructor `Ok rich_completer` | Preserve the callback; construction performs no dispatch |
-| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Success` | `Ok response` with status `Success` and the mapped trace |
-| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Failed message` | `Ok response` with the same failed status/attempt diagnostic in process and the mapped trace |
-| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Timeout` | `Ok response` with status `Timed_out` and the mapped trace |
-| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Cancelled` | `Ok response` with status `Cancelled` and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Success` represented by the last completed attempt | `Ok response` with status `Success` and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Failed message` represented by the last completed attempt | `Ok response` with the same failed status/attempt diagnostic in process and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Timeout` represented by the last completed attempt | `Ok response` with status `Timed_out` and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, final `Cancelled` represented by the last completed attempt | `Ok response` with status `Cancelled` and the mapped trace |
+| Callback `Ok { execution; event_trace; _ }`, non-empty attempts, synthetic final `Timeout` or `Cancelled` not represented by the last completed attempt | `Incomplete_execution` with the exact completed prefix, outer status/elapsed/cleanup, completed-only aggregates/session, full outer trace, and optional single continuation inferred as described below. This includes timeout/cancellation before retry transition (no continuation) and during a fresh/resumed retry (one continuation) |
 | Callback `Ok { execution; event_trace; _ }`, zero attempts, final `Timeout` | `No_completed_attempt { status = Timed_out; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
 | Callback `Ok { execution; event_trace; _ }`, zero attempts, final `Cancelled` | `No_completed_attempt { status = Cancelled; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
 | Callback `Error { cause = Dispatch_failure failure; event_trace }` | Use the exhaustive cause table below; preserve `event_trace` on the selected error shape |
-| Callback `Error { cause = Dispatch_failure_with_execution { failure; execution }; event_trace }` | `Post_execution_dispatch_failed` with `map_dispatch_cause failure`, the coherent non-empty response built from `execution` without attaching the outer trace, and `outer_event_trace = mapped_trace`. Preserve actual attempts/status/session/metrics/`Cleanup_failed`; the outer failed terminal remains separate |
+| Callback `Error { cause = Dispatch_failure_with_execution { failure; execution }; event_trace }` where `execution.final_result` is synthetic and not a committed attempt result | `Incomplete_execution` with outer `Failed _`, exact completed prefix, completed-only aggregates/session, cleanup state, complete outer trace, and at most one continuation. This is Cabal's retry-exception-after-progress path |
+| Callback `Error { cause = Dispatch_failure_with_execution { failure; execution }; event_trace }` after a coherent completed execution, including successful execution plus attachment cleanup failure | `Post_execution_dispatch_failed` with `map_dispatch_cause failure`, the coherent non-empty response built from `execution` without attaching the outer trace, and `outer_event_trace = mapped_trace`. Preserve actual attempts/status/session/metrics/`Cleanup_failed`; the outer failed terminal remains separate |
 | Callback `Error { cause = Execution_failure (Native_backend_failure_with_schema { execution; _ }); event_trace }` | `Execution_failure Native_backend_failure_with_schema` with the mapped non-empty response and trace; this makes no schema-causality claim |
 | Callback `Error { cause = Execution_failure (Schema_retry_failed { execution; attempt_2_failure; _ }); event_trace }` | `Execution_failure Schema_retry_failed` with both mapped attempts, unchanged final status, and trace; `attempt_2_failure` maps as detailed below |
+
+For `Incomplete_execution`, let N be the last committed attempt number. Retained
+events may refer only to completed attempts 1..N and optionally N+1. A visible
+retry transition or N+1 start fixes the continuation kind; it must be fresh or
+resumed and consistent with the prior schema/retry context. Explicit N+1 start,
+finish, process, session, text, tool, or usage evidence selects
+`Invocation_started`; omission/gap evidence without such an event may select
+`Invocation_may_have_started`. A retained N+1 finish must be failed, timed out,
+or cancelled exactly like the outer terminal. A successful N+1 finish/terminal,
+N+2 evidence, skipped number, or mismatched kind fails conversion rather than
+fabricating telemetry.
 
 The nested retry-failure algebra maps without rewriting attempt status:
 
@@ -131,7 +162,7 @@ is exhaustive for the current `Runtime_dispatch.error` algebra:
 | `Availability_check_failed` | Definitely not invoked | `Dispatch_failure Internal_dispatch_failure` |
 | `Prepared_already_consumed` | Definitely not invoked by this call | `Dispatch_failure Internal_dispatch_failure` |
 | `Backend_execution_failed` in plain `Dispatch_failure` | May have started, no completed result | `No_completed_attempt { status = Failed _; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
-| `Backend_execution_failed` in `Dispatch_failure_with_execution` | Completed progress exists | `Post_execution_dispatch_failed` with cause `Internal_dispatch_failure`, response, and separate outer trace |
+| `Backend_execution_failed` in `Dispatch_failure_with_execution` with a synthetic failed final result | Completed progress exists; a continuation may be invoked but uncommitted | `Incomplete_execution` with outer `Failed _`, exact completed prefix, optional continuation, and complete outer trace |
 | `Schema_enforcement_failed _` | The current detailed `make_rich` path does not emit this compatibility projection; structured cases are `Execution_failure` | If received defensively, `No_completed_attempt { status = Failed _; invocation_may_have_started = true; event_trace = Some mapped_trace }`; never claim pre-invocation |
 
 Attempt kinds, result statuses, token counts, delivery modes, media counts, web
@@ -148,6 +179,14 @@ non-finite/negative/out-of-range values and apply an approved deterministic
 rounding policy. Until then it must fail conversion rather than silently drop the
 cost, set it to unknown, truncate it, or overflow it. The same rule applies to
 cost carried by normalized usage events.
+
+### Pre-release incomplete-execution addition
+
+Exhaustive adopters of the unreleased `error_view` type must add an
+`Incomplete_execution` arm. Error-projection consumers must likewise accept the
+new `"incomplete_execution"` kind, whose nested value is versioned
+`cwr.agent-execution.incomplete/v1`. The existing error envelope remains
+`cwr.agent-execution.error/v1` because none of these projections has shipped.
 
 ### Pre-release native error rename
 
