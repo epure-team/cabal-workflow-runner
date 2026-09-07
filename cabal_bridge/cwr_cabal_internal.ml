@@ -201,11 +201,6 @@ let render_selection_error = function
   | Custom_authorization_required ->
       "custom backend selection requires its explicit registration authorization"
 
-let selection_failure_kind = function
-  | Missing -> Agent_execution.Backend_unavailable
-  | Raw | Untrusted_binding | Custom_authorization_required ->
-      Agent_execution.Capability_mismatch
-
 let internal_mapping_message =
   "central execution telemetry could not be represented safely"
 
@@ -290,7 +285,7 @@ let runtime_capabilities descriptor =
     ~session_resume:capabilities.session_resume ~media_mime_types
     ~maximum_web:(web_level_of_cabal capabilities.web_support.maximum)
     ~restricted_web_domains:false ~read_only:capabilities.read_only_support
-    ~max_turns:true ~hard_timeout:true ~routing:true ~model_selection:true ()
+    ~max_turns:true ~hard_timeout:true ~routing:false ~model_selection:true ()
 
 let map_media_type mime_type =
   match mime_type with
@@ -752,6 +747,8 @@ let map_dispatch_kind = function
   | Runtime_dispatch.Invalid_timeout -> Agent_execution.Invalid_request
   | Runtime_dispatch.Backend_not_registered -> Agent_execution.Backend_unavailable
   | Runtime_dispatch.Runtime_registration_untrusted
+  | Runtime_dispatch.Runtime_entry_invalid _
+  | Runtime_dispatch.Expected_entry_mismatch
   | Runtime_dispatch.Backend_quarantined _
   | Runtime_dispatch.Backend_version_unsupported ->
       Agent_execution.Capability_mismatch
@@ -772,6 +769,8 @@ let dispatch_may_have_started = function
   | Runtime_dispatch.Invalid_timeout
   | Runtime_dispatch.Backend_not_registered
   | Runtime_dispatch.Runtime_registration_untrusted
+  | Runtime_dispatch.Runtime_entry_invalid _
+  | Runtime_dispatch.Expected_entry_mismatch
   | Runtime_dispatch.Backend_quarantined _
   | Runtime_dispatch.Preflight_failed _
   | Runtime_dispatch.Backend_version_unsupported
@@ -919,44 +918,39 @@ let map_error ~descriptor (error : Backend_completer.rich_completion_error) =
           | Ok error -> error
           | Error reason -> mapping_failure ~event_trace:trace ~reason ())
 
-let complete_request ~bootstrap ~sw ~env ~limits ~default_backend ?custom_backend
-    ~working_dir ~default_model request =
+let complete_request ~sw ~env ~limits ~backend_id ~entry ~working_dir
+    ~default_model ?after_selection request =
   match Agent_execution.read_only request with
   | None ->
       Error
         (dispatch_error Agent_execution.Invalid_request
            "Cabal bridge requires explicit read-only intent")
   | Some read_only -> (
-      match map_web_policy (Agent_execution.web_policy request) with
-      | Error message ->
-          Error (dispatch_error Agent_execution.Unsupported_request message)
-      | Ok web_access -> (
-          match map_attachments (Agent_execution.attachments request) with
+      match Agent_execution.routing request with
+      | Some requested when requested <> backend_id ->
+          Error
+            (dispatch_error Agent_execution.Capability_mismatch
+               "request routing does not match the runtime's bound backend")
+      | None | Some _ -> (
+          match map_web_policy (Agent_execution.web_policy request) with
           | Error message ->
               Error (dispatch_error Agent_execution.Unsupported_request message)
-          | Ok attachments ->
-              let backend_id =
-                Option.value ~default:default_backend
-                  (Agent_execution.routing request)
-              in
-              match
-                resolve_selection ~bootstrap ?custom_backend ~default_backend
-                  backend_id
-              with
-              | Error selection_error ->
+          | Ok web_access -> (
+              match map_attachments (Agent_execution.attachments request) with
+              | Error message ->
                   Error
-                    (dispatch_error
-                       (selection_failure_kind selection_error)
-                       (render_selection_error selection_error))
-              | Ok entry ->
+                    (dispatch_error Agent_execution.Unsupported_request message)
+              | Ok attachments ->
+                  Option.iter (fun hook -> hook ()) after_selection;
                   let model =
                     match Agent_execution.model request with
                     | Some _ as model -> model
                     | None -> default_model
                   in
                   match
-                    Backend_completer.make_rich ~sw ~env ~limits ~backend_name:backend_id
-                      ~working_dir ?model ~read_only ()
+                    Backend_completer.make_rich_with_entry ~sw ~env ~limits
+                      ~backend_name:backend_id ~working_dir
+                      ~expected_entry:entry ?model ~read_only ()
                   with
                   | Error message ->
                       Error
@@ -979,10 +973,10 @@ let complete_request ~bootstrap ~sw ~env ~limits ~default_backend ?custom_backen
                       | Error error ->
                           Error
                             (map_error ~descriptor:entry.effective_descriptor
-                               error)))
+                               error))))
 
-let create ~bootstrap ~sw ~env ~limits ~backend_id ~working_dir ?custom_backend
-    ?default_model () =
+let create_internal ?after_selection ~bootstrap ~sw ~env ~limits ~backend_id
+    ~working_dir ?custom_backend ?default_model () =
   if not (Runtime_bootstrap.valid_runtime_id backend_id)
      || String.trim backend_id <> backend_id
   then Error "backend id must be explicit, non-blank, and canonical"
@@ -1001,6 +995,17 @@ let create ~bootstrap ~sw ~env ~limits ~backend_id ~working_dir ?custom_backend
         let* capabilities = runtime_capabilities entry.effective_descriptor in
         Runtime.make ~identity:("cabal-" ^ backend_id) ~capabilities
           ~complete:
-            (complete_request ~bootstrap ~sw ~env ~limits
-               ~default_backend:backend_id ?custom_backend ~working_dir
-               ~default_model) ()
+            (complete_request ~sw ~env ~limits ~backend_id ~entry ~working_dir
+               ~default_model ?after_selection) ()
+
+let create ~bootstrap ~sw ~env ~limits ~backend_id ~working_dir ?custom_backend
+    ?default_model () =
+  create_internal ~bootstrap ~sw ~env ~limits ~backend_id ~working_dir
+    ?custom_backend ?default_model ()
+
+module Private = struct
+  let create_with_selection_hook ~bootstrap ~sw ~env ~limits ~backend_id
+      ~working_dir ?custom_backend ?default_model ~after_selection () =
+    create_internal ~after_selection ~bootstrap ~sw ~env ~limits ~backend_id
+      ~working_dir ?custom_backend ?default_model ()
+end

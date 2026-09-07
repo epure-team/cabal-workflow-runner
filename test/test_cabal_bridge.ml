@@ -5,7 +5,7 @@ let fail error = Alcotest.fail error
 
 let ok = function Ok value -> value | Error error -> fail error
 
-let bootstrap = ok (Cwr_cabal.bootstrap_hardened ())
+let bootstrap = ok (Cwr_cabal_internal.bootstrap_hardened ())
 
 let execution_ok = function
   | Ok value -> value
@@ -97,6 +97,7 @@ type observation = {
 }
 
 let make_backend ?(session_resume = false) ?(native = false)
+    ?(emit_result_text = true)
     ?(available = fun () -> true) ~id run =
   let observation =
     {calls = ref 0; availability_calls = ref 0; specs = ref []}
@@ -125,7 +126,7 @@ let make_backend ?(session_resume = false) ?(native = false)
       Option.iter
         (fun context ->
           if
-            result.Backend_types.agent_text <> ""
+            emit_result_text && result.Backend_types.agent_text <> ""
             && not (Task_execution_context.agent_text_emitted context)
           then
             Task_execution_context.emit context
@@ -153,17 +154,17 @@ let cost ?input ?output ?cache_creation ?cache_read ?usd () :
 let register ?binary_name ?baseline_version ?session_resume ?native ?read_only
     ?media_types ?web id backend =
   ok
-    (Cwr_cabal.register_custom_backend ~bootstrap
+    (Cwr_cabal_internal.register_custom_backend ~bootstrap
        ~descriptor:
          (descriptor ?binary_name ?baseline_version ?session_resume ?native
             ?read_only ?media_types ?web id)
        ~backend)
 
-let create ~sw ~env ?(limits = no_attachment_limits) ?custom_backend
-    ?default_model ~backend_id ~working_dir () =
+let create ~sw ~env ?(limits = no_attachment_limits) ?custom_backend ?default_model
+    ~backend_id ~working_dir () =
   ok
-    (Cwr_cabal.create ~bootstrap ~sw ~env ~limits ~backend_id ~working_dir
-       ?custom_backend ?default_model ())
+    (Cwr_cabal_internal.create ~bootstrap ~sw ~env ~limits ~backend_id
+       ~working_dir ?custom_backend ?default_model ())
 
 let request ?(id = "bridge-request") ?(system_prompt = "system")
     ?(user_prompt = "user") ?json_schema ?resume_session ?(attachments = [])
@@ -251,7 +252,7 @@ let test_hardened_entry_identity_is_pinned () =
   let original = validated_entry id in
   let expect_rejected ~sw ~env label =
     match
-      Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+      Cwr_cabal_internal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
         ~backend_id:id ~working_dir:"/tmp" ()
     with
     | Error _ -> ()
@@ -290,7 +291,7 @@ let test_custom_token_binds_exact_entry_and_bootstrap () =
   Eio_posix.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
   (match
-     Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+     Cwr_cabal_internal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
        ~backend_id:first_id ~working_dir:"/tmp" ~custom_backend:second_token ()
    with
   | Error _ -> ()
@@ -298,7 +299,7 @@ let test_custom_token_binds_exact_entry_and_bootstrap () =
   let original = validated_entry first_id in
   Registry.register_validated (clone_entry original);
   (match
-     Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+     Cwr_cabal_internal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
        ~backend_id:first_id ~working_dir:"/tmp" ~custom_backend:first_token ()
    with
   | Error _ -> ()
@@ -312,7 +313,7 @@ let test_concurrent_create_uses_immutable_bootstrap () =
   Eio_posix.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
   let make_runtime () =
-    Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+    Cwr_cabal_internal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
       ~backend_id:"codex" ~working_dir:"/tmp" ()
   in
   let left = ref None in
@@ -341,11 +342,12 @@ let test_exact_request_mapping () =
   in
   let id = "cwr-map-exact" in
   let backend, observation =
-    make_backend ~session_resume:true ~id (fun ~env:_ ~context:_ ~call:_ _ ->
+    make_backend ~session_resume:true ~native:true ~id
+      (fun ~env:_ ~context:_ ~call:_ _ ->
         result ~session_id:"returned-session" ())
   in
   let custom_backend =
-    register ~session_resume:true ~read_only:true
+    register ~session_resume:true ~native:true ~read_only:true
       ~media_types:[Backend_types.Png; Backend_types.Jpeg]
       ~web:Backend_types.Web_search_and_fetch id backend
   in
@@ -355,8 +357,31 @@ let test_exact_request_mapping () =
     create ~sw ~env ~limits:media_limits ~custom_backend ~backend_id:id
       ~working_dir:workspace ()
   in
+  let capabilities = Runtime.capabilities runtime in
+  Alcotest.(check bool) "native schema matches the bound entry" true
+    (Runtime.native_json_schema capabilities);
+  Alcotest.(check bool) "session resume matches the bound entry" true
+    (Runtime.session_resume capabilities);
+  Alcotest.(check bool) "attachments match the bound entry" true
+    (Runtime.attachments capabilities);
+  Alcotest.(check (list string)) "media types match the bound entry"
+    ["image/png"; "image/jpeg"]
+    (Runtime.media_mime_types capabilities);
+  Alcotest.(check bool) "maximum web matches the bound entry" true
+    (Runtime.maximum_web capabilities
+    = Agent_execution.Web_search_and_fetch);
+  Alcotest.(check bool) "domain restrictions remain unsupported" false
+    (Runtime.restricted_web_domains capabilities);
+  Alcotest.(check bool) "read only matches the bound entry" true
+    (Runtime.read_only capabilities);
   Alcotest.(check bool) "max turns are accepted and forwarded" true
-    (Runtime.max_turns (Runtime.capabilities runtime));
+    (Runtime.max_turns capabilities);
+  Alcotest.(check bool) "central deadline is hard" true
+    (Runtime.hard_timeout capabilities);
+  Alcotest.(check bool) "fixed runtime does not advertise routing" false
+    (Runtime.routing capabilities);
+  Alcotest.(check bool) "per-request model selection is forwarded" true
+    (Runtime.model_selection capabilities);
   let schema = `Assoc [("type", `String "object")] in
   let mapped =
     request ~system_prompt:" system prompt with spaces "
@@ -438,7 +463,164 @@ let test_exact_request_mapping () =
     (Some "returned-session")
     (Agent_execution.final_session_id mapped);
   Alcotest.(check bool) "sealed attachment cleanup retained" true
-    (Agent_execution.cleanup_status mapped = Agent_execution.Cleanup_succeeded)
+    (Agent_execution.cleanup_status mapped = Agent_execution.Cleanup_succeeded);
+  (match Runtime.complete runtime (request ~routing:"another-backend" ()) with
+  | Error error -> (
+      match Agent_execution.error_view error with
+      | Agent_execution.Dispatch_failure
+          {kind = Agent_execution.Capability_mismatch; message; _} ->
+          Alcotest.(check bool) "cross-backend routing diagnostic" true
+            (contains message "bound backend")
+      | _ -> fail "cross-backend routing was misclassified")
+  | Ok _ -> fail "fixed runtime switched backend per request");
+  Alcotest.(check int) "routing mismatch precedes Cabal dispatch" 1
+    !(observation.calls)
+
+let test_guarded_dispatch_rejects_selected_entry_replacement () =
+  let id = "cwr-guarded-race" in
+  let original_backend, original_observation =
+    make_backend ~id (fun ~env:_ ~context:_ ~call:_ _ ->
+        result ~text:{|{"original":true}|} ())
+  in
+  let token = register id original_backend in
+  let original_entry = validated_entry id in
+  let replacement_backend, replacement_observation =
+    make_backend ~id (fun ~env:_ ~context:_ ~call:_ _ ->
+        result ~text:{|{"replacement":true}|} ())
+  in
+  let replacement_entry =
+    clone_entry ~backend:replacement_backend original_entry
+  in
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let runtime =
+    ok
+      (Cwr_cabal_internal.Private.create_with_selection_hook ~bootstrap ~sw ~env
+         ~limits:no_attachment_limits ~backend_id:id ~working_dir:"/tmp"
+         ~custom_backend:token
+         ~after_selection:(fun () -> Registry.register_validated replacement_entry)
+         ())
+  in
+  let outcome =
+    Fun.protect
+      ~finally:(fun () -> Registry.register_validated original_entry)
+      (fun () -> Runtime.complete runtime (request ()))
+  in
+  (match outcome with
+  | Error error -> (
+      match Agent_execution.error_view error with
+      | Agent_execution.Dispatch_failure
+          {kind = Agent_execution.Capability_mismatch; message; _} ->
+          Alcotest.(check bool) "guard mismatch is sanitized" true
+            (contains message "expected entry identity")
+      | _ -> fail "guarded replacement was misclassified")
+  | Ok response ->
+      Alcotest.failf "replacement race executed: %s"
+        (Agent_execution.final_text response));
+  Alcotest.(check int) "captured original not invoked after replacement" 0
+    !(original_observation.calls);
+  Alcotest.(check int) "replacement never invoked" 0
+    !(replacement_observation.calls)
+
+let test_guarded_dispatch_keeps_snapshot_after_capture () =
+  let id = "cwr-guarded-snapshot" in
+  let replacement_entry = ref None in
+  let original_backend, original_observation =
+    make_backend
+      ~available:(fun () ->
+        Option.iter Registry.register_validated !replacement_entry;
+        true)
+      ~id (fun ~env:_ ~context:_ ~call:_ _ ->
+        result ~text:{|{"original":true}|} ())
+  in
+  let token = register id original_backend in
+  let original_entry = validated_entry id in
+  let replacement_backend, replacement_observation =
+    make_backend ~id (fun ~env:_ ~context:_ ~call:_ _ ->
+        result ~text:{|{"replacement":true}|} ())
+  in
+  replacement_entry :=
+    Some (clone_entry ~backend:replacement_backend original_entry);
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let runtime =
+    create ~sw ~env ~custom_backend:token ~backend_id:id ~working_dir:"/tmp" ()
+  in
+  let outcome =
+    Fun.protect
+      ~finally:(fun () -> Registry.register_validated original_entry)
+      (fun () -> Runtime.complete runtime (request ()))
+  in
+  let response = execution_ok outcome in
+  Alcotest.(check (option bool)) "captured original produced the result"
+    (Some true)
+    (match Agent_execution.final_structured_json response with
+    | Some (`Assoc fields) -> (
+        match List.assoc_opt "original" fields with
+        | Some (`Bool value) -> Some value
+        | _ -> None)
+    | _ -> None);
+  Alcotest.(check int) "captured original invoked once" 1
+    !(original_observation.calls);
+  Alcotest.(check int) "late replacement never invoked" 0
+    !(replacement_observation.calls)
+
+let test_final_agent_text_fallback_is_preserved () =
+  let id = "cwr-final-text-fallback" in
+  let final_text = {|{"fallback":true}|} in
+  let backend, observation =
+    make_backend ~emit_result_text:false ~id
+      (fun ~env:_ ~context:_ ~call:_ _ -> result ~text:final_text ())
+  in
+  let custom_backend = register id backend in
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let runtime =
+    create ~sw ~env ~custom_backend ~backend_id:id ~working_dir:"/tmp" ()
+  in
+  let response = Runtime.complete runtime (request ()) |> execution_ok in
+  let trace =
+    match Agent_execution.event_trace response with
+    | Some trace -> trace
+    | None -> fail "final fallback trace was absent"
+  in
+  let events = Workflow_event.events trace in
+  Alcotest.(check int) "one final fallback text event" 1
+    (List.fold_left
+       (fun count event ->
+         match Workflow_event.payload event with
+         | Workflow_event.Agent_text_delta _ -> count + 1
+         | _ -> count)
+       0 events);
+  let rec adjacent = function
+    | finish :: text :: terminal :: rest -> (
+        match
+          ( Workflow_event.payload finish,
+            Workflow_event.payload text,
+            Workflow_event.payload terminal )
+        with
+        | ( Workflow_event.Attempt_finished Workflow_event.Attempt_succeeded,
+            Workflow_event.Agent_text_delta actual,
+            Workflow_event.Terminal Workflow_event.Succeeded ) ->
+            Some (finish, text, actual)
+        | _ -> adjacent (text :: terminal :: rest))
+    | _ -> None
+  in
+  (match adjacent events with
+  | Some (finish, text, actual) ->
+      Alcotest.(check string) "fallback text is source-preserved" final_text actual;
+      Alcotest.(check bool) "fallback text is nonempty" true (actual <> "");
+      Alcotest.(check bool) "fallback text is bounded" true
+        (String.length actual <= Workflow_event.max_text_bytes);
+      Alcotest.(check int64) "fallback sequence follows attempt finish"
+        (Int64.succ (Workflow_event.seq finish))
+        (Workflow_event.seq text);
+      Alcotest.(check int) "fallback remains on the finished attempt"
+        (Workflow_event.attempt finish) (Workflow_event.attempt text);
+      Alcotest.(check bool) "fallback timestamp remains ordered" true
+        (Workflow_event.elapsed_s text >= Workflow_event.elapsed_s finish)
+  | None -> fail "final fallback was not immediately before the terminal");
+  Alcotest.(check int) "fallback backend called once" 1 !(observation.calls)
 
 let test_nonresume_prompt_and_default_model () =
   let id = "cwr-map-prompt" in
@@ -737,7 +919,7 @@ let test_missing_blank_untrusted_and_quarantined_backends () =
   Eio.Switch.run @@ fun sw ->
   let expect_create_error ?custom_backend backend_id =
     match
-      Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+      Cwr_cabal_internal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
         ~backend_id ~working_dir:"/tmp" ?custom_backend ()
     with
     | Error _ -> ()
@@ -966,7 +1148,7 @@ let test_clear_and_rebootstrap_do_not_refresh_trust () =
   Eio.Switch.run @@ fun sw ->
   let expect_old_handle_rejected label =
     match
-      Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+      Cwr_cabal_internal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
         ~backend_id:"codex" ~working_dir:"/tmp" ()
     with
     | Error _ -> ()
@@ -1145,6 +1327,10 @@ let () =
             test_custom_token_binds_exact_entry_and_bootstrap;
           Alcotest.test_case "concurrent create" `Quick
             test_concurrent_create_uses_immutable_bootstrap;
+          Alcotest.test_case "selected entry replacement is guarded" `Quick
+            test_guarded_dispatch_rejects_selected_entry_replacement;
+          Alcotest.test_case "captured entry survives later replacement" `Quick
+            test_guarded_dispatch_keeps_snapshot_after_capture;
           Alcotest.test_case "missing blank raw and quarantined" `Quick
             test_missing_blank_untrusted_and_quarantined_backends;
           Alcotest.test_case "unavailable and zero-attempt timeout" `Quick
@@ -1175,6 +1361,8 @@ let () =
             test_cost_rounding_sessions_and_event_truncation;
           Alcotest.test_case "process and tool event normalization" `Quick
             test_process_and_tool_events_are_normalized;
+          Alcotest.test_case "final agent text fallback" `Quick
+            test_final_agent_text_fallback_is_preserved;
         ] );
       ( "destructive lifecycle",
         [

@@ -3,9 +3,9 @@
     This is a separate installable library. The core [cabal_workflow_runner]
     library remains Cabal-free; applications opt into this module by linking
     [cabal_workflow_runner.cabal_bridge]. All task execution goes through
-    [Cabal.Backend_completer.make_rich] and therefore through Cabal's central
-    registry, capability/input preflight, deadline, schema-enforcement, event,
-    and cleanup owners. *)
+    [Cabal.Backend_completer.make_rich_with_entry] and therefore through Cabal's
+    guarded central registry, capability/input preflight, deadline,
+    schema-enforcement, event, and cleanup owners. *)
 
 type bootstrap
 (** Opaque identity snapshot for the exact validated runtime entries installed
@@ -62,15 +62,22 @@ val create :
     has no model hint.
 
     Every completion requires explicit CWR read-only intent and maps one request
-    through [Backend_completer.make_completion_request]. The request model,
-    read-only flag, and selected backend are constructor inputs to
-    [Backend_completer.make_rich]. A request routing hint may select another
-    intact hardened built-in; it cannot silently select raw, extensible YAML, or
-    another custom backend. Every call rechecks the current registry entry
-    against the bootstrap's captured metadata and physical entry/backend
-    identities, so an equal-looking validated replacement is rejected. The
-    explicitly selected custom backend is accepted only with its matching
-    bootstrap-bound [custom_backend] token and unchanged physical entry.
+    through [Backend_completer.make_completion_request]. The returned runtime is
+    permanently bound to the exact entry selected during construction and
+    advertises [routing=false]. A request routing hint is accepted only when
+    absent or equal to [backend_id]; any other value is rejected before Cabal
+    dispatch. Native-schema, session, media MIME, maximum-web, and read-only
+    capabilities are projected from that exact entry. The bridge additionally
+    advertises its own maximum-turn forwarding, hard deadline, and per-request
+    model support; restricted-domain web policy and cross-backend routing remain
+    false. The request model and read-only flag are constructor inputs to
+    [Backend_completer.make_rich_with_entry]. That guarded call performs the sole
+    registry lookup, complete entry revalidation, physical-identity comparison,
+    and backend capture for the invocation. An equal-looking validated
+    replacement therefore fails, and registry mutation after capture cannot
+    switch the invocation away from its captured original. The explicitly
+    selected custom backend is accepted only with its matching bootstrap-bound
+    [custom_backend] token and unchanged physical entry.
 
     CWR [image/png] and [image/jpeg] attachments map exactly to Cabal media
     types, in request order. Other MIME types, oversized integer metadata, and
@@ -101,8 +108,11 @@ val create :
     delivery, elapsed, session, usage/cost, cleanup, continuation, and bounded
     normalized event evidence in CWR Batch-1 types. Raw protocol lines, stdout,
     stderr, process ids, tool arguments, chain-of-thought, and attachment paths
-    are never projected. Cabal may deliver final [Session_id] and [Token_usage]
-    metadata immediately after its transport [Attempt_finished] notification.
-    [Workflow_event] permits only those two same-attempt final observations in
-    that position. The bridge preserves their original sequence, attempt, and
-    elapsed envelopes; it never rotates or reassociates them. *)
+    are never projected. Cabal may deliver final [Session_id], a non-empty
+    bounded [Agent_text_delta] fallback when no prior agent text was emitted, and
+    [Token_usage] immediately after its transport [Attempt_finished]
+    notification. [Workflow_event] permits only those ordered same-attempt final
+    observations in that position. The bridge preserves their original sequence,
+    attempt, elapsed, and payload envelopes; it never rotates or reassociates
+    them. Final public text/session/usage parser observations may also occur
+    after process exit while [Attempt_finished] is still pending. *)

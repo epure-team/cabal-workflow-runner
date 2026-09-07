@@ -28,6 +28,23 @@ let test_eio_cancellation_propagates () =
    with Eio.Cancel.Cancelled _ -> cancelled := true);
   Alcotest.(check bool) "cancellation propagated" true !cancelled
 
+let test_live_agent_type_is_fixed_to_bound_backend () =
+  let check label expected input =
+    Alcotest.(check (result (option string) string)) label expected
+      (Backend_cabal.live_agent_routing ~backend_id:"codex" input)
+  in
+  check "omitted agent type" (Ok None) None;
+  check "blank agent type remains omitted" (Ok None) (Some "  ");
+  check "equal agent type" (Ok (Some "codex")) (Some "codex");
+  check "trimmed equal agent type" (Ok (Some "codex")) (Some " codex ");
+  match
+    Backend_cabal.live_agent_routing ~backend_id:"codex" (Some "reviewer")
+  with
+  | Error message ->
+      Alcotest.(check bool) "mismatch diagnostic is fixed" true
+        (message = "agent_type does not match the bound live backend")
+  | Ok _ -> Alcotest.fail "cross-backend agent_type was accepted"
+
 let () =
   Alcotest.run "CWR Cabal legacy shell adapter"
     [
@@ -39,5 +56,7 @@ let () =
             test_fatal_shell_exceptions_propagate;
           Alcotest.test_case "Eio cancellation propagates" `Quick
             test_eio_cancellation_propagates;
+          Alcotest.test_case "live agent type is fixed" `Quick
+            test_live_agent_type_is_fixed_to_bound_backend;
         ] );
     ]

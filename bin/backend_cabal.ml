@@ -59,6 +59,14 @@ let protect_shell_command run =
   | (Out_of_memory | Stack_overflow | Sys.Break) as fatal -> raise fatal
   | _ -> 127
 
+let live_agent_routing ~backend_id = function
+  | None -> Ok None
+  | Some value ->
+      let requested = String.trim value in
+      if requested = "" then Ok None
+      else if requested = backend_id then Ok (Some backend_id)
+      else Error "agent_type does not match the bound live backend"
+
 let make ~sw ~env ~working_dir =
   let* backend_id = required_backend_id () in
   let* bootstrap = Cwr_cabal.bootstrap_hardened () in
@@ -74,29 +82,27 @@ let make ~sw ~env ~working_dir =
         !budget_counter)
   in
   let run_agent ~id ~prompt ~read_only ~agent_type ~model ~output_schema =
-    let routing =
-      match agent_type with
-      | Some value when String.trim value <> "" -> Some (String.trim value)
-      | Some _ | None -> None
-    in
-    let model =
-      match model with
-      | Some value when String.trim value <> "" -> Some (String.trim value)
-      | Some _ | None -> None
-    in
-    let json_schema = Option.map Types.Schema.to_json_schema output_schema in
-    match
-      Agent_execution.make_request ~id
-        ~system_prompt:
-          "Return exactly one JSON object or array without prose or a code fence."
-        ~user_prompt:prompt ~timeout_s:max_float ?json_schema ?routing ?model
-        ~read_only ()
-    with
-    | Error _ -> strict_json_error "invalid rich agent request"
-    | Ok request -> (
-        match Runtime.complete runtime request with
-        | Ok response -> project_completion response
-        | Error error -> project_completion_error error)
+    match live_agent_routing ~backend_id agent_type with
+    | Error message -> strict_json_error message
+    | Ok routing ->
+        let model =
+          match model with
+          | Some value when String.trim value <> "" -> Some (String.trim value)
+          | Some _ | None -> None
+        in
+        let json_schema = Option.map Types.Schema.to_json_schema output_schema in
+        (match
+           Agent_execution.make_request ~id
+             ~system_prompt:
+               "Return exactly one JSON object or array without prose or a code fence."
+             ~user_prompt:prompt ~timeout_s:max_float ?json_schema ?routing ?model
+             ~read_only ()
+         with
+        | Error _ -> strict_json_error "invalid rich agent request"
+        | Ok request -> (
+            match Runtime.complete runtime request with
+            | Ok response -> project_completion response
+            | Error error -> project_completion_error error))
   in
   let run_command = Cwr_runner.Runner.make ~sw ~env ~base:working_dir in
   let run_pinned_command =

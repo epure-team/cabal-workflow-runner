@@ -80,7 +80,28 @@ let check_dispatch_error expected_kind expected_message error =
   | Agent_execution.Dispatch_failure {kind; message; event_trace} ->
       Alcotest.(check bool) "dispatch kind" true (kind = expected_kind);
       Alcotest.(check string) "sanitized message" expected_message message;
-      check_trace_some_and_attempt "pre-invocation trace" 0 event_trace
+      check_trace_some_and_attempt "pre-invocation trace" 0 event_trace;
+      (match event_trace with
+      | Some trace -> (
+          match Workflow_event.events trace with
+          | [started; terminal] ->
+              Alcotest.(check int64) "start sequence preserved" 1L
+                (Workflow_event.seq started);
+              Alcotest.(check (float 0.0)) "start timestamp preserved" 0.0
+                (Workflow_event.elapsed_s started);
+              Alcotest.(check bool) "start payload preserved" true
+                (Workflow_event.payload started = Workflow_event.Task_started);
+              Alcotest.(check int64) "terminal sequence preserved" 2L
+                (Workflow_event.seq terminal);
+              Alcotest.(check (float 0.0)) "terminal timestamp preserved" 0.1
+                (Workflow_event.elapsed_s terminal);
+              Alcotest.(check bool) "terminal payload safely preserved" true
+                (Workflow_event.payload terminal
+                = Workflow_event.Terminal Workflow_event.Failed)
+          | events ->
+              Alcotest.failf "expected two pre-dispatch events, got %d"
+                (List.length events))
+      | None -> fail "pre-invocation trace was dropped")
   | _ -> fail "expected dispatch failure"
 
 let test_dispatch_failure_table () =
@@ -95,6 +116,10 @@ let test_dispatch_failure_table () =
       ( Runtime_dispatch.Backend_not_registered,
         Agent_execution.Backend_unavailable );
       ( Runtime_dispatch.Runtime_registration_untrusted,
+        Agent_execution.Capability_mismatch );
+      ( Runtime_dispatch.Runtime_entry_invalid Runtime_entry.Runtime_id_mismatch,
+        Agent_execution.Capability_mismatch );
+      ( Runtime_dispatch.Expected_entry_mismatch,
         Agent_execution.Capability_mismatch );
       ( Runtime_dispatch.Backend_quarantined
           Runtime_entry.Incomplete_mcp_isolation,
