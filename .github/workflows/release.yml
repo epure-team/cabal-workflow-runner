@@ -31,7 +31,7 @@ jobs:
               set -ex
               apk add --no-cache git musl-dev linux-headers liburing-dev pkgconf
               git config --global --add safe.directory /workspace
-              opam pin add -n cabal https://github.com/epure-team/cabal.git#eccda75cede474c8682db41ab5c99d639a655441 --yes
+              opam pin add -n cabal https://github.com/epure-team/cabal.git#c500033f9f45412936fd247a88f125844a2300db --yes
               opam install . --deps-only --yes
               opam exec -- dune build --profile static bin/main.exe
               install -m 755 _build/default/bin/main.exe cabal-workflow-runner-linux-amd64
@@ -64,7 +64,7 @@ jobs:
               set -ex
               apk add --no-cache git musl-dev linux-headers liburing-dev pkgconf
               git config --global --add safe.directory /workspace
-              opam pin add -n cabal https://github.com/epure-team/cabal.git#eccda75cede474c8682db41ab5c99d639a655441 --yes
+              opam pin add -n cabal https://github.com/epure-team/cabal.git#c500033f9f45412936fd247a88f125844a2300db --yes
               opam install . --deps-only --yes
               opam exec -- dune build --profile static bin/main.exe
               install -m 755 _build/default/bin/main.exe cabal-workflow-runner-linux-arm64
@@ -87,7 +87,7 @@ jobs:
       - name: Pin cabal and install deps
         run: |
           export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-          opam pin add -n cabal https://github.com/epure-team/cabal.git#eccda75cede474c8682db41ab5c99d639a655441 --yes
+          opam pin add -n cabal https://github.com/epure-team/cabal.git#c500033f9f45412936fd247a88f125844a2300db --yes
           opam install . --deps-only --yes
 
       - name: Build

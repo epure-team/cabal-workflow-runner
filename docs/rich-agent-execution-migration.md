@@ -13,6 +13,18 @@ Callers adopting the new API must observe these fail-closed boundaries:
   same process. Custom tokens are bound to that handle, ID, and exact entry.
   There is no first-available, raw-registration, YAML-adapter, or direct
   `Agentic_backend` fallback.
+- Treat every `Cwr_cabal.create` result as fixed to the exact entry selected at
+  construction. Its native-schema, session, media MIME, maximum-web, and
+  read-only claims project that bound descriptor. Maximum-turn forwarding, hard
+  deadlines, and model selection are bridge guarantees; restricted-domain web
+  policy and routing are false. Request routing is a compatibility input only:
+  omit it or pass the bound backend ID. Any other role/backend string fails
+  before Cabal dispatch. This is also the live CLI rule for legacy `agent_type`.
+- Keep `Backend_completer.make_rich_with_entry` as the sole call-time dispatch
+  authority. Pass the selected snapshot as `~expected_entry`; do not precede an
+  unguarded by-name call with a separate registry identity check. A replacement
+  before Cabal capture must fail, while one after capture may execute only the
+  captured original.
 - Pass an explicit `~status` to `Agent_execution.make_response`. It must agree
   with the final transport attempt, except that a transport-successful attempt
   carrying `schema_error` uses an overall `Failed _` status.
@@ -61,9 +73,14 @@ Callers adopting the new API must observe these fail-closed boundaries:
   constructors. `Exited code` rejects negative values but intentionally accepts
   every non-negative host `int`, without a Unix-only 255 ceiling.
 - Preserve each event's sequence number, attempt, elapsed time, and payload.
-  Cabal may deliver final session and usage metadata immediately after
-  `Attempt_finished`; only those two same-attempt observations are valid before
-  the terminal. Never rotate or reassociate payloads to make a trace fit.
+  Cabal may deliver final session metadata, one non-empty bounded agent-text
+  fallback when no earlier agent text was emitted, and final usage immediately
+  after `Attempt_finished`; only those ordered same-attempt observations are
+  valid before the terminal. Never rotate or reassociate payloads to make a
+  trace fit. For a definitely pre-dispatch failure, normalize only `attempt` to
+  zero; preserve the source sequence, timestamp, and safely mapped payload.
+  Final public text/session/usage parser observations may occur after process
+  exit while the attempt remains open; do not reject that Cabal ordering.
 - Emit `Usage_observed` as cumulative per-attempt snapshots, not deltas. Known
   dimensions must never decrease. Every known value remains a lower bound even
   if later snapshots omit that dimension, delivery is truncated, or a sequence
@@ -107,10 +124,10 @@ Callers adopting the new API must observe these fail-closed boundaries:
 The event trace remains a bounded post-outcome value. This migration does not
 add a live event stream or wire the rich runtime into `Engine.run`.
 
-## Current Cabal `make_rich` outcome map
+## Current guarded Cabal rich-completion outcome map
 
 This table records the integration contract inspected in Cabal's current
-`Backend_completer.make_rich`, `Runtime_dispatch.detailed_error`, and
+`Backend_completer.make_rich_with_entry`, `Runtime_dispatch.detailed_error`, and
 `Backend_types.task_execution_error`. It is a bridge specification, not a Cabal
 dependency in this library. Every callback row preserves Cabal's complete
 bounded normalized outer trace; private/raw fields outside CWR's safe contract
@@ -125,7 +142,7 @@ a coherent completed execution, notably successful execution followed by sealed
 input cleanup failure, is `Post_execution_dispatch_failed` and keeps the
 completed response independent from the outer failed trace.
 
-| Cabal `make_rich` outcome | Host-neutral CWR shape |
+| Cabal guarded rich-completion outcome | Host-neutral CWR shape |
 |---|---|
 | Constructor `Error _` (the routing id is malformed) | `Dispatch_error Invalid_request` |
 | Constructor `Ok rich_completer` | Preserve the callback; construction performs no dispatch |
@@ -198,6 +215,8 @@ is exhaustive for the current `Runtime_dispatch.error` algebra:
 | `Invalid_timeout` | Definitely not invoked | `Dispatch_failure Invalid_request` |
 | `Backend_not_registered` | Definitely not invoked | `Dispatch_failure Backend_unavailable` |
 | `Runtime_registration_untrusted` | Definitely not invoked | `Dispatch_failure Capability_mismatch` |
+| `Runtime_entry_invalid _` | Definitely not invoked | `Dispatch_failure Capability_mismatch` |
+| `Expected_entry_mismatch` | Definitely not invoked | `Dispatch_failure Capability_mismatch` |
 | `Backend_quarantined _` | Definitely not invoked | `Dispatch_failure Capability_mismatch` |
 | `Preflight_failed _` | Definitely not invoked when carried by plain `Dispatch_failure`; post-execution cleanup uses `Dispatch_failure_with_execution` | `Dispatch_failure Preflight_failed`, or the post-execution shape in the table above |
 | `Backend_version_unsupported` | Definitely not invoked | `Dispatch_failure Capability_mismatch` |
@@ -207,7 +226,7 @@ is exhaustive for the current `Runtime_dispatch.error` algebra:
 | `Prepared_already_consumed` | Definitely not invoked by this call | `Dispatch_failure Internal_dispatch_failure` |
 | `Backend_execution_failed` in plain `Dispatch_failure` | May have started, no completed result | `No_completed_attempt { status = Failed _; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
 | `Backend_execution_failed` in `Dispatch_failure_with_execution` with a synthetic failed final result | Completed progress exists; a continuation may be invoked but uncommitted | `Incomplete_execution` with outer `Failed _`, exact completed prefix, optional continuation, and complete outer trace |
-| `Schema_enforcement_failed _` | The current detailed `make_rich` path does not emit this compatibility projection; structured cases are `Execution_failure` | If received defensively, `No_completed_attempt { status = Failed _; invocation_may_have_started = true; event_trace = Some mapped_trace }`; never claim pre-invocation |
+| `Schema_enforcement_failed _` | The current detailed guarded path does not emit this compatibility projection; structured cases are `Execution_failure` | If received defensively, `No_completed_attempt { status = Failed _; invocation_may_have_started = true; event_trace = Some mapped_trace }`; never claim pre-invocation |
 
 Attempt kinds, result statuses, token counts, delivery modes, media counts, web
 levels, cleanup states, sessions, and normalized events have direct conservative
@@ -215,6 +234,17 @@ projections. Opaque retry reasons map to `Other_redacted`; process-exit text tha
 cannot be classified maps to `Unknown`; process ids and raw process streams are
 deliberately outside the safe host-neutral projection. These are explicit
 redactions, not rewritten telemetry.
+
+## Cabal release migration blocker
+
+- [ ] A Cabal release must contain commit
+  `c500033f9f45412936fd247a88f125844a2300db` before this bridge is merged or
+  published as normally installable.
+- [ ] Until then, keep CI, release, and developer setup pinned to that exact
+  commit. Do not guess a future package version or claim release readiness.
+- [ ] Once released, verify a clean unpinned package installation, then update
+  dependency metadata and remove the temporary commit pins in one reviewed
+  migration.
 
 The installable bridge applies one deterministic conversion policy to Cabal's
 optional `cost_usd : float`: finite non-negative values become

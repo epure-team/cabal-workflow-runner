@@ -12,7 +12,7 @@ Everything is built and tested in an opam switch that has the public
 `cabal`, `eio_posix`, `eio_main`, `cmdliner`, and `alcotest`. Pin cabal and install deps:
 
 ```sh
-opam pin add -n cabal https://github.com/epure-team/cabal.git#eccda75cede474c8682db41ab5c99d639a655441
+opam pin add -n cabal https://github.com/epure-team/cabal.git#c500033f9f45412936fd247a88f125844a2300db
 opam install . --deps-only --with-test
 
 dune build
@@ -69,21 +69,25 @@ extending the contract.
 Production startup must call `Cwr_cabal.bootstrap_hardened ()` exactly once while the
 Cabal registry is empty, retain its opaque handle, and pass `~bootstrap` to every
 `Cwr_cabal.create` or `register_custom_backend` call. Do not add a first-available,
-direct `Agentic_backend`, YAML-adapter, or registry-rebootstrap bypass. Hardened routing
-is authorized by the exact physical entries/backends captured at bootstrap; custom
-routing additionally requires its bootstrap-bound opaque token. `CWR_BACKEND` remains a
-required explicit canonical ID for the CLI.
+direct `Agentic_backend`, YAML-adapter, or registry-rebootstrap bypass. Each runtime is
+authorized by one exact physical entry/backend captured at construction; it advertises
+no cross-backend routing and accepts a request routing value only when it equals the
+bound ID. Custom selection additionally requires its bootstrap-bound opaque token.
+`CWR_BACKEND` remains a required explicit canonical ID for the CLI.
 
-All bridge execution goes through `Backend_completer.make_rich`, including central
-registry consistency, input/capability preflight, version/availability checks, schema
-enforcement, event collection, deadlines, and cleanup. Caller-owned attachment limits
-remain mandatory. A maximum-turn value is accepted and forwarded, but this does not by
-itself prove that every backend CLI enforces the value.
+All bridge execution goes through guarded
+`Backend_completer.make_rich_with_entry`, including the sole call-time registry lookup,
+exact-entry identity guard, input/capability preflight, version/availability checks,
+schema enforcement, event collection, deadlines, and cleanup. Caller-owned attachment
+limits remain mandatory. A maximum-turn value is accepted and forwarded, but this does
+not by itself prove that every backend CLI enforces the value.
 
 Keep event envelopes faithful: never rotate or reassociate payloads to make a trace
-validate. Only same-attempt final session and usage observations may follow
-`Attempt_finished`. When invalid or contradictory source telemetry prevents a richer
-constructor but the normalized source trace is valid, return
+validate. Only ordered same-attempt final session metadata, one non-empty bounded text
+fallback when no earlier text exists, and final usage metadata may follow
+`Attempt_finished`. Final public text/session/usage parser observations may follow
+process exit before the attempt finishes. When invalid or contradictory source
+telemetry prevents a richer constructor but the normalized source trace is valid, return
 `Telemetry_mapping_failure` with that exact trace. Strict structured output accepts only
 standard JSON objects/arrays; valid but different structured-report and normalized-text
 values are a conflict and must fail closed.
@@ -93,6 +97,15 @@ must re-raise Eio cancellation and `Out_of_memory`, `Stack_overflow`, and `Sys.B
 Add mapping cases to `test/test_cabal_bridge_mapping.ml`, integration/identity cases to
 `test/test_cabal_bridge.ml`, event-model cases to `test/test_agent_execution.ml`, and
 shell classification cases to `test/test_backend_cabal.ml`.
+
+### Cabal release blocker
+
+- [ ] Do not merge or publish this bridge as normally installable until a Cabal release
+      contains commit `c500033f9f45412936fd247a88f125844a2300db`.
+- [ ] Keep CI, release, and developer setup pinned to that exact commit until the release
+      exists; do not invent a package-version constraint in advance.
+- [ ] After the Cabal release, verify a clean unpinned package installation before
+      replacing the commit pin and clearing this blocker.
 
 ## Safety floor must not regress
 

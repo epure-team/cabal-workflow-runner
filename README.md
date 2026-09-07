@@ -78,7 +78,7 @@ verdicts rather than on an LLM's opinion of its own diff. See
 The core library exposes a host-neutral rich contract without changing the workflow
 format or wiring it directly into `Engine.run`. The separately installable
 `cabal_workflow_runner.cabal_bridge` library implements that contract through Cabal's
-central `Backend_completer.make_rich` path:
+central guarded `Backend_completer.make_rich_with_entry` path:
 
 - `Agent_execution` validates opaque requests with separate system/user prompts,
   finite positive timeouts, optional JSON Schema/session/routing/model/read-only
@@ -130,9 +130,12 @@ central `Backend_completer.make_rich` path:
   rejects visible phase, attempt, retry, and process-order contradictions, negative
   process exit codes, and decreasing known cumulative usage/cost snapshots. Exit codes
   otherwise use the host's non-negative `int` range rather than a Unix-specific ceiling.
-  After `Attempt_finished`, only same-attempt final session and cumulative usage metadata
-  may precede the terminal; their sequence, attempt, elapsed time, and payload remain
-  attached to the original event rather than being rotated to fit the lifecycle.
+  After `Attempt_finished`, only same-attempt final session metadata, one non-empty
+  bounded agent-text fallback when no earlier agent text was observed, and final
+  cumulative usage metadata may precede the terminal, in that order. Their sequence,
+  attempt, elapsed time, and payload remain attached to the original event rather than
+  being rotated to fit the lifecycle. A backend's final public text/session/usage parser
+  observations may also follow process exit while the transport attempt is still open.
   This batch does **not** claim live event streaming.
 - `Runtime` wraps one completion function. `Runtime.of_legacy_backend` adapts the
   unchanged `Backend.t` honestly as one synthetic attempt with unknown usage/cost, no
@@ -155,17 +158,25 @@ projections; incomplete and post-execution error bounds include a separately ret
 outer trace.
 See the [rich execution migration
 notes](docs/rich-agent-execution-migration.md) for adoption details and the exhaustive
-mapping from Cabal's current `Backend_completer.make_rich` outcomes.
+mapping from Cabal's current guarded rich-completion outcomes.
 
 `Cwr_cabal.bootstrap_hardened ()` must run once while the Cabal registry is empty and
 returns an opaque process-lifetime identity handle. Successful bootstrap is one-shot even
 if test-only code later clears and rebuilds Cabal's registry. `Cwr_cabal.create
 ~bootstrap` then requires that handle, an explicit backend id, working directory, and
 caller-owned `Task_preflight.limits`; it never chooses a first-available backend or
-defines product attachment limits. Every selection rechecks the exact physical registry
-entry/backend identities captured by the handle, so raw registrations and equal-looking
-validated replacements fail closed. Hardened bootstrap ignores project/user/global
-adapter configuration. Tests may add one explicitly authorized custom backend with
+defines product attachment limits. Each returned runtime is permanently bound to the
+exact physical entry selected at construction and advertises `routing=false`. A request
+routing hint is accepted only when absent or equal to that bound backend; any other value
+fails before Cabal dispatch. Native-schema, session, media MIME, maximum-web, and
+read-only capabilities match the bound entry; maximum-turn forwarding, hard deadlines,
+and model selection are bridge guarantees, while restricted domains and routing remain
+false. Each call delegates the sole registry lookup, complete entry
+revalidation, physical-identity guard, and backend capture to
+`Backend_completer.make_rich_with_entry`, so raw registrations and equal-looking
+validated replacements fail closed while mutation after capture can execute only the
+captured original. Hardened bootstrap ignores project/user/global adapter configuration.
+Tests may add one explicitly authorized custom backend with
 `Cwr_cabal.register_custom_backend ~bootstrap`; its opaque token is bound to that handle,
 id, and exact entry. The handle is immutable and supports concurrent `create` calls.
 
@@ -186,9 +197,15 @@ add `cabal` and `eio_posix`. The executable/test toolchain also uses `eio_main`,
 `cmdliner`, and `alcotest`. CI and release builds pin the audited Cabal rich-runtime
 contract commit:
 
+> **Release blocker:** normal package installation is not supported until Cabal
+> releases the guarded API containing
+> `c500033f9f45412936fd247a88f125844a2300db`. Keep the exact commit pin below;
+> do not infer a future package-version constraint or treat this state as
+> release-ready.
+
 ```sh
 opam pin add -n cabal \
-  https://github.com/epure-team/cabal.git#eccda75cede474c8682db41ab5c99d639a655441
+  https://github.com/epure-team/cabal.git#c500033f9f45412936fd247a88f125844a2300db
 opam install . --deps-only --with-test
 dune build
 dune test

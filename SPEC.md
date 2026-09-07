@@ -461,13 +461,18 @@ canonical non-blank `CWR_BACKEND`, invokes `Cwr_cabal.bootstrap_hardened ()` onc
 the Cabal registry is empty, and passes the resulting opaque bootstrap handle to
 `Cwr_cabal.create`. There is no first-available or direct `Agentic_backend` execution
 path. The handle captures the physical identity and immutable binding metadata of the
-six hardened runtime entries; every request rechecks the current registry entry and
-backend against that snapshot. Raw registrations, equal-looking validated replacements,
-and registry rebuilds therefore fail closed. Explicit custom backends require a
-bootstrap-bound opaque authorization token.
+six hardened runtime entries. Each returned runtime binds one exact selected entry and
+advertises no cross-backend routing; an explicit per-request route must equal that bound
+ID. `Backend_completer.make_rich_with_entry` owns the sole call-time registry lookup,
+full entry revalidation, physical-identity comparison, and backend capture. Raw
+registrations, equal-looking validated replacements, and registry rebuilds therefore
+fail closed, while replacement after central capture cannot switch the current
+invocation. Explicit custom backends require a bootstrap-bound opaque authorization
+token.
 
 `run_agent` constructs one host-neutral `Agent_execution.request` and completes it via
-the runtime, whose bridge uses `Cabal.Backend_completer.make_rich`. Cabal's central
+the runtime, whose bridge uses guarded
+`Cabal.Backend_completer.make_rich_with_entry`. Cabal's central
 registry consistency, capability/input preflight, version/availability checks, deadline,
 schema enforcement, bounded event collection, and cleanup paths remain authoritative.
 The CLI projects only `Agent_execution.final_structured_json`: it never parses a Cabal
@@ -492,11 +497,14 @@ installable `cabal_workflow_runner.cabal_bridge` library and `bin/` link Cabal.
 by `Ledger`. `Workflow_event.trace`, despite its broad historical module name, is a
 separate optional agent-completion lifecycle trace nested in `Agent_execution.response`.
 It is not an engine trace, is not written to the workflow ledger, and is not consumed by
-`Engine.replay`. Cabal can emit final session and usage observations immediately after
-`Attempt_finished`; only those same-attempt metadata kinds are valid before the terminal.
-The bridge retains their original sequence number, attempt, timestamp, and payload. It
-never rotates event payloads between envelopes. If already-valid safe source events
-cannot be fused with contradictory or invalid result telemetry, a distinct
+`Engine.replay`. Cabal can emit final session metadata, one non-empty bounded agent-text
+fallback when no earlier agent text was emitted, and final usage immediately after
+`Attempt_finished`; only those ordered same-attempt observations are valid before the
+terminal. The bridge retains their original sequence number, attempt, timestamp, and
+payload. It never rotates event payloads between envelopes. Final public
+text/session/usage parser observations may follow process exit while the attempt remains
+open. If already-valid safe source events cannot be fused with contradictory or invalid
+result telemetry, a distinct
 `Telemetry_mapping_failure` retains the exact mapped source trace instead of discarding
 it or fabricating replacement status/attempt data.
 
