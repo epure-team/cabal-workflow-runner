@@ -212,14 +212,15 @@ executes**. The CLI flag `--allow-run BIN` (repeatable; `--allow-run '*'` allows
 populates it; it is **operator-only and runtime-only** — a workflow file cannot grant
 itself the right to run a command.
 
-**The run effect never crashes the engine.** The `bin` runner wraps the whole effect in
-`try … with`: a spawn failure (command not found ⇒ exit `127`), an output-capture
-buffer-limit overflow (⇒ exit `125`, `truncated=true`), a timeout (⇒ exit `124`), or any
-other error is turned into a **well-formed recorded `run_result`** (non-zero `exit`, a
-short `stderr` message, the diff computed so far), never an uncaught exception. This
-preserves "exactly one recorded result, replayable" even for an attacker-authored
-engine-kill attempt (e.g. `yes` flooding stdout). The contract is that the injected
-`run_command` **must not raise**; the `bin` runner honors it.
+**Ordinary run failures become data; cancellation and fatal conditions remain
+exceptions.** The `bin` runner maps spawn failure (command not found ⇒ exit `127`), an
+output-capture buffer-limit overflow (⇒ exit `125`, `truncated=true`), timeout (⇒ exit
+`124`), and other ordinary exceptions into a **well-formed recorded `run_result`**
+(non-zero `exit`, a short `stderr` message, and the diff computed so far). It deliberately
+re-raises `Eio.Cancel.Cancelled _`, `Out_of_memory`, `Stack_overflow`, and `Sys.Break`:
+cancellation and process-fatal conditions must not be laundered into replayable command
+results. Injected test/host `run_command` implementations are responsible for the same
+classification.
 
 **Determinism / replay.** A live run executes the command **exactly once**, captures the
 full `run_result`, **records it in the trace** as `Run_executed { id; result }`, and binds
@@ -455,27 +456,49 @@ type t = {
 ```
 
 The library ships a deterministic **stub** backend (`Backend.stub`) used by tests.
-The CLI builds a **cabal-backed** backend (`bin/backend_cabal.ml`): `run_agent` forces
-**structured output** via `Cabal.Registry.first_available` +
-`Cabal.Agentic_backend.run_task_with_ctxt` over a spec from
-`Cabal.Backend_types.make_task_spec` (with `expected_outputs` including
-`Structured_report`), parsing the structured report's `raw_json` (falling back to
-parsing `agent_text` as JSON); if no parseable JSON is produced it **fails closed**
-(`success = false`). `budget` is a genuine **consumable** counter created per run
+The CLI builds a **Cabal-backed** backend (`bin/backend_cabal.ml`). Startup requires a
+canonical non-blank `CWR_BACKEND`, invokes `Cwr_cabal.bootstrap_hardened ()` once while
+the Cabal registry is empty, and passes the resulting opaque bootstrap handle to
+`Cwr_cabal.create`. There is no first-available or direct `Agentic_backend` execution
+path. The handle captures the physical identity and immutable binding metadata of the
+six hardened runtime entries; every request rechecks the current registry entry and
+backend against that snapshot. Raw registrations, equal-looking validated replacements,
+and registry rebuilds therefore fail closed. Explicit custom backends require a
+bootstrap-bound opaque authorization token.
+
+`run_agent` constructs one host-neutral `Agent_execution.request` and completes it via
+the runtime, whose bridge uses `Cabal.Backend_completer.make_rich`. Cabal's central
+registry consistency, capability/input preflight, version/availability checks, deadline,
+schema enforcement, bounded event collection, and cleanup paths remain authoritative.
+The CLI projects only `Agent_execution.final_structured_json`: it never parses a Cabal
+raw report directly. The bridge accepts only standard JSON objects/arrays from strict
+normalized text or Cabal's structured report; two valid but different sources fail
+closed, as do prose, fences, scalar JSON, and missing structured output. Maximum-turn
+bounds in the public rich request are accepted and forwarded unchanged; the advertised
+runtime capability means forwarding, not independent proof that every backend CLI
+enforces the bound.
+
+`budget` is a genuine **consumable** counter created per run
 (`make`), initialised to 1_000_000 by default or from the `CWR_BUDGET` env var: each
 `Budget`-governor check **decrements and returns** the remaining, so with `CWR_BUDGET=N`
 the run performs **at most N** budget-governed loop iterations total (shared across all
 loops in that run) before the `Budget` governor stops the loop. (Determinism is
 unaffected — every `Budget_read` is recorded and replay re-feeds the recorded values.)
-cabal usage is confined to this boundary: the
-`cabal_workflow_runner` library links `yojson`, `eio`, `unix`, `base64`, `digestif`, and
-`mirage-crypto-ec`; only `bin/` links Cabal.
+Cabal usage is confined to this boundary: the `cabal_workflow_runner` library links
+`yojson`, `eio`, `unix`, `base64`, `digestif`, and `mirage-crypto-ec`; only the separate
+installable `cabal_workflow_runner.cabal_bridge` library and `bin/` link Cabal.
 
 **Trace naming.** `Types.trace` below is the deterministic engine replay trace persisted
 by `Ledger`. `Workflow_event.trace`, despite its broad historical module name, is a
 separate optional agent-completion lifecycle trace nested in `Agent_execution.response`.
 It is not an engine trace, is not written to the workflow ledger, and is not consumed by
-`Engine.replay`.
+`Engine.replay`. Cabal can emit final session and usage observations immediately after
+`Attempt_finished`; only those same-attempt metadata kinds are valid before the terminal.
+The bridge retains their original sequence number, attempt, timestamp, and payload. It
+never rotates event payloads between envelopes. If already-valid safe source events
+cannot be fused with contradictory or invalid result telemetry, a distinct
+`Telemetry_mapping_failure` retains the exact mapped source trace instead of discarding
+it or fabricating replacement status/attempt data.
 
 `Engine.run ?max_loop_iters ~backend ~token validated : outcome * trace` performs a
 deterministic walk: `Agent` → `run_agent`, bind `outputs.<id>`; a `success = false` run

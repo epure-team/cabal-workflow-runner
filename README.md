@@ -82,9 +82,9 @@ central `Backend_completer.make_rich` path:
 
 - `Agent_execution` validates opaque requests with separate system/user prompts,
   finite positive timeouts, optional JSON Schema/session/routing/model/read-only
-  metadata, ordered workspace-relative attachment references, and disabled/search/
-  search+fetch web policies (optionally domain-restricted). Construction performs no
-  filesystem I/O.
+  metadata and maximum-turn bounds, ordered workspace-relative attachment references,
+  and disabled/search/search+fetch web policies (optionally domain-restricted).
+  Construction performs no filesystem I/O.
 - Rich results retain structured status, normalized public text/JSON, every initial/
   fresh/resumed attempt, path-free delivery intent, exact optional usage and integer
   micro-USD cost, aggregate telemetry, final session, cleanup status, and an optional
@@ -103,6 +103,9 @@ central `Backend_completer.make_rich` path:
   invoked-but-uncommitted fresh/resumed continuation,
   post-execution dispatch failures retaining any coherent non-empty response plus a
   separate outer failed trace, and execution failures remain distinct typed shapes.
+  A separate telemetry-mapping failure retains an already-valid safe source trace when
+  invalid or contradictory source telemetry cannot fit a richer response/error
+  constructor; it never silently drops that trace or fabricates an attempt/status.
   Incomplete execution never fabricates a continuation result: its failed/timed-out/
   cancelled outer status and complete bounded outer trace remain separate from committed
   attempts. Aggregate metrics and final session use committed results only; bounded
@@ -127,6 +130,9 @@ central `Backend_completer.make_rich` path:
   rejects visible phase, attempt, retry, and process-order contradictions, negative
   process exit codes, and decreasing known cumulative usage/cost snapshots. Exit codes
   otherwise use the host's non-negative `int` range rather than a Unix-specific ceiling.
+  After `Attempt_finished`, only same-attempt final session and cumulative usage metadata
+  may precede the terminal; their sequence, attempt, elapsed time, and payload remain
+  attached to the original event rather than being rotated to fit the lifecycle.
   This batch does **not** claim live event streaming.
 - `Runtime` wraps one completion function. `Runtime.of_legacy_backend` adapts the
   unchanged `Backend.t` honestly as one synthetic attempt with unknown usage/cost, no
@@ -151,12 +157,21 @@ See the [rich execution migration
 notes](docs/rich-agent-execution-migration.md) for adoption details and the exhaustive
 mapping from Cabal's current `Backend_completer.make_rich` outcomes.
 
-`Cwr_cabal.bootstrap_hardened ()` must run once while the Cabal registry is empty.
-`Cwr_cabal.create` then requires an explicit backend id, working directory, and
+`Cwr_cabal.bootstrap_hardened ()` must run once while the Cabal registry is empty and
+returns an opaque process-lifetime identity handle. Successful bootstrap is one-shot even
+if test-only code later clears and rebuilds Cabal's registry. `Cwr_cabal.create
+~bootstrap` then requires that handle, an explicit backend id, working directory, and
 caller-owned `Task_preflight.limits`; it never chooses a first-available backend or
-defines product attachment limits. Hardened bootstrap ignores project/user/global
+defines product attachment limits. Every selection rechecks the exact physical registry
+entry/backend identities captured by the handle, so raw registrations and equal-looking
+validated replacements fail closed. Hardened bootstrap ignores project/user/global
 adapter configuration. Tests may add one explicitly authorized custom backend with
-`Cwr_cabal.register_custom_backend`.
+`Cwr_cabal.register_custom_backend ~bootstrap`; its opaque token is bound to that handle,
+id, and exact entry. The handle is immutable and supports concurrent `create` calls.
+
+Maximum-turn requests are accepted by this bridge and forwarded unchanged into Cabal's
+completion contract. The runtime capability means acceptance/forwarding only; it is not
+new evidence that every backend CLI enforces the bound.
 
 Versioned response/incomplete-execution/error/event-trace Yojson projections are
 redacted persistence surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`,
@@ -459,9 +474,12 @@ ever executes**. A workflow file cannot grant itself the allowlist.
 > followed** — the command runs with cwd = the resolved target. This is **not a sandbox**;
 > the allowlist is the trust control.
 
-The run effect **never crashes the engine**: a spawn failure (exit `127`), an
-output-buffer overflow (exit `125`, `truncated=true`), or a timeout (exit `124`) is turned
-into a recorded `run_result`, so the run is always recorded and replayable.
+Ordinary run-effect failures are normalized: a spawn failure becomes exit `127`, an
+output-buffer overflow becomes exit `125` with `truncated=true`, and a timeout becomes
+exit `124`, producing a recorded replayable `run_result`. Eio cancellation and fatal
+runtime exceptions (`Out_of_memory`, `Stack_overflow`, and `Sys.Break`) are deliberately
+re-raised; the adapter never launders cancellation or process-fatal conditions into an
+ordinary command result.
 
 `working_dir` bounds the cwd and the snapshot scope but **does NOT sandbox** the command
 from touching absolute paths in its args; full isolation (container/chroot) is **out of

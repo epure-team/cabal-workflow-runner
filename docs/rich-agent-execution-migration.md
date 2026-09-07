@@ -5,6 +5,14 @@ The rich execution modules are additive. Existing `Backend.t`, `Backend.stub`,
 
 Callers adopting the new API must observe these fail-closed boundaries:
 
+- Call `Cwr_cabal.bootstrap_hardened ()` once against an empty Cabal registry and
+  retain its opaque handle. Pass `~bootstrap` to every `Cwr_cabal.create` and
+  `register_custom_backend` call. The handle captures exact physical
+  entry/backend identities and immutable binding metadata, supports concurrent
+  `create`, and cannot be refreshed after registry clearing/replacement in the
+  same process. Custom tokens are bound to that handle, ID, and exact entry.
+  There is no first-available, raw-registration, YAML-adapter, or direct
+  `Agentic_backend` fallback.
 - Pass an explicit `~status` to `Agent_execution.make_response`. It must agree
   with the final transport attempt, except that a transport-successful attempt
   carrying `schema_error` uses an overall `Failed _` status.
@@ -52,6 +60,10 @@ Callers adopting the new API must observe these fail-closed boundaries:
   identities and omission counters must be built with their validated smart
   constructors. `Exited code` rejects negative values but intentionally accepts
   every non-negative host `int`, without a Unix-only 255 ceiling.
+- Preserve each event's sequence number, attempt, elapsed time, and payload.
+  Cabal may deliver final session and usage metadata immediately after
+  `Attempt_finished`; only those two same-attempt observations are valid before
+  the terminal. Never rotate or reassociate payloads to make a trace fit.
 - Emit `Usage_observed` as cumulative per-attempt snapshots, not deltas. Known
   dimensions must never decrease. Every known value remains a lower bound even
   if later snapshots omit that dimension, delivery is truncated, or a sequence
@@ -85,6 +97,12 @@ Callers adopting the new API must observe these fail-closed boundaries:
   canonicalizes/rejects MIME claims and rejects restricted-domain support when
   web access is disabled. Legacy read-only/routing/model capability claims are
   false unless the caller opts in through the corresponding `attested_*` flag.
+- Treat rich maximum-turn capability as acceptance and unchanged forwarding into
+  Cabal's completion request, not as independent evidence that every backend CLI
+  enforces the bound.
+- Accept strict structured output only from a standard object/array in Cabal's
+  report or normalized final text. If both sources are valid and differ, fail
+  closed; never silently prefer one. Do not parse raw reports outside the bridge.
 
 The event trace remains a bounded post-outcome value. This migration does not
 add a live event stream or wire the rich runtime into `Engine.run`.
@@ -118,11 +136,14 @@ completed response independent from the outer failed trace.
 | Callback `Ok { execution; event_trace; _ }`, non-empty attempts, synthetic final `Timeout` or `Cancelled` not represented by the last completed attempt | `Incomplete_execution` with the exact completed prefix, outer status/elapsed/cleanup, completed-only aggregates/session, full outer trace, and optional single continuation inferred as described below. This includes timeout/cancellation before retry transition (no continuation) and during a fresh/resumed retry (one continuation) |
 | Callback `Ok { execution; event_trace; _ }`, zero attempts, final `Timeout` | `No_completed_attempt { status = Timed_out; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
 | Callback `Ok { execution; event_trace; _ }`, zero attempts, final `Cancelled` | `No_completed_attempt { status = Cancelled; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
+| Callback `Ok { execution; event_trace; _ }`, zero attempts, final `Failed _` | `No_completed_attempt { status = Failed _; invocation_may_have_started = true; event_trace = Some mapped_trace }` |
+| Callback `Ok { execution; event_trace; _ }`, zero attempts, final `Success` | Invalid source contract; `Telemetry_mapping_failure` retains the exact mapped trace |
 | Callback `Error { cause = Dispatch_failure failure; event_trace }` | Use the exhaustive cause table below; preserve `event_trace` on the selected error shape |
 | Callback `Error { cause = Dispatch_failure_with_execution { failure; execution }; event_trace }` where `execution.final_result` is synthetic and not a committed attempt result | `Incomplete_execution` with outer `Failed _`, exact completed prefix, completed-only aggregates/session, cleanup state, complete outer trace, and at most one continuation. This is Cabal's retry-exception-after-progress path |
 | Callback `Error { cause = Dispatch_failure_with_execution { failure; execution }; event_trace }` after a coherent completed execution, including successful execution plus attachment cleanup failure | `Post_execution_dispatch_failed` with `map_dispatch_cause failure`, the coherent non-empty response built from `execution` without attaching the outer trace, and `outer_event_trace = mapped_trace`. Preserve actual attempts/status/session/metrics/`Cleanup_failed`; the outer failed terminal remains separate |
 | Callback `Error { cause = Execution_failure (Native_backend_failure_with_schema { execution; _ }); event_trace }` | `Execution_failure Native_backend_failure_with_schema` with the mapped non-empty response and trace; this makes no schema-causality claim |
 | Callback `Error { cause = Execution_failure (Schema_retry_failed { execution; attempt_2_failure; _ }); event_trace }` | `Execution_failure Schema_retry_failed` with both mapped attempts, unchanged final status, and trace; `attempt_2_failure` maps as detailed below |
+| Any callback whose event trace maps successfully but whose invalid/contradictory cost, session, attempt, total elapsed, result, or failure telemetry cannot satisfy the selected CWR constructor | `Telemetry_mapping_failure` with the exact already-valid mapped trace and no fabricated replacement telemetry. If the source event trace itself is invalid, no trace is claimed |
 
 For `Incomplete_execution`, let N be the last committed attempt number. Retained
 events may refer only to completed attempts 1..N and optionally N+1. A visible
@@ -201,6 +222,14 @@ optional `cost_usd : float`: finite non-negative values become
 overflow saturates at `Int64.max_int` consistently with CWR aggregate saturation.
 Negative and non-finite values fail conversion rather than being dropped or
 rewritten. The same rule applies to cost carried by normalized usage events.
+
+### Pre-release telemetry-mapping failure addition
+
+Exhaustive adopters of the unreleased `error_view` type must add a
+`Telemetry_mapping_failure` arm. Its required `event_trace` is the exact safe
+mapped Cabal trace and its in-process diagnostic is omitted from persistence.
+The JSON projection uses error kind `"telemetry_mapping_failure"` under the
+existing `cwr.agent-execution.error/v1` envelope.
 
 ### Pre-release incomplete-execution addition
 

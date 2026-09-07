@@ -17,6 +17,18 @@ registry/preflight path. The core `lib/` remains Cabal-free. Fake-backend tests 
 request/status/retry/error/event/cost/session mapping without real CLIs. CI, release, and
 developer setup pin Cabal commit `eccda75cede474c8682db41ab5c99d639a655441`.
 
+Review hardening makes successful Cabal bootstrap process-one-shot and returns an opaque
+identity handle required by bridge construction/custom registration. Hardened routing now
+requires the exact physical registry entries/backends captured by that handle; raw,
+equal-looking replacement, and post-clear rebuilt registrations fail closed. Final
+same-attempt session/usage events may follow `Attempt_finished` without payload rotation,
+preserving source sequence/attempt/time envelopes. Conflicting valid structured-report and
+normalized-text JSON now fails closed. A typed `Telemetry_mapping_failure` retains an
+already-valid safe event trace when contradictory/invalid telemetry cannot satisfy a richer
+constructor. Maximum-turn capability records acceptance/forwarding only. The shell adapter
+continues to normalize ordinary exceptions but re-raises Eio cancellation and fatal runtime
+exceptions.
+
 **Additive rich agent execution contract.** Added opaque, validated host-neutral
 `Agent_execution` request/result/error DTOs; integer-micro-USD and saturating token
 `Execution_metrics`; bounded typed post-completion `Workflow_event` traces; and a

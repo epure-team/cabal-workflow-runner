@@ -17,6 +17,7 @@ opam install . --deps-only --with-test
 
 dune build
 dune test          # the full suite must stay green
+dune build @fmt    # Dune/OCaml formatting must be clean
 ```
 
 The test binary also runs standalone from the repo root:
@@ -62,6 +63,36 @@ compatibility change. Normalized event traces are post-completion values in this
 do not document the API as live streaming. Keep their opaque-constructor resource bounds,
 event/response cross-validation, and pre-dispatch legacy-adapter rejections covered when
 extending the contract.
+
+## Cabal bridge trust and mapping rules
+
+Production startup must call `Cwr_cabal.bootstrap_hardened ()` exactly once while the
+Cabal registry is empty, retain its opaque handle, and pass `~bootstrap` to every
+`Cwr_cabal.create` or `register_custom_backend` call. Do not add a first-available,
+direct `Agentic_backend`, YAML-adapter, or registry-rebootstrap bypass. Hardened routing
+is authorized by the exact physical entries/backends captured at bootstrap; custom
+routing additionally requires its bootstrap-bound opaque token. `CWR_BACKEND` remains a
+required explicit canonical ID for the CLI.
+
+All bridge execution goes through `Backend_completer.make_rich`, including central
+registry consistency, input/capability preflight, version/availability checks, schema
+enforcement, event collection, deadlines, and cleanup. Caller-owned attachment limits
+remain mandatory. A maximum-turn value is accepted and forwarded, but this does not by
+itself prove that every backend CLI enforces the value.
+
+Keep event envelopes faithful: never rotate or reassociate payloads to make a trace
+validate. Only same-attempt final session and usage observations may follow
+`Attempt_finished`. When invalid or contradictory source telemetry prevents a richer
+constructor but the normalized source trace is valid, return
+`Telemetry_mapping_failure` with that exact trace. Strict structured output accepts only
+standard JSON objects/arrays; valid but different structured-report and normalized-text
+values are a conflict and must fail closed.
+
+`Backend_cabal.protect_shell_command` may map ordinary exceptions to exit `127`, but it
+must re-raise Eio cancellation and `Out_of_memory`, `Stack_overflow`, and `Sys.Break`.
+Add mapping cases to `test/test_cabal_bridge_mapping.ml`, integration/identity cases to
+`test/test_cabal_bridge.ml`, event-model cases to `test/test_agent_execution.ml`, and
+shell classification cases to `test/test_backend_cabal.ml`.
 
 ## Safety floor must not regress
 
