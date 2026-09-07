@@ -32,14 +32,19 @@ Callers adopting the new API must observe these fail-closed boundaries:
   immediately following fresh/resumed continuation. A declared continuation
   owns the outer terminal at N+1. Mark it `Invocation_started` only when retained
   N+1 lifecycle or observation evidence proves entry. Use
-  `Invocation_may_have_started` only when the terminal is N+1 and an omission,
-  truncation marker, or sequence gap makes start/activity evidence unknowable.
-  A schema error is retry context, not proof that retry began. Dense cancellation
-  on N before a retry transition therefore has no continuation. Never manufacture
-  continuation result, duration, output, or session. Completed aggregate
-  usage/cost and final session exclude it; retained bounded N+1 usage/cost
-  observations are exposed only as separate lower bounds and remain present in
-  the complete outer trace.
+  `Invocation_may_have_started` only when the terminal is N+1 and a positive
+  truncation marker or sequence gap across the N→N+1 boundary makes
+  start/activity evidence unknowable. With a retained retry transition, the
+  omission must be after that transition (and any later retained N evidence).
+  With an omitted transition, it must be after completed N's last retained
+  lifecycle/observation event. A prefix/N omission that ends before a dense
+  transition→terminal suffix does not qualify; neither does a bare unlocated
+  omission count. A schema error is retry context, not proof that retry began.
+  Dense cancellation on N before a retry transition therefore has no
+  continuation. Never manufacture continuation result, duration, output, or
+  session. Completed aggregate usage/cost and final session exclude it;
+  retained bounded N+1 usage/cost observations are exposed only as separate
+  lower bounds and remain present in the complete outer trace.
 - Treat `Workflow_event.make_trace` as a lifecycle validator, not only an order
   check. Retained events may be an omitted prefix/subsequence, but visible
   lifecycle contradictions are rejected. `Workflow_event.trace` is agent-call
@@ -128,14 +133,20 @@ terminal must be attributed to N+1, never N. Explicit N+1 start, finish, process
 session, text, tool, usage, or other backend observation evidence selects
 `Invocation_started`; terminal alone is insufficient. With no such evidence,
 `Invocation_may_have_started` is valid only when the N+1 terminal is accompanied
-by a positive omission count/truncation marker or a retained sequence gap. A
-dense no-omission terminal on N selects [continuation = None]. A retained N+1
-finish must be failed, timed out, or cancelled exactly like the outer terminal.
-A successful N+1 finish/terminal, N+2 evidence, skipped number, mismatched kind,
-unsupported certainty claim, or completed-attempt usage/cost/session mismatch
-fails conversion rather than fabricating telemetry. N+1 session observations
-remain in the trace and N+1 metric observations remain separate lower bounds;
-neither changes completed aggregates or final session.
+by a positive truncation marker or retained sequence gap capable of hiding
+transition/start/activity specifically at the N→N+1 boundary. If the retry
+transition is retained, scan only after it and any later retained N evidence. If
+it is omitted, scan after completed N's last retained lifecycle/observation
+event. A gap ending before that anchor, an earlier truncation, or a global
+`omitted_count` with no boundary-local gap is unrelated and must not upgrade a
+dense transition→terminal suffix to uncertainty. A dense no-omission terminal
+on N selects `continuation = None`. A retained N+1 finish must be failed, timed
+out, or cancelled exactly like the outer terminal. A successful N+1
+finish/terminal, N+2 evidence, skipped number, mismatched kind, unsupported
+certainty claim, or completed-attempt usage/cost/session mismatch fails
+conversion rather than fabricating telemetry. N+1 session observations remain
+in the trace and N+1 metric observations remain separate lower bounds; neither
+changes completed aggregates or final session.
 
 The nested retry-failure algebra maps without rewriting attempt status:
 

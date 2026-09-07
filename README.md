@@ -105,9 +105,13 @@ changing the workflow format or wiring it into `Engine.run`:
   attempts. Aggregate metrics and final session use committed results only; bounded
   usage/cost observations from the continuation are exposed separately as lower bounds.
   A declared continuation owns the outer terminal at N+1. Known-started state requires
-  explicit retained N+1 lifecycle/observation evidence; uncertain state requires an N+1
-  terminal plus omission/gap evidence. A schema rejection alone cannot fabricate a retry,
-  so dense cancellation on the last completed attempt records no continuation.
+  explicit retained N+1 lifecycle/observation evidence. Uncertain state requires an N+1
+  terminal plus a positive truncation marker or sequence gap spanning the N→N+1 boundary:
+  after a retained retry transition, or after completed N's last retained lifecycle event
+  when the transition was omitted. Earlier prefix/N omissions and a bare global omission
+  count do not qualify when the retained transition→terminal suffix is dense. A schema
+  rejection alone cannot fabricate a retry, so dense cancellation on the last completed
+  attempt records no continuation.
   A successful completed transport therefore stays successful when later sealed-input
   cleanup fails; its attempts/session/metrics/cleanup status are not rewritten to fit the
   outer terminal. Native backend failure while a schema is in force is named neutrally

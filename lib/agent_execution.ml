@@ -959,9 +959,6 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
   let continuation_cost_seen = ref false in
   let continuation_evidence_seen = ref false in
   let previous_event = ref None in
-  let omission_or_gap_seen =
-    ref (Int64.compare (Workflow_event.omitted_count trace) 0L > 0)
-  in
   let no_unlocated_omissions =
     Int64.compare (Workflow_event.omitted_count trace) 0L = 0
   in
@@ -972,30 +969,25 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
   in
   let note_sequence_gap event =
     (match !previous_event with
-    | None when Int64.compare (Workflow_event.seq event) 1L > 0 ->
-        omission_or_gap_seen := true
     | Some previous
       when Int64.compare (Workflow_event.seq event)
              (Int64.succ (Workflow_event.seq previous))
            > 0 ->
-        omission_or_gap_seen := true;
         mark_usage_unknown (Workflow_event.attempt previous)
     | None | Some _ -> ());
     previous_event := Some event
   in
-  let note_delivery_omissions counts =
-    if
-      List.exists
-        (fun count -> Int64.compare count 0L > 0)
-        [
-          Workflow_event.omitted_text_events counts;
-          Workflow_event.omitted_text_bytes counts;
-          Workflow_event.omitted_usage_events counts;
-          Workflow_event.omitted_session_events counts;
-          Workflow_event.omitted_tool_events counts;
-          Workflow_event.omitted_control_events counts;
-        ]
-    then omission_or_gap_seen := true
+  let has_delivery_omissions counts =
+    List.exists
+      (fun count -> Int64.compare count 0L > 0)
+      [
+        Workflow_event.omitted_text_events counts;
+        Workflow_event.omitted_text_bytes counts;
+        Workflow_event.omitted_usage_events counts;
+        Workflow_event.omitted_session_events counts;
+        Workflow_event.omitted_tool_events counts;
+        Workflow_event.omitted_control_events counts;
+      ]
   in
   let next_attempt_kind number =
     match find_attempt completed_attempts (number + 1) with
@@ -1055,7 +1047,6 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
     | Availability_check_started | Availability_check_completed ->
         Error "pre-dispatch event refers to a completed attempt"
     | Delivery_truncated counts ->
-        note_delivery_omissions counts;
         if Int64.compare (Workflow_event.omitted_usage_events counts) 0L > 0
         then mark_usage_unknown attempt.number;
         Ok ()
@@ -1091,9 +1082,7 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
     | Process_exited _ | Opaque_backend_observation ->
         continuation_evidence_seen := true;
         Ok ()
-    | Delivery_truncated counts ->
-        note_delivery_omissions counts;
-        Ok ()
+    | Delivery_truncated _ -> Ok ()
     | Task_started | Backend_selected _ | Preflight_started
     | Preflight_completed | Version_probe_started | Version_probe_completed
     | Availability_check_started | Availability_check_completed ->
@@ -1103,6 +1092,56 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
   match List.rev completed_attempts with
   | [] -> Error "incomplete execution requires a completed attempt"
   | final_completed :: _ ->
+      let events = Workflow_event.events trace in
+      (* Evidence before the last retained N lifecycle/observation event cannot
+         explain a missing N+1 start. A retained retry is normally that anchor;
+         later N observations move it forward so gaps that cannot cross the
+         attempt boundary do not qualify. *)
+      let boundary_anchor =
+        List.fold_left
+          (fun anchor event ->
+            if Workflow_event.attempt event <> final_completed.number then anchor
+            else
+              match Workflow_event.payload event with
+              | Workflow_event.Delivery_truncated _ | Terminal _ -> anchor
+              | _ -> Some event)
+          None events
+      in
+      let boundary_omission_seen =
+        match (continuation, boundary_anchor) with
+        | Some expected, Some anchor ->
+            let anchor_seq = Workflow_event.seq anchor in
+            let rec scan previous = function
+              | [] -> false
+              | event :: rest ->
+                  let gap_can_hide_continuation =
+                    match previous with
+                    | Some previous ->
+                        Int64.compare (Workflow_event.seq previous) anchor_seq
+                          >= 0
+                        && Workflow_event.attempt event = expected.number
+                        && Int64.compare (Workflow_event.seq event)
+                             (Int64.succ (Workflow_event.seq previous))
+                           > 0
+                    | None -> false
+                  in
+                  let truncation_can_hide_continuation =
+                    Int64.compare (Workflow_event.seq event) anchor_seq > 0
+                    &&
+                    match Workflow_event.payload event with
+                    | Workflow_event.Delivery_truncated counts ->
+                        has_delivery_omissions counts
+                    | _ -> false
+                  in
+                  if
+                    gap_can_hide_continuation
+                    || truncation_can_hide_continuation
+                  then true
+                  else scan (Some event) rest
+            in
+            scan None events
+        | None, _ | Some _, None -> false
+      in
       let terminal_attempt_matches event =
         match continuation with
         | None -> Workflow_event.attempt event = final_completed.number
@@ -1127,9 +1166,7 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
               | Version_probe_completed | Availability_check_started
               | Availability_check_completed | Opaque_backend_observation ->
                   Ok ()
-              | Delivery_truncated counts ->
-                  note_delivery_omissions counts;
-                  Ok ()
+              | Delivery_truncated _ -> Ok ()
               | Attempt_started _ | Attempt_finished _ | Retry_transition _
               | Process_started | Process_termination_requested
               | Process_kill_escalated | Process_exited _ | Session_id _
@@ -1168,7 +1205,7 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
         | event :: rest ->
             Result.bind (validate_event event) (fun () -> loop rest)
       in
-      Result.bind (loop (Workflow_event.events trace)) (fun () ->
+      Result.bind (loop events) (fun () ->
           Result.bind
             (match continuation with
             | Some value
@@ -1183,9 +1220,9 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
                   "continuation marked uncertain has explicit invocation evidence"
             | Some value
               when value.invocation = Invocation_may_have_started
-                   && not !omission_or_gap_seen ->
+                   && not boundary_omission_seen ->
                 Error
-                  "uncertain continuation requires retained omission evidence"
+                  "uncertain continuation requires omission evidence at its boundary"
             | None | Some _ -> Ok ())
             (fun () ->
               Result.bind

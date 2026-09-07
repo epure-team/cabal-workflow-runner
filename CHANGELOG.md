@@ -89,6 +89,14 @@ attempt usage, cost, and session observations are cross-checked on this path; N+
 and metric observations stay trace-only/separate lower bounds and cannot replace
 completed aggregates or final session.
 
+Continuation uncertainty now localizes omission evidence to the N→N+1 boundary. With a
+retained retry transition, only a later positive truncation marker or sequence gap capable
+of hiding N+1 start/activity qualifies. If the transition was omitted, the qualifying
+interval begins after completed N's last retained lifecycle/observation event. Prefix or
+attempt-N omissions that finish before a dense retained transition→terminal suffix, and a
+bare global omission count without a boundary gap, no longer justify
+`Invocation_may_have_started`.
+
 The pre-release `Native_schema_rejection` category is renamed to the causally neutral
 `Native_backend_failure_with_schema`, matching Cabal's contract: the schema was in force,
 but is not asserted to have caused the backend failure. Error projections remain

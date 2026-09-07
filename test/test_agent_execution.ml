@@ -2181,6 +2181,119 @@ let test_uncertain_continuation_accepts_omitted_start_at_n_plus_one () =
     (Agent_execution.continuation_invocation retained
     = Invocation_may_have_started)
 
+let test_uncertain_continuation_rejects_unrelated_earlier_gap () =
+  let first = attempt ~schema_error:"schema rejected" () in
+  let earlier_gap_then_dense_boundary =
+    ok
+      (Workflow_event.make_trace ~omitted_count:1L
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.31
+             (Retry_transition
+                { kind = Fresh_retry; reason = Schema_validation });
+           event ~seq:5L ~attempt:2 ~elapsed_s:0.5 (Terminal Timed_out);
+         ])
+  in
+  let uncertain =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_may_have_started
+  in
+  expect_error
+    (Agent_execution.make_incomplete_execution ~completed_attempts:[ first ]
+       ~outer_status:Timed_out ~total_elapsed_s:0.5
+       ~cleanup_status:Cleanup_not_required ~continuation:uncertain
+       ~outer_event_trace:earlier_gap_then_dense_boundary ())
+
+let test_uncertain_continuation_rejects_unrelated_earlier_truncation () =
+  let first = attempt ~schema_error:"schema rejected" () in
+  let omissions =
+    ok (Workflow_event.make_omission_counts ~control_events:1L ())
+  in
+  let earlier_truncation_then_dense_boundary =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.1
+             (Delivery_truncated omissions);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.31
+             (Retry_transition
+                { kind = Fresh_retry; reason = Schema_validation });
+           event ~seq:5L ~attempt:2 ~elapsed_s:0.5 (Terminal Timed_out);
+         ])
+  in
+  let uncertain =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_may_have_started
+  in
+  expect_error
+    (Agent_execution.make_incomplete_execution ~completed_attempts:[ first ]
+       ~outer_status:Timed_out ~total_elapsed_s:0.5
+       ~cleanup_status:Cleanup_not_required ~continuation:uncertain
+       ~outer_event_trace:earlier_truncation_then_dense_boundary ())
+
+let test_uncertain_continuation_accepts_boundary_spanning_gap () =
+  let first = attempt ~schema_error:"schema rejected" () in
+  let omitted_transition_and_start =
+    ok
+      (Workflow_event.make_trace ~omitted_count:1L
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:4L ~attempt:2 ~elapsed_s:0.5 (Terminal Timed_out);
+         ])
+  in
+  let uncertain =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_may_have_started
+  in
+  ignore
+    (ok
+       (Agent_execution.make_incomplete_execution ~completed_attempts:[ first ]
+          ~outer_status:Timed_out ~total_elapsed_s:0.5
+          ~cleanup_status:Cleanup_not_required ~continuation:uncertain
+          ~outer_event_trace:omitted_transition_and_start ()))
+
+let test_uncertain_continuation_accepts_post_transition_truncation () =
+  let first = attempt ~schema_error:"schema rejected" () in
+  let omissions =
+    ok (Workflow_event.make_omission_counts ~control_events:1L ())
+  in
+  let truncated_start =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.31
+             (Retry_transition
+                { kind = Fresh_retry; reason = Schema_validation });
+           event ~seq:4L ~attempt:2 ~elapsed_s:0.4
+             (Delivery_truncated omissions);
+           event ~seq:5L ~attempt:2 ~elapsed_s:0.5 (Terminal Timed_out);
+         ])
+  in
+  let uncertain =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_may_have_started
+  in
+  ignore
+    (ok
+       (Agent_execution.make_incomplete_execution ~completed_attempts:[ first ]
+          ~outer_status:Timed_out ~total_elapsed_s:0.5
+          ~cleanup_status:Cleanup_not_required ~continuation:uncertain
+          ~outer_event_trace:truncated_start ()))
+
 let test_incomplete_completed_telemetry_mismatches () =
   let completed_usage = ok (Execution_metrics.make_usage ~input_tokens:7L ()) in
   let mismatched_usage =
@@ -2918,6 +3031,15 @@ let () =
             test_uncertain_continuation_requires_omission_and_n_plus_one_terminal;
           Alcotest.test_case "omitted continuation start at N+1" `Quick
             test_uncertain_continuation_accepts_omitted_start_at_n_plus_one;
+          Alcotest.test_case "reject unrelated earlier continuation gap" `Quick
+            test_uncertain_continuation_rejects_unrelated_earlier_gap;
+          Alcotest.test_case "reject unrelated earlier continuation truncation"
+            `Quick
+            test_uncertain_continuation_rejects_unrelated_earlier_truncation;
+          Alcotest.test_case "accept continuation boundary gap" `Quick
+            test_uncertain_continuation_accepts_boundary_spanning_gap;
+          Alcotest.test_case "accept post-transition truncation" `Quick
+            test_uncertain_continuation_accepts_post_transition_truncation;
           Alcotest.test_case "incomplete completed telemetry mismatches" `Quick
             test_incomplete_completed_telemetry_mismatches;
           Alcotest.test_case "cancellation during resumed retry" `Quick

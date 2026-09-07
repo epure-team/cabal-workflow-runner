@@ -213,8 +213,9 @@ type status = Success | Failed of string | Timed_out | Cancelled
 
 (** Evidence about an invoked-but-uncommitted corrective continuation.
     [Invocation_may_have_started] is conservative when retained lifecycle events
-    do not prove entry into the continuation and an omission/gap makes that
-    evidence unknowable. [Invocation_started] requires explicit retained
+    do not prove entry into the continuation and a boundary-local omission/gap
+    makes that evidence unknowable. Earlier omissions within the completed
+    attempt do not qualify. [Invocation_started] requires explicit retained
     lifecycle or observation evidence for the continuation; the exact start
     event may be omitted when later activity proves invocation. *)
 type continuation_invocation =
@@ -411,9 +412,15 @@ val make_incomplete_execution :
     [outer_status]; success and evidence for a second continuation are rejected.
     [Invocation_started] requires explicit retained continuation lifecycle or
     observation evidence. [Invocation_may_have_started] requires no such
-    evidence plus a retained omission count, truncation marker, or sequence gap
-    that can account for its absence. A prior [schema_error] establishes retry
-    context but does not by itself establish that a continuation began.
+    evidence plus a positive truncation marker or sequence gap within the N to
+    N+1 boundary that can account for its absence. When the N retry transition
+    is retained, that interval begins after the transition (and any later
+    retained N evidence). Otherwise it begins after the last retained lifecycle
+    or observation event for completed N. A prefix gap or earlier N truncation
+    that ends before a dense retained transition-to-terminal suffix does not
+    qualify; an unlocated trace omission count alone does not qualify either. A
+    prior [schema_error] establishes retry context but does not by itself
+    establish that a continuation began.
 
     Aggregate usage/cost and final session are derived exclusively from
     [completed_attempts]. Usage/cost observations for the incomplete
