@@ -29,6 +29,19 @@
  (modules test_agent_execution)
  (libraries cabal_workflow_runner alcotest eio eio_main))
 
+(test
+ (name test_cabal_bridge)
+ (modules test_cabal_bridge)
+ (libraries
+  cabal_workflow_runner
+  cabal_workflow_runner.cabal_bridge
+  cabal
+  alcotest
+  eio
+  eio_posix
+  unix
+  digestif))
+
 ; Real-subprocess integration test (Jalon 3, Workstream B) — see test_pcc_integration.ml's own
 ; header comment. A plain `executable`, NOT a `test` stanza, specifically so it is never attached
 ; to the default @runtest alias: it requires a sibling arch-index checkout on PATH, which the

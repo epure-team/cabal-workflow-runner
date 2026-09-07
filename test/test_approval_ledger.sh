@@ -46,6 +46,27 @@ JSON
 cat > "$tmp/aborted.json" <<'JSON'
 {"name":"approval-ledger-aborted","steps":[{"kind":"run","id":"abort","cmd":["approval-ledger-abort"],"working_dir":".","stdout_schema":{"ok":"bool"}}]}
 JSON
+
+# Live execution always requires an explicit hardened Cabal backend, even when
+# this particular workflow happens not to contain an Agent step. This keeps a
+# later workflow edit from silently changing first-available dispatch.
+rc=0
+env -u CWR_BACKEND "$BIN" run "$tmp/completed.json" \
+  > "$tmp/missing-backend.out" 2> "$tmp/missing-backend.err" || rc=$?
+assert_eq 1 "$rc" "missing CWR_BACKEND exit code"
+grep -F 'CWR_BACKEND is required' "$tmp/missing-backend.err" >/dev/null ||
+  fail "missing CWR_BACKEND lacked a controlled error"
+rc=0
+CWR_BACKEND=' ' "$BIN" run "$tmp/completed.json" \
+  > "$tmp/blank-backend.out" 2> "$tmp/blank-backend.err" || rc=$?
+assert_eq 1 "$rc" "blank CWR_BACKEND exit code"
+grep -F 'CWR_BACKEND is required' "$tmp/blank-backend.err" >/dev/null ||
+  fail "blank CWR_BACKEND lacked a controlled error"
+
+# The remaining no-agent fixtures only construct this hardened selection; they
+# never require the backend binary to be installed.
+export CWR_BACKEND=claude-code
+
 mkdir "$tmp/abort-bin"
 printf '#!/bin/sh\nprintf "not-json\\n"\n' > "$tmp/abort-bin/approval-ledger-abort"
 chmod +x "$tmp/abort-bin/approval-ledger-abort"

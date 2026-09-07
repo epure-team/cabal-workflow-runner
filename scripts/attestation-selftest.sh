@@ -6,6 +6,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 cwr=${CWR_BIN:-"$root/_build/default/bin/main.exe"}
+export CWR_BACKEND=${CWR_BACKEND:-claude-code}
 if [[ ! -x "$cwr" ]]; then
   opam exec --switch=/home/mathias/dev/cabal -- dune build --root "$root" bin/main.exe
 fi

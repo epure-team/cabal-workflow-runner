@@ -60,7 +60,7 @@ run_safe() {
   local before
   before=$(cd "$tmp/work" && find . -type f -printf '%P\n' | sort)
   (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin:$PATH" FAKE_ARGV="$tmp/argv" \
-    FAKE_MUTATION="$tmp/mutated" CWR_BACKEND='' "$cwr" run workflow.json \
+    FAKE_MUTATION="$tmp/mutated" CWR_BACKEND=claude-code "$cwr" run workflow.json \
     > "$tmp/out" 2>&1)
   [[ ! -e $tmp/mutated ]]
   [[ $(cd "$tmp/work" && find . -type f -printf '%P\n' | sort) == "$before" ]]
@@ -72,7 +72,7 @@ run_rejected() {
   workflow "$type" > "$tmp/work/workflow.json"
   rm -f "$tmp/argv" "$tmp/mutated"
   if (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin:$PATH" FAKE_ARGV="$tmp/argv" \
-      FAKE_MUTATION="$tmp/mutated" CWR_BACKEND='' "$cwr" run workflow.json \
+      FAKE_MUTATION="$tmp/mutated" CWR_BACKEND=claude-code "$cwr" run workflow.json \
       > "$tmp/out" 2>&1); then
     echo "backend $type unexpectedly dispatched" >&2
     exit 1
@@ -80,14 +80,14 @@ run_rejected() {
   [[ ! -e $tmp/argv && ! -e $tmp/mutated ]]
 }
 
-# Explicit safe adapters must use their handwritten, read-only argv contracts.
+# Central hardened dispatch must use the handwritten read-only argv contracts.
 run_safe claude-code Bash,Edit,Write,NotebookEdit
 grep -qx -- '--disallowedTools' "$tmp/argv"
 run_safe codex read-only
 grep -qx -- '-s' "$tmp/argv"
 
-# Default selection is safe and registry-independent; unsafe/unknown/custom IDs
-# fail closed without dispatch. (A YAML registry entry must never grant trust.)
+# The explicit operator selection is safe and registry-independent; unsafe,
+# unknown, and YAML-spoofed request routing fails closed without dispatch.
 run_safe default Bash,Edit,Write,NotebookEdit
 run_rejected opencode
 run_rejected unknown-custom
