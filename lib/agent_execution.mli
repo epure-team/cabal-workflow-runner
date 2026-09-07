@@ -213,9 +213,10 @@ type status = Success | Failed of string | Timed_out | Cancelled
 
 (** Evidence about an invoked-but-uncommitted corrective continuation.
     [Invocation_may_have_started] is conservative when retained lifecycle events
-    do not prove entry into the continuation. [Invocation_started] records known
-    invocation without requiring that its start event survived bounded event
-    delivery. *)
+    do not prove entry into the continuation and an omission/gap makes that
+    evidence unknowable. [Invocation_started] requires explicit retained
+    lifecycle or observation evidence for the continuation; the exact start
+    event may be omitted when later activity proves invocation. *)
 type continuation_invocation =
   | Invocation_may_have_started
   | Invocation_started
@@ -404,10 +405,15 @@ val make_incomplete_execution :
     A continuation, when present, must be numbered immediately after the last
     completed attempt, be fresh or resumed, and follow retained schema/retry
     context. The outer trace may contain lifecycle evidence only through that
-    one continuation. A retained continuation finish must be failed, timed out,
-    or cancelled consistently with [outer_status]; success and evidence for a
-    second continuation are rejected. An uncertain continuation cannot coexist
-    with explicit invocation lifecycle evidence.
+    one continuation, and its terminal must be attributed to the continuation
+    number rather than the last completed attempt. A retained continuation
+    finish must be failed, timed out, or cancelled consistently with
+    [outer_status]; success and evidence for a second continuation are rejected.
+    [Invocation_started] requires explicit retained continuation lifecycle or
+    observation evidence. [Invocation_may_have_started] requires no such
+    evidence plus a retained omission count, truncation marker, or sequence gap
+    that can account for its absence. A prior [schema_error] establishes retry
+    context but does not by itself establish that a continuation began.
 
     Aggregate usage/cost and final session are derived exclusively from
     [completed_attempts]. Usage/cost observations for the incomplete

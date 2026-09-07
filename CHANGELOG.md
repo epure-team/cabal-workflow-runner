@@ -80,6 +80,15 @@ Exhaustive pre-release `error_view` consumers must add the new constructor, and
 projection consumers must accept the new `incomplete_execution` error kind and nested
 `cwr.agent-execution.incomplete/v1` value.
 
+Incomplete continuation evidence is now fail-closed: a declared N+1 continuation must
+own the outer terminal, `Invocation_started` requires explicit retained N+1 lifecycle or
+observation evidence, and `Invocation_may_have_started` requires an N+1 terminal plus a
+real omission count, truncation marker, or sequence gap. A schema rejection alone no
+longer authorizes a fabricated continuation after dense cancellation on N. Completed
+attempt usage, cost, and session observations are cross-checked on this path; N+1 session
+and metric observations stay trace-only/separate lower bounds and cannot replace
+completed aggregates or final session.
+
 The pre-release `Native_schema_rejection` category is renamed to the causally neutral
 `Native_backend_failure_with_schema`, matching Cabal's contract: the schema was in force,
 but is not asserted to have caused the backend failure. Error projections remain

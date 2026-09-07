@@ -29,12 +29,17 @@ Callers adopting the new API must observe these fail-closed boundaries:
 - Use `Incomplete_execution` when at least one backend result was committed but
   the outer failed/timed-out/cancelled outcome is not a complete result for the
   latest invocation. Preserve committed attempts exactly and record at most one
-  immediately following fresh/resumed continuation. Mark it
-  `Invocation_started` when lifecycle evidence proves entry, otherwise
-  `Invocation_may_have_started`; never manufacture its result, duration, output,
-  or session. Completed aggregate usage/cost and final session exclude the
-  continuation. Its retained bounded usage/cost observations are exposed only
-  as separate lower bounds and remain present in the complete outer trace.
+  immediately following fresh/resumed continuation. A declared continuation
+  owns the outer terminal at N+1. Mark it `Invocation_started` only when retained
+  N+1 lifecycle or observation evidence proves entry. Use
+  `Invocation_may_have_started` only when the terminal is N+1 and an omission,
+  truncation marker, or sequence gap makes start/activity evidence unknowable.
+  A schema error is retry context, not proof that retry began. Dense cancellation
+  on N before a retry transition therefore has no continuation. Never manufacture
+  continuation result, duration, output, or session. Completed aggregate
+  usage/cost and final session exclude it; retained bounded N+1 usage/cost
+  observations are exposed only as separate lower bounds and remain present in
+  the complete outer trace.
 - Treat `Workflow_event.make_trace` as a lifecycle validator, not only an order
   check. Retained events may be an omitted prefix/subsequence, but visible
   lifecycle contradictions are rejected. `Workflow_event.trace` is agent-call
@@ -117,13 +122,20 @@ completed response independent from the outer failed trace.
 For `Incomplete_execution`, let N be the last committed attempt number. Retained
 events may refer only to completed attempts 1..N and optionally N+1. A visible
 retry transition or N+1 start fixes the continuation kind; it must be fresh or
-resumed and consistent with the prior schema/retry context. Explicit N+1 start,
-finish, process, session, text, tool, or usage evidence selects
-`Invocation_started`; omission/gap evidence without such an event may select
-`Invocation_may_have_started`. A retained N+1 finish must be failed, timed out,
-or cancelled exactly like the outer terminal. A successful N+1 finish/terminal,
-N+2 evidence, skipped number, or mismatched kind fails conversion rather than
-fabricating telemetry.
+resumed and consistent with the prior schema/retry context, but a schema error
+alone does not prove N+1 exists. When a continuation is present, the outer
+terminal must be attributed to N+1, never N. Explicit N+1 start, finish, process,
+session, text, tool, usage, or other backend observation evidence selects
+`Invocation_started`; terminal alone is insufficient. With no such evidence,
+`Invocation_may_have_started` is valid only when the N+1 terminal is accompanied
+by a positive omission count/truncation marker or a retained sequence gap. A
+dense no-omission terminal on N selects [continuation = None]. A retained N+1
+finish must be failed, timed out, or cancelled exactly like the outer terminal.
+A successful N+1 finish/terminal, N+2 evidence, skipped number, mismatched kind,
+unsupported certainty claim, or completed-attempt usage/cost/session mismatch
+fails conversion rather than fabricating telemetry. N+1 session observations
+remain in the trace and N+1 metric observations remain separate lower bounds;
+neither changes completed aggregates or final session.
 
 The nested retry-failure algebra maps without rewriting attempt status:
 

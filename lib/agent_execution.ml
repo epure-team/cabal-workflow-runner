@@ -959,6 +959,9 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
   let continuation_cost_seen = ref false in
   let continuation_evidence_seen = ref false in
   let previous_event = ref None in
+  let omission_or_gap_seen =
+    ref (Int64.compare (Workflow_event.omitted_count trace) 0L > 0)
+  in
   let no_unlocated_omissions =
     Int64.compare (Workflow_event.omitted_count trace) 0L = 0
   in
@@ -969,13 +972,30 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
   in
   let note_sequence_gap event =
     (match !previous_event with
+    | None when Int64.compare (Workflow_event.seq event) 1L > 0 ->
+        omission_or_gap_seen := true
     | Some previous
       when Int64.compare (Workflow_event.seq event)
              (Int64.succ (Workflow_event.seq previous))
            > 0 ->
+        omission_or_gap_seen := true;
         mark_usage_unknown (Workflow_event.attempt previous)
     | None | Some _ -> ());
     previous_event := Some event
+  in
+  let note_delivery_omissions counts =
+    if
+      List.exists
+        (fun count -> Int64.compare count 0L > 0)
+        [
+          Workflow_event.omitted_text_events counts;
+          Workflow_event.omitted_text_bytes counts;
+          Workflow_event.omitted_usage_events counts;
+          Workflow_event.omitted_session_events counts;
+          Workflow_event.omitted_tool_events counts;
+          Workflow_event.omitted_control_events counts;
+        ]
+    then omission_or_gap_seen := true
   in
   let next_attempt_kind number =
     match find_attempt completed_attempts (number + 1) with
@@ -1035,6 +1055,7 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
     | Availability_check_started | Availability_check_completed ->
         Error "pre-dispatch event refers to a completed attempt"
     | Delivery_truncated counts ->
+        note_delivery_omissions counts;
         if Int64.compare (Workflow_event.omitted_usage_events counts) 0L > 0
         then mark_usage_unknown attempt.number;
         Ok ()
@@ -1070,7 +1091,9 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
     | Process_exited _ | Opaque_backend_observation ->
         continuation_evidence_seen := true;
         Ok ()
-    | Delivery_truncated _ -> Ok ()
+    | Delivery_truncated counts ->
+        note_delivery_omissions counts;
+        Ok ()
     | Task_started | Backend_selected _ | Preflight_started
     | Preflight_completed | Version_probe_started | Version_probe_completed
     | Availability_check_started | Availability_check_completed ->
@@ -1083,10 +1106,7 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
       let terminal_attempt_matches event =
         match continuation with
         | None -> Workflow_event.attempt event = final_completed.number
-        | Some value ->
-            Workflow_event.attempt event = value.number
-            || (value.invocation = Invocation_may_have_started
-               && Workflow_event.attempt event = final_completed.number)
+        | Some value -> Workflow_event.attempt event = value.number
       in
       let validate_event event =
         note_sequence_gap event;
@@ -1105,8 +1125,10 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
               | Workflow_event.Task_started | Backend_selected _
               | Preflight_started | Preflight_completed | Version_probe_started
               | Version_probe_completed | Availability_check_started
-              | Availability_check_completed | Delivery_truncated _
-              | Opaque_backend_observation ->
+              | Availability_check_completed | Opaque_backend_observation ->
+                  Ok ()
+              | Delivery_truncated counts ->
+                  note_delivery_omissions counts;
                   Ok ()
               | Attempt_started _ | Attempt_finished _ | Retry_transition _
               | Process_started | Process_termination_requested
@@ -1150,10 +1172,20 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
           Result.bind
             (match continuation with
             | Some value
+              when value.invocation = Invocation_started
+                   && not !continuation_evidence_seen ->
+                Error
+                  "continuation marked started has no retained invocation evidence"
+            | Some value
               when value.invocation = Invocation_may_have_started
                    && !continuation_evidence_seen ->
                 Error
                   "continuation marked uncertain has explicit invocation evidence"
+            | Some value
+              when value.invocation = Invocation_may_have_started
+                   && not !omission_or_gap_seen ->
+                Error
+                  "uncertain continuation requires retained omission evidence"
             | None | Some _ -> Ok ())
             (fun () ->
               Result.bind
