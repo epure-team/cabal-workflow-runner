@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**Additive rich agent execution contract.** Added opaque, validated host-neutral
+`Agent_execution` request/result/error DTOs; integer-micro-USD and saturating token
+`Execution_metrics`; bounded typed post-completion `Workflow_event` traces; and a
+one-call `Runtime` seam for a later Cabal bridge. Requests keep system/user prompts
+separate and carry optional schema/session/media/web/routing/model/read-only controls.
+Responses retain every initial/fresh/resumed attempt, exact optional metrics, aggregate
+telemetry, final session and sanitized cleanup status. Versioned Yojson projections omit
+prompts, attachment paths/digests/bytes, raw process output, argv, diagnostics and private
+backend payloads. Unknown backend observations have a payload-free opaque event kind;
+this release does not provide live event streaming.
+
+This is not integrated into the deterministic engine. `Backend.t`, `Backend.stub`,
+`Engine.run`, workflow JSON/schema, and workflow ledgers retain their existing APIs and
+encodings. `Runtime.of_legacy_backend` provides an explicit one-attempt adapter without
+inferring session IDs from model JSON. The library still has no Cabal dependency.
+
+**Yojson 2.2 compatibility.** Canonical JSON validation now rejects Yojson's
+non-standard `Tuple`/`Variant` values explicitly and expression projection treats them
+as non-comparable, restoring exhaustive compilation without changing standard workflow
+JSON or ledger encodings.
+
 **`Deadline` governor.** `{"kind":"deadline"}` stops a governed loop once an
 operator-supplied wall-clock instant has passed. The instant is a runtime value
 (`Engine.run ~deadline`, with `~now` as an injectable clock seam), never a workflow

@@ -6,15 +6,17 @@ keep changes small and well-tested.
 ## Build & test
 
 Everything is built and tested in an opam switch that has the public
-[cabal](https://github.com/epure-team/cabal) library plus `eio`, `cmdliner`,
-`alcotest`, and `yojson`. Pin cabal and install deps:
+[cabal](https://github.com/epure-team/cabal) library and the dependencies declared in
+`dune-project`. The library currently uses `yojson`, `eio`, `unix`, `base64`,
+`digestif`, and `mirage-crypto-ec`; the executable/test toolchain also uses `cabal`,
+`eio_main`, `cmdliner`, and `alcotest`. Pin cabal and install deps:
 
 ```sh
 opam pin add -n cabal https://github.com/epure-team/cabal.git
 opam install . --deps-only --with-test
 
 dune build
-dune test          # 45 tests; must stay green
+dune test          # the full suite must stay green
 ```
 
 The test binary also runs standalone from the repo root:
@@ -45,11 +47,17 @@ The in-suite no-drift test additionally enforces that the committed
 change the schema, regenerate the artifact (`cabal-workflow-runner schema >
 schema/workflow.schema.json`) so the no-drift test stays green.
 
-## Layering rule: `lib/` stays yojson-only
+## Layering rule: `lib/` stays host-neutral
 
-The library `cabal_workflow_runner` (`lib/`) depends on **yojson only** — never on
-cabal. cabal is linked **only** in the executable (`bin/`). Do not add a cabal (or
-eio) dependency to anything under `lib/`.
+The library `cabal_workflow_runner` (`lib/`) has the dependencies listed above but
+must never depend on Cabal or a host application's workflow/orchestration layers.
+Cabal is linked **only** in the executable (`bin/`). Keep backend bridges injected
+behind library-owned contracts such as `Backend.t` or the additive rich `Runtime.t`.
+
+The rich execution DTOs are not part of workflow input: do not wire them into
+`Engine.run`, workflow JSON/schema, or workflow ledgers without a separately reviewed
+compatibility change. Normalized event traces are post-completion values in this batch;
+do not document the API as live streaming.
 
 ## Safety floor must not regress
 

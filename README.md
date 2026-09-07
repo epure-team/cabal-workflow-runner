@@ -72,9 +72,40 @@ verdicts rather than on an LLM's opinion of its own diff. See
 - **Executable** `cabal-workflow-runner` (`bin/`): a small CLI; this is the only place
   that links cabal.
 
+## Rich agent execution contract (additive)
+
+The library exposes a host-neutral contract for future rich backend bridges without
+changing the workflow format or wiring it into `Engine.run`:
+
+- `Agent_execution` validates opaque requests with separate system/user prompts,
+  finite positive timeouts, optional JSON Schema/session/routing/model/read-only
+  metadata, ordered workspace-relative attachment references, and disabled/search/
+  search+fetch web policies (optionally domain-restricted). Construction performs no
+  filesystem I/O.
+- Rich results retain structured status, normalized public text/JSON, every initial/
+  fresh/resumed attempt, path-free delivery intent, exact optional usage and integer
+  micro-USD cost, aggregate telemetry, final session, cleanup status, and an optional
+  bounded event trace. Dispatch failures before execution are distinct from execution
+  failures that retain attempts.
+- `Workflow_event` is a typed, bounded post-completion trace. It cannot represent raw
+  protocol lines, prompts, attachment paths/digests/bytes, argv, stdout/stderr, tool
+  arguments, chain-of-thought, or private backend JSON. Unknown observations become a
+  payload-free opaque event. This batch does **not** claim live event streaming.
+- `Runtime` wraps one completion function. `Runtime.of_legacy_backend` adapts the
+  unchanged `Backend.t` honestly as one synthetic attempt with unknown usage/cost, no
+  events, no inferred session, and no cleanup requirement. Unsupported rich inputs are
+  rejected before legacy dispatch.
+
+Versioned response/error/event-trace Yojson projections are redacted persistence
+surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`, workflow JSON/schema,
+and workflow ledgers remain unchanged; the new runtime is not yet an engine dependency.
+
 ## Build & test
 
-Built and tested in the cabal opam switch (cabal, eio, cmdliner, alcotest, yojson):
+Built and tested in the cabal opam switch. The library currently links `yojson`, `eio`,
+`unix`, `base64`, `digestif`, and `mirage-crypto-ec`; Cabal remains executable-only.
+The executable/test toolchain additionally uses `cabal`, `eio_main`, `cmdliner`, and
+`alcotest`:
 
 ```sh
 eval $(opam env --switch=/path/to/cabal --set-switch)
