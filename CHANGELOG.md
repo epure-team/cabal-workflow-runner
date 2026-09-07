@@ -2,6 +2,113 @@
 
 ## Unreleased
 
+**Additive rich agent execution contract.** Added opaque, validated host-neutral
+`Agent_execution` request/result/error DTOs; integer-micro-USD and saturating token
+`Execution_metrics`; bounded typed post-completion `Workflow_event` traces; and a
+one-call `Runtime` seam for a later Cabal bridge. Requests keep system/user prompts
+separate and carry optional schema/session/media/web/routing/model/read-only controls.
+Responses retain every initial/fresh/resumed attempt, exact optional metrics, aggregate
+telemetry, final session and sanitized cleanup status. Versioned Yojson projections omit
+prompts, attachment paths/digests/bytes, raw process output, argv, diagnostics and private
+backend payloads. Unknown backend observations have a payload-free opaque event kind;
+this release does not provide live event streaming.
+
+This is not integrated into the deterministic engine. `Backend.t`, `Backend.stub`,
+`Engine.run`, workflow JSON/schema, and workflow ledgers retain their existing APIs and
+encodings. `Runtime.of_legacy_backend` provides an explicit one-attempt adapter without
+inferring session IDs from model JSON. The library still has no Cabal dependency.
+
+**Rich-contract review closure.** Response status is now explicit and validated against
+the final transport attempt, schema-validation outcome, normalized event terminal,
+attempt kinds/outcomes/durations, sessions, metrics, and total elapsed time. Execution
+error kinds reject incoherent telemetry. Event traces now
+enforce phase, attempt/retry, and process lifecycle order while treating absent retained
+events conservatively as an unknown prefix/subsequence. JSON traversal is iterative and
+bounded by depth/node/serialized-byte limits; attempt text/count and trace/response/error
+projections are bounded as well.
+
+The legacy adapter no longer weakens unspecified read-only intent to `false`: `None` and
+each unrepresentable rich field are rejected before any callback, while explicit
+`true`/`false`, routing, and model values are forwarded exactly. Migration details are in
+`docs/rich-agent-execution-migration.md`.
+
+Architecture follow-up makes tool identities and omission counters opaque and
+constructor-validated. Runtime capabilities now carry canonical supported media MIME
+types and an independent restricted-domain web bit; the generic attachment boolean is
+derived from the MIME list. Legacy read-only/routing/model claims default to false and
+require explicit caller attestation. Documentation now distinguishes agent-completion
+`Workflow_event.trace` from the engine/ledger `Types.trace`, and `SPEC.md` lists the
+library's actual dependencies rather than the obsolete “yojson-only” claim.
+
+The final review follow-up moves JSON byte enforcement ahead of serialization:
+an iterative checked-size pass accounts exactly for compact JSON escaping, keys,
+separators, and delimiters, emits fixed resource-limit diagnostics with bounded semantic
+paths, and sizes canonical serialization from the accepted result. Event-trace and
+response projections now run the same exact preflight rather than allocating an
+over-limit temporary. Process exit events reject negative codes while retaining the full
+non-negative host `int` range.
+
+Usage events are cumulative per-attempt snapshots. Repeated known dimensions must be
+non-decreasing. Every known dimension now remains an aggregate lower bound across later
+omissions; exact equality is limited to dimensions present in a provably final retained
+observation. Retry transitions are checked against the next complete response attempt
+even when its start event is omitted. Attempt duration must fit inside its start/finish
+event envelope with a one-millisecond one-sided tolerance for timestamp overhead. Schema
+retry exhaustion now requires exactly an initial schema rejection plus one fresh/resumed
+corrective attempt and preserves a final schema rejection, backend/resume failure,
+timeout, or cancellation coherently.
+
+Post-execution dispatch failures now have their own typed error shape. They retain any
+coherent non-empty response without rewriting its status or attempts, plus a separate
+normalized outer failed trace. This permits a successful completed task with
+`Cleanup_failed` to coexist with Cabal's outer failed terminal. A new
+`No_completed_attempt` shape retains failed/timed-out/cancelled status, explicit
+invocation uncertainty, and an optional safe trace without inventing an attempt. Pure
+pre-invocation dispatch errors remain distinct and may retain a no-attempt trace.
+
+Interrupted outcomes after completed progress now use `Incomplete_execution`. The shape
+retains exact committed attempts, failed/timed-out/cancelled outer status, cleanup,
+completed-only aggregate metrics and final session, and the complete bounded outer trace.
+It records at most one immediately following fresh/resumed continuation as either
+possibly or known started, but never invents its `task_result` or complete attempt.
+Continuation usage/cost observations remain separate bounded lower bounds and are not
+folded into completed aggregates. Validation rejects skipped/wrong continuation kinds,
+successful incomplete outcomes, and evidence for more than one uncommitted continuation;
+ordinary response fusion and successful-execution-plus-cleanup-failure semantics remain
+strict.
+Exhaustive pre-release `error_view` consumers must add the new constructor, and
+projection consumers must accept the new `incomplete_execution` error kind and nested
+`cwr.agent-execution.incomplete/v1` value.
+
+Incomplete continuation evidence is now fail-closed: a declared N+1 continuation must
+own the outer terminal, `Invocation_started` requires explicit retained N+1 lifecycle or
+observation evidence, and `Invocation_may_have_started` requires an N+1 terminal plus a
+real omission count, truncation marker, or sequence gap. A schema rejection alone no
+longer authorizes a fabricated continuation after dense cancellation on N. Completed
+attempt usage, cost, and session observations are cross-checked on this path; N+1 session
+and metric observations stay trace-only/separate lower bounds and cannot replace
+completed aggregates or final session.
+
+Continuation uncertainty now localizes omission evidence to the N→N+1 boundary. With a
+retained retry transition, only a later positive truncation marker or sequence gap capable
+of hiding N+1 start/activity qualifies. If the transition was omitted, the qualifying
+interval begins after completed N's last retained lifecycle/observation event. Prefix or
+attempt-N omissions that finish before a dense retained transition→terminal suffix, and a
+bare global omission count without a boundary gap, no longer justify
+`Invocation_may_have_started`.
+
+The pre-release `Native_schema_rejection` category is renamed to the causally neutral
+`Native_backend_failure_with_schema`, matching Cabal's contract: the schema was in force,
+but is not asserted to have caused the backend failure. Error projections remain
+versioned/redacted/bounded and now account for an outer trace. The migration notes pin an
+exhaustive table for Cabal's current `Backend_completer.make_rich` outcomes and defer
+float-USD conversion until a checked deterministic micro-USD rounding policy is chosen.
+
+**Yojson 2.2 compatibility.** Canonical JSON validation now rejects Yojson's
+non-standard `Tuple`/`Variant` values explicitly and expression projection treats them
+as non-comparable, restoring exhaustive compilation without changing standard workflow
+JSON or ledger encodings.
+
 **`Deadline` governor.** `{"kind":"deadline"}` stops a governed loop once an
 operator-supplied wall-clock instant has passed. The instant is a runtime value
 (`Engine.run ~deadline`, with `~now` as an injectable clock seam), never a workflow

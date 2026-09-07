@@ -72,9 +72,93 @@ verdicts rather than on an LLM's opinion of its own diff. See
 - **Executable** `cabal-workflow-runner` (`bin/`): a small CLI; this is the only place
   that links cabal.
 
+## Rich agent execution contract (additive)
+
+The library exposes a host-neutral contract for future rich backend bridges without
+changing the workflow format or wiring it into `Engine.run`:
+
+- `Agent_execution` validates opaque requests with separate system/user prompts,
+  finite positive timeouts, optional JSON Schema/session/routing/model/read-only
+  metadata, ordered workspace-relative attachment references, and disabled/search/
+  search+fetch web policies (optionally domain-restricted). Construction performs no
+  filesystem I/O.
+- Rich results retain structured status, normalized public text/JSON, every initial/
+  fresh/resumed attempt, path-free delivery intent, exact optional usage and integer
+  micro-USD cost, aggregate telemetry, final session, cleanup status, and an optional
+  bounded event trace. Response construction cross-validates overall/final status,
+  trace terminal, attempt kinds/outcomes, sessions, cumulative metric snapshots, and
+  whole-call elapsed time. Cumulative usage observations retain per-dimension lower
+  bounds across later omissions; only dimensions present in a provably final observation
+  require exact equality. Retry transitions are checked against the next complete
+  response attempt even when its start event was omitted. Attempt event intervals may
+  include bridge overhead but may not be shorter than the corresponding attempt duration
+  beyond the documented one-sided tolerance. Schema-retry failures retain exactly the
+  initial schema rejection and one fresh/resumed corrective attempt, including failed,
+  timed-out, or cancelled corrective transports. Dispatch failures before execution,
+  no-completed-attempt outcomes with explicit invocation uncertainty,
+  incomplete executions with exact completed attempts plus at most one
+  invoked-but-uncommitted fresh/resumed continuation,
+  post-execution dispatch failures retaining any coherent non-empty response plus a
+  separate outer failed trace, and execution failures remain distinct typed shapes.
+  Incomplete execution never fabricates a continuation result: its failed/timed-out/
+  cancelled outer status and complete bounded outer trace remain separate from committed
+  attempts. Aggregate metrics and final session use committed results only; bounded
+  usage/cost observations from the continuation are exposed separately as lower bounds.
+  A declared continuation owns the outer terminal at N+1. Known-started state requires
+  explicit retained N+1 lifecycle/observation evidence. Uncertain state requires an N+1
+  terminal plus a positive truncation marker or sequence gap spanning the N→N+1 boundary:
+  after a retained retry transition, or after completed N's last retained lifecycle event
+  when the transition was omitted. Earlier prefix/N omissions and a bare global omission
+  count do not qualify when the retained transition→terminal suffix is dense. A schema
+  rejection alone cannot fabricate a retry, so dense cancellation on the last completed
+  attempt records no continuation.
+  A successful completed transport therefore stays successful when later sealed-input
+  cleanup fails; its attempts/session/metrics/cleanup status are not rewritten to fit the
+  outer terminal. Native backend failure while a schema is in force is named neutrally
+  and does not claim that schema validation caused the failure.
+- `Workflow_event` is a typed, bounded agent-completion lifecycle trace, distinct from
+  the deterministic engine's `Types.trace` and ledger. It cannot represent raw
+  protocol lines, prompts, attachment paths/digests/bytes, argv, stdout/stderr, tool
+  arguments, chain-of-thought, or private backend JSON. Unknown observations become a
+  payload-free opaque event. Its lifecycle validator permits omitted prefixes/events but
+  rejects visible phase, attempt, retry, and process-order contradictions, negative
+  process exit codes, and decreasing known cumulative usage/cost snapshots. Exit codes
+  otherwise use the host's non-negative `int` range rather than a Unix-specific ceiling.
+  This batch does **not** claim live event streaming.
+- `Runtime` wraps one completion function. `Runtime.of_legacy_backend` adapts the
+  unchanged `Backend.t` honestly as one synthetic attempt with unknown usage/cost, no
+  events, no inferred session, and no cleanup requirement. It requires explicit
+  read-only intent and rejects schema, resume, attachment, web, and max-turn inputs
+  before legacy dispatch; `true` and `false` read-only values plus routing/model hints
+  are forwarded unchanged. Its capability claims are conservative by default and can be
+  enabled only through explicit caller-attestation flags. Runtime capability metadata
+  records exact canonical media MIME types and whether domain-restricted web policies
+  are enforceable, rather than inferring either from a generic boolean/web maximum.
+
+JSON validation uses bounded iterative traversal and checked compact-encoding size
+accounting before serialization allocation. The accounting includes string/key escaping,
+separators, and delimiters without constructing unbounded attacker-controlled diagnostic
+paths. Canonical output is serialized into a buffer sized from that successful preflight;
+trace and response projections are likewise rejected from exact pre-serialization size.
+Public constants cap JSON depth, nodes/bytes, public attempt text, attempt count,
+restricted domains, canonical output, and serialized trace/response/incomplete/error
+projections; incomplete and post-execution error bounds include a separately retained
+outer trace.
+See the [rich execution migration
+notes](docs/rich-agent-execution-migration.md) for adoption details and the exhaustive
+mapping from Cabal's current `Backend_completer.make_rich` outcomes.
+
+Versioned response/incomplete-execution/error/event-trace Yojson projections are
+redacted persistence surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`,
+workflow JSON/schema, and workflow ledgers remain unchanged; the new runtime is not yet
+an engine dependency.
+
 ## Build & test
 
-Built and tested in the cabal opam switch (cabal, eio, cmdliner, alcotest, yojson):
+Built and tested in the cabal opam switch. The library currently links `yojson`, `eio`,
+`unix`, `base64`, `digestif`, and `mirage-crypto-ec`; Cabal remains executable-only.
+The executable/test toolchain additionally uses `cabal`, `eio_main`, `cmdliner`, and
+`alcotest`:
 
 ```sh
 eval $(opam env --switch=/path/to/cabal --set-switch)
