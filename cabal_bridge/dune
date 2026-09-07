@@ -1,4 +1,11 @@
 (library
+ (name cwr_cabal_internal)
+ (package cabal_workflow_runner)
+ (modules cwr_cabal_internal)
+ (libraries cabal_workflow_runner cabal eio eio_posix))
+
+(library
  (name cwr_cabal)
  (public_name cabal_workflow_runner.cabal_bridge)
- (libraries cabal_workflow_runner cabal eio eio_posix))
+ (modules cwr_cabal)
+ (libraries cwr_cabal_internal cabal_workflow_runner cabal eio eio_posix))

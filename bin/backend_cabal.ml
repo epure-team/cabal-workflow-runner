@@ -53,12 +53,18 @@ let project_completion response =
 let project_completion_error error =
   (false, Agent_execution.error_to_yojson error)
 
+let protect_shell_command run =
+  try run () with
+  | Eio.Cancel.Cancelled _ as cancellation -> raise cancellation
+  | (Out_of_memory | Stack_overflow | Sys.Break) as fatal -> raise fatal
+  | _ -> 127
+
 let make ~sw ~env ~working_dir =
   let* backend_id = required_backend_id () in
-  let* () = Cwr_cabal.bootstrap_hardened () in
+  let* bootstrap = Cwr_cabal.bootstrap_hardened () in
   let* runtime =
-    Cwr_cabal.create ~sw ~env ~limits:no_attachment_limits ~backend_id
-      ~working_dir ?default_model:(default_model ()) ()
+    Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+      ~backend_id ~working_dir ?default_model:(default_model ()) ()
   in
   let budget_counter = ref (initial_budget ()) in
   let budget_mutex = Eio.Mutex.create () in
@@ -97,7 +103,7 @@ let make ~sw ~env ~working_dir =
     Cwr_runner.Runner.make_pinned ~sw ~env ~base:working_dir
   in
   let run_shell_command command =
-    try
+    protect_shell_command (fun () ->
       let result =
         Backend_process.run_process ~sw ~env ~cmd:["sh"; "-c"; command]
           ~working_dir ~timeout_seconds:60.0 ()
@@ -105,8 +111,7 @@ let make ~sw ~env ~working_dir =
       match result.Backend_process.status with
       | Backend_types.Timeout -> 124
       | Backend_types.Success | Backend_types.Failed _ | Backend_types.Cancelled ->
-          result.exit_code
-    with _ -> 127
+          result.exit_code)
   in
   Ok
     Backend.

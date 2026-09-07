@@ -5,6 +5,8 @@ let fail error = Alcotest.fail error
 
 let ok = function Ok value -> value | Error error -> fail error
 
+let bootstrap = ok (Cwr_cabal.bootstrap_hardened ())
+
 let execution_ok = function
   | Ok value -> value
   | Error error -> (
@@ -13,7 +15,9 @@ let execution_ok = function
       | Agent_execution.No_completed_attempt {message; _}
       | Agent_execution.Incomplete_execution {message; _}
       | Agent_execution.Post_execution_dispatch_failed {message; _}
-      | Agent_execution.Execution_failure {message; _} -> Alcotest.fail message)
+      | Agent_execution.Execution_failure {message; _}
+      | Agent_execution.Telemetry_mapping_failure {message; _} ->
+          Alcotest.fail message)
 
 let contains value needle =
   let value_length = String.length value in
@@ -46,15 +50,16 @@ let native_evidence : Backend_types.capability_evidence =
     test_method = Backend_types.E2e_test;
   }
 
-let descriptor ?(session_resume = false) ?(native = false)
+let descriptor ?(binary_name = "true") ?(baseline_version = "1.0.0")
+    ?(session_resume = false) ?(native = false)
     ?(read_only = false) ?(media_types = [])
     ?(web = Backend_types.Web_disabled) id =
   let open Backend_registry in
   {
     id;
     display_name = "CWR deterministic fake backend";
-    binary_name = "true";
-    baseline_version = "1.0.0";
+    binary_name;
+    baseline_version;
     capabilities =
       {
         structured_output = true;
@@ -116,7 +121,17 @@ let make_backend ?(session_resume = false) ?(native = false)
     let run_task ~sw:_ ~env ?context ?on_raw_line:_ spec =
       incr observation.calls;
       observation.specs := spec :: !(observation.specs);
-      run ~env ~context ~call:!(observation.calls) spec
+      let result = run ~env ~context ~call:!(observation.calls) spec in
+      Option.iter
+        (fun context ->
+          if
+            result.Backend_types.agent_text <> ""
+            && not (Task_execution_context.agent_text_emitted context)
+          then
+            Task_execution_context.emit context
+              (Task_event.Agent_text_delta result.agent_text))
+        context;
+      result
   end in
   ((module Backend : Agentic_backend.S), observation)
 
@@ -135,18 +150,20 @@ let cost ?input ?output ?cache_creation ?cache_read ?usd () :
     cache_read_input_tokens = cache_read;
   }
 
-let register ?session_resume ?native ?read_only ?media_types ?web id backend =
+let register ?binary_name ?baseline_version ?session_resume ?native ?read_only
+    ?media_types ?web id backend =
   ok
-    (Cwr_cabal.register_custom_backend
+    (Cwr_cabal.register_custom_backend ~bootstrap
        ~descriptor:
-         (descriptor ?session_resume ?native ?read_only ?media_types ?web id)
+         (descriptor ?binary_name ?baseline_version ?session_resume ?native
+            ?read_only ?media_types ?web id)
        ~backend)
 
 let create ~sw ~env ?(limits = no_attachment_limits) ?custom_backend
     ?default_model ~backend_id ~working_dir () =
   ok
-    (Cwr_cabal.create ~sw ~env ~limits ~backend_id ~working_dir ?custom_backend
-       ?default_model ())
+    (Cwr_cabal.create ~bootstrap ~sw ~env ~limits ~backend_id ~working_dir
+       ?custom_backend ?default_model ())
 
 let request ?(id = "bridge-request") ?(system_prompt = "system")
     ?(user_prompt = "user") ?json_schema ?resume_session ?(attachments = [])
@@ -191,13 +208,122 @@ let status_equal left right =
   | Agent_execution.Failed _, Agent_execution.Failed _ -> true
   | _ -> false
 
+let check_predispatch_error ~kind ~diagnostic error =
+  match Agent_execution.error_view error with
+  | Agent_execution.Dispatch_failure
+      {kind = actual; message; event_trace = Some trace} ->
+      Alcotest.(check bool) "dispatch kind" true (actual = kind);
+      Alcotest.(check bool) "sanitized diagnostic" true
+        (contains message diagnostic);
+      Alcotest.(check bool) "every pre-invocation envelope is attempt zero" true
+        (List.for_all
+           (fun event -> Workflow_event.attempt event = 0)
+           (Workflow_event.events trace))
+  | _ -> fail "pre-invocation error lost its typed trace"
+
 let test_bootstrap_conflict_is_clear () =
   match Cwr_cabal.bootstrap_hardened () with
   | Error message ->
       Alcotest.(check bool)
-        "second bootstrap explains the registry conflict" true
-        (contains message "requires an empty runtime registry")
-  | Ok () -> fail "a second hardened bootstrap unexpectedly succeeded"
+        "second bootstrap explains the process lifecycle" true
+        (contains message "one-shot for the process")
+  | Ok _ -> fail "a second hardened bootstrap unexpectedly succeeded"
+
+let validated_entry id =
+  match Registry.find_entry id with
+  | Some (Registry.Validated entry) -> entry
+  | Some (Registry.Raw _) -> Alcotest.failf "%s is raw" id
+  | None -> Alcotest.failf "%s is missing" id
+
+let clone_entry ?backend entry =
+  let backend = Option.value ~default:entry.Runtime_entry.backend backend in
+  match
+    Runtime_entry.create ~backend ~descriptor:entry.effective_descriptor
+      ~runtime_capabilities:entry.runtime_capabilities ~origin:entry.origin
+      ~execution_policy:entry.execution_policy
+      ~version_policy:entry.version_policy
+  with
+  | Ok entry -> entry
+  | Error error -> fail (Runtime_entry.render_validation_error error)
+
+let test_hardened_entry_identity_is_pinned () =
+  let id = "codex" in
+  let original = validated_entry id in
+  let expect_rejected ~sw ~env label =
+    match
+      Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+        ~backend_id:id ~working_dir:"/tmp" ()
+    with
+    | Error _ -> ()
+    | Ok _ -> Alcotest.fail (label ^ " unexpectedly retained trust")
+  in
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  Registry.register original.backend;
+  expect_rejected ~sw ~env "raw replacement";
+  Registry.register_validated original;
+  let cloned = clone_entry original in
+  Registry.register_validated cloned;
+  expect_rejected ~sw ~env "equal validated replacement";
+  Registry.register_validated original;
+  let replacement_backend, _ =
+    make_backend ~session_resume:true ~native:true ~id
+      (fun ~env:_ ~context:_ ~call:_ _ -> result ())
+  in
+  let replacement = clone_entry ~backend:replacement_backend original in
+  Registry.register_validated replacement;
+  expect_rejected ~sw ~env "physical backend replacement";
+  Registry.register_validated original;
+  ignore (create ~sw ~env ~backend_id:id ~working_dir:"/tmp" ())
+
+let test_custom_token_binds_exact_entry_and_bootstrap () =
+  let first_id = "cwr-token-first" in
+  let first_backend, _ =
+    make_backend ~id:first_id (fun ~env:_ ~context:_ ~call:_ _ -> result ())
+  in
+  let first_token = register first_id first_backend in
+  let second_id = "cwr-token-second" in
+  let second_backend, _ =
+    make_backend ~id:second_id (fun ~env:_ ~context:_ ~call:_ _ -> result ())
+  in
+  let second_token = register second_id second_backend in
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  (match
+     Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+       ~backend_id:first_id ~working_dir:"/tmp" ~custom_backend:second_token ()
+   with
+  | Error _ -> ()
+  | Ok _ -> fail "a token authorized another custom backend");
+  let original = validated_entry first_id in
+  Registry.register_validated (clone_entry original);
+  (match
+     Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+       ~backend_id:first_id ~working_dir:"/tmp" ~custom_backend:first_token ()
+   with
+  | Error _ -> ()
+  | Ok _ -> fail "a token survived validated entry replacement");
+  Registry.register_validated original;
+  ignore
+    (create ~sw ~env ~custom_backend:first_token ~backend_id:first_id
+       ~working_dir:"/tmp" ())
+
+let test_concurrent_create_uses_immutable_bootstrap () =
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let make_runtime () =
+    Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+      ~backend_id:"codex" ~working_dir:"/tmp" ()
+  in
+  let left = ref None in
+  let right = ref None in
+  Eio.Fiber.both
+    (fun () -> left := Some (make_runtime ()))
+    (fun () -> right := Some (make_runtime ()));
+  match (!left, !right) with
+  | Some (Ok _), Some (Ok _) -> ()
+  | Some (Error error), _ | _, Some (Error error) -> Alcotest.fail error
+  | None, _ | _, None -> fail "concurrent create did not complete"
 
 let test_exact_request_mapping () =
   with_temp_dir "mapping" @@ fun root ->
@@ -229,6 +355,8 @@ let test_exact_request_mapping () =
     create ~sw ~env ~limits:media_limits ~custom_backend ~backend_id:id
       ~working_dir:workspace ()
   in
+  Alcotest.(check bool) "max turns are accepted and forwarded" true
+    (Runtime.max_turns (Runtime.capabilities runtime));
   let schema = `Assoc [("type", `String "object")] in
   let mapped =
     request ~system_prompt:" system prompt with spaces "
@@ -275,20 +403,37 @@ let test_exact_request_mapping () =
         else event_index predicate (index + 1) rest
   in
   let events = Workflow_event.events trace in
+  let required_index label predicate =
+    match event_index predicate 0 events with
+    | Some index -> index
+    | None -> fail (label ^ " event was absent")
+  in
+  let required_at label index =
+    match List.nth_opt events index with
+    | Some event -> event
+    | None -> fail (label ^ " event index was invalid")
+  in
   let session_index =
-    Option.get
-      (event_index
-         (function Workflow_event.Session_id _ -> true | _ -> false)
-         0 events)
+    required_index "session"
+      (function Workflow_event.Session_id _ -> true | _ -> false)
   in
   let finish_index =
-    Option.get
-      (event_index
-         (function Workflow_event.Attempt_finished _ -> true | _ -> false)
-         0 events)
+    required_index "attempt finish"
+      (function Workflow_event.Attempt_finished _ -> true | _ -> false)
   in
-  Alcotest.(check bool) "fallback metadata normalized inside attempt" true
-    (session_index < finish_index);
+  Alcotest.(check bool) "fallback metadata keeps its post-finish envelope" true
+    (session_index > finish_index);
+  let finish_event = required_at "attempt finish" finish_index in
+  let session_event = required_at "session" session_index in
+  Alcotest.(check int64) "source sequence envelope is unchanged"
+    (Int64.succ (Workflow_event.seq finish_event))
+    (Workflow_event.seq session_event);
+  Alcotest.(check int) "source attempt envelope is unchanged"
+    (Workflow_event.attempt finish_event)
+    (Workflow_event.attempt session_event);
+  Alcotest.(check bool) "source elapsed envelope remains ordered" true
+    (Workflow_event.elapsed_s session_event
+    >= Workflow_event.elapsed_s finish_event);
   Alcotest.(check (option string)) "session retained"
     (Some "returned-session")
     (Agent_execution.final_session_id mapped);
@@ -400,8 +545,14 @@ let test_strict_structured_output () =
   in
   Alcotest.(check bool) "valid raw report preferred" true
     (structured () = Some (`Assoc [("raw", `Bool true)]));
-  Alcotest.(check bool) "inconsistent raw report yields strict text" true
-    (structured () = Some (`Assoc [("text", `Bool true)]));
+  (match Runtime.complete runtime (request ()) with
+  | Error error -> (
+      match Agent_execution.error_view error with
+      | Agent_execution.Telemetry_mapping_failure {event_trace; _} ->
+          Alcotest.(check bool) "safe source trace retained" true
+            (Workflow_event.events event_trace <> [])
+      | _ -> fail "conflicting structured sources were misclassified")
+  | Ok _ -> fail "conflicting structured sources were accepted");
   Alcotest.(check bool) "invalid report root yields strict text" true
     (structured () = Some (`Assoc [("fallback", `Bool true)]));
   List.iter
@@ -453,7 +604,11 @@ let test_schema_retry_and_native_failure () =
           {kind = Agent_execution.Schema_retry_failed; response; _} ->
           Alcotest.(check int) "both retries retained" 2
             (List.length (Agent_execution.attempts response));
-          let trace = Option.get (Agent_execution.event_trace response) in
+          let trace =
+            match Agent_execution.event_trace response with
+            | Some trace -> trace
+            | None -> fail "schema retry trace was absent"
+          in
           Alcotest.(check bool) "opaque retry reason stays redacted" true
             (List.exists
                (fun event ->
@@ -475,7 +630,7 @@ let test_schema_retry_and_native_failure () =
                 (Option.is_some (Agent_execution.attempt_schema_error first)
                 && Option.is_some
                      (Agent_execution.attempt_schema_error second))
-          | _ -> assert false)
+          | _ -> fail "schema retry did not retain exactly two attempts")
       | _ -> fail "schema retry failure was misclassified")
   | Ok _ -> fail "double schema failure unexpectedly succeeded");
   Alcotest.(check int) "two central calls" 2 !(observation.calls);
@@ -561,8 +716,17 @@ let test_capability_and_routing_rejections_precede_spawn () =
   let read_only_error = expect_dispatch (request ~read_only:(Some true) ()) in
   (match Agent_execution.error_view read_only_error with
   | Agent_execution.Dispatch_failure
-      {kind = Agent_execution.Preflight_failed; _} ->
-      ()
+      {
+        kind = Agent_execution.Preflight_failed;
+        message;
+        event_trace = Some trace;
+      } ->
+      Alcotest.(check bool) "preflight diagnostic is sanitized" true
+        (contains message "read-only");
+      Alcotest.(check bool) "preflight trace remains pre-invocation" true
+        (List.for_all
+           (fun event -> Workflow_event.attempt event = 0)
+           (Workflow_event.events trace))
   | _ -> fail "read-only capability rejection was misclassified");
   Alcotest.(check int) "no backend spawn" 0 !(observation.calls);
   Alcotest.(check int) "capability rejection precedes availability" 0
@@ -573,8 +737,8 @@ let test_missing_blank_untrusted_and_quarantined_backends () =
   Eio.Switch.run @@ fun sw ->
   let expect_create_error ?custom_backend backend_id =
     match
-      Cwr_cabal.create ~sw ~env ~limits:no_attachment_limits ~backend_id
-        ~working_dir:"/tmp" ?custom_backend ()
+      Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+        ~backend_id ~working_dir:"/tmp" ?custom_backend ()
     with
     | Error _ -> ()
     | Ok _ -> Alcotest.failf "backend %S unexpectedly passed create" backend_id
@@ -586,7 +750,26 @@ let test_missing_blank_untrusted_and_quarantined_backends () =
   in
   Registry.register raw_backend;
   expect_create_error "cwr-raw";
-  expect_create_error "copilot-cli";
+  let quarantined =
+    create ~sw ~env ~backend_id:"copilot-cli" ~working_dir:"/tmp" ()
+  in
+  (match Runtime.complete quarantined (request ()) with
+  | Error error -> (
+      match Agent_execution.error_view error with
+      | Agent_execution.Dispatch_failure
+          {
+            kind = Agent_execution.Capability_mismatch;
+            message;
+            event_trace = Some trace;
+          } ->
+          Alcotest.(check bool) "quarantine diagnostic" true
+            (contains message "quarantined");
+          Alcotest.(check bool) "quarantine terminal is attempt zero" true
+            (List.for_all
+               (fun event -> Workflow_event.attempt event = 0)
+               (Workflow_event.events trace))
+      | _ -> fail "quarantine was misclassified or lost its trace")
+  | Ok _ -> fail "quarantined backend executed");
   Alcotest.(check int) "raw backend not called" 0 !(raw_observation.calls)
 
 let test_unavailable_and_zero_attempt_timeout () =
@@ -621,8 +804,17 @@ let test_unavailable_and_zero_attempt_timeout () =
   | Error error -> (
       match Agent_execution.error_view error with
       | Agent_execution.Dispatch_failure
-          {kind = Agent_execution.Backend_unavailable; _} ->
-          ()
+          {
+            kind = Agent_execution.Backend_unavailable;
+            message;
+            event_trace = Some trace;
+          } ->
+          Alcotest.(check bool) "availability diagnostic" true
+            (contains message "not available");
+          Alcotest.(check bool) "unavailable trace is attempt zero" true
+            (List.for_all
+               (fun event -> Workflow_event.attempt event = 0)
+               (Workflow_event.events trace))
       | _ -> fail "unavailable backend was misclassified")
   | Ok _ -> fail "unavailable backend succeeded");
   Alcotest.(check int) "unavailable backend not called" 0
@@ -663,6 +855,136 @@ let test_unavailable_and_zero_attempt_timeout () =
   | Ok _ -> fail "zero-attempt backend exception unexpectedly succeeded");
   Alcotest.(check int) "exception backend called once" 1
     !(exception_observation.calls)
+
+let test_predispatch_registry_version_and_availability_errors () =
+  let raw_id = "cwr-race-raw" in
+  let raw_backend, _ =
+    make_backend ~id:raw_id (fun ~env:_ ~context:_ ~call:_ _ -> result ())
+  in
+  let raw_token = register raw_id raw_backend in
+  let missing_id = "cwr-race-missing" in
+  let missing_backend, _ =
+    make_backend ~id:missing_id (fun ~env:_ ~context:_ ~call:_ _ -> result ())
+  in
+  let missing_token = register missing_id missing_backend in
+  let availability_id = "cwr-availability-error" in
+  let availability_backend, availability_observation =
+    make_backend ~available:(fun () -> raise (Failure "private availability"))
+      ~id:availability_id
+      (fun ~env:_ ~context:_ ~call:_ _ -> result ())
+  in
+  let availability_token = register availability_id availability_backend in
+  let run_race ~runtime mutate =
+    let outcome = ref None in
+    Eio.Fiber.both
+      (fun () ->
+        Eio.Fiber.yield ();
+        mutate ())
+      (fun () -> outcome := Some (Runtime.complete runtime (request ())));
+    match !outcome with
+    | Some (Error error) -> error
+    | Some (Ok _) -> fail "registry race unexpectedly dispatched"
+    | None -> fail "registry race did not complete"
+  in
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let raw_runtime =
+    create ~sw ~env ~custom_backend:raw_token ~backend_id:raw_id
+      ~working_dir:"/tmp" ()
+  in
+  let raw_original = validated_entry raw_id in
+  let raw_error = run_race ~runtime:raw_runtime (fun () -> Registry.register raw_backend) in
+  Registry.register_validated raw_original;
+  check_predispatch_error ~kind:Agent_execution.Capability_mismatch
+    ~diagnostic:"raw-registered" raw_error;
+  let missing_runtime =
+    create ~sw ~env ~custom_backend:missing_token ~backend_id:missing_id
+      ~working_dir:"/tmp" ()
+  in
+  let registry_snapshot =
+    Registry.list_ids ()
+    |> List.filter_map (fun id ->
+           match Registry.find_entry id with
+           | Some (Registry.Validated entry) -> Some entry
+           | None | Some (Registry.Raw _) -> None)
+  in
+  let missing_error = run_race ~runtime:missing_runtime Registry.clear in
+  Registry.replace_all_validated registry_snapshot;
+  check_predispatch_error ~kind:Agent_execution.Backend_unavailable
+    ~diagnostic:"not registered" missing_error;
+  let availability_runtime =
+    create ~sw ~env ~custom_backend:availability_token
+      ~backend_id:availability_id ~working_dir:"/tmp" ()
+  in
+  let availability_error =
+    match Runtime.complete availability_runtime (request ()) with
+    | Error error -> error
+    | Ok _ -> fail "availability exception unexpectedly dispatched"
+  in
+  check_predispatch_error ~kind:Agent_execution.Internal_dispatch_failure
+    ~diagnostic:"availability check failed" availability_error;
+  Alcotest.(check int) "availability failure did not invoke backend" 0
+    !(availability_observation.calls)
+
+let test_predispatch_version_rejection () =
+  with_temp_dir "version" @@ fun root ->
+  let binary = "cwr-old-version" in
+  let binary_path = Filename.concat root binary in
+  write_file binary_path "#!/bin/sh\nprintf 'cwr-old-version 0.1.0\\n'\n";
+  Unix.chmod binary_path 0o700;
+  let original_path = Option.value ~default:"" (Sys.getenv_opt "PATH") in
+  Fun.protect
+    ~finally:(fun () -> Unix.putenv "PATH" original_path)
+    (fun () ->
+      Unix.putenv "PATH" (root ^ ":" ^ original_path);
+      let id = "cwr-version-rejected" in
+      let backend, observation =
+        make_backend ~id (fun ~env:_ ~context:_ ~call:_ _ -> result ())
+      in
+      let token =
+        register ~binary_name:binary ~baseline_version:"1.0.0" id backend
+      in
+      Eio_posix.run @@ fun env ->
+      Eio.Switch.run @@ fun sw ->
+      let runtime =
+        create ~sw ~env ~custom_backend:token ~backend_id:id ~working_dir:"/tmp"
+          ()
+      in
+      let error =
+        match Runtime.complete runtime (request ()) with
+        | Error error -> error
+        | Ok _ -> fail "unsupported version unexpectedly dispatched"
+      in
+      check_predispatch_error ~kind:Agent_execution.Capability_mismatch
+        ~diagnostic:"stable baseline" error;
+      Alcotest.(check int) "version rejection did not invoke backend" 0
+        !(observation.calls))
+
+let test_clear_and_rebootstrap_do_not_refresh_trust () =
+  Registry.clear ();
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let expect_old_handle_rejected label =
+    match
+      Cwr_cabal.create ~bootstrap ~sw ~env ~limits:no_attachment_limits
+        ~backend_id:"codex" ~working_dir:"/tmp" ()
+    with
+    | Error _ -> ()
+    | Ok _ -> Alcotest.fail (label ^ " trusted a new registry generation")
+  in
+  expect_old_handle_rejected "cleared registry";
+  (match Cwr_cabal.bootstrap_hardened () with
+  | Error message ->
+      Alcotest.(check bool) "CWR bootstrap stays one-shot" true
+        (contains message "one-shot")
+  | Ok _ -> fail "CWR bootstrap succeeded twice");
+  (match
+     Runtime_bootstrap.register_runtime
+       ~profile:Runtime_bootstrap.Hardened_builtins ()
+   with
+  | Ok () -> ()
+  | Error error -> fail (Runtime_bootstrap.render_error error));
+  expect_old_handle_rejected "direct Cabal rebootstrap"
 
 let test_cost_rounding_sessions_and_event_truncation () =
   let id = "cwr-cost-events" in
@@ -708,7 +1030,11 @@ let test_cost_rounding_sessions_and_event_truncation () =
   Alcotest.(check (option string)) "session aggregate"
     (Some "cost-session")
     (Agent_execution.final_session_id response);
-  let trace = Option.get (Agent_execution.event_trace response) in
+  let trace =
+    match Agent_execution.event_trace response with
+    | Some trace -> trace
+    | None -> fail "cost/session trace was absent"
+  in
   Alcotest.(check bool) "bounded trace" true
     (List.length (Workflow_event.events trace) <= Workflow_event.max_events);
   Alcotest.(check bool) "omissions recorded" true
@@ -727,7 +1053,13 @@ let test_cost_rounding_sessions_and_event_truncation () =
   let overflow_response =
     Runtime.complete overflow_runtime (request ()) |> execution_ok
   in
-  let overflow_attempt = List.hd (Agent_execution.attempts overflow_response) in
+  let overflow_attempt =
+    match Agent_execution.attempts overflow_response with
+    | [ attempt ] -> attempt
+    | attempts ->
+        Alcotest.failf "expected one overflow attempt, got %d"
+          (List.length attempts)
+  in
   (match Agent_execution.attempt_cost overflow_attempt with
   | Some mapped ->
       Alcotest.(check (option int64)) "overflow saturates" (Some Int64.max_int)
@@ -770,7 +1102,11 @@ let test_process_and_tool_events_are_normalized () =
     create ~sw ~env ~custom_backend ~backend_id:id ~working_dir:"/tmp" ()
   in
   let response = Runtime.complete runtime (request ()) |> execution_ok in
-  let trace = Option.get (Agent_execution.event_trace response) in
+  let trace =
+    match Agent_execution.event_trace response with
+    | Some trace -> trace
+    | None -> fail "process/tool trace was absent"
+  in
   let payloads = List.map Workflow_event.payload (Workflow_event.events trace) in
   let has predicate = List.exists predicate payloads in
   Alcotest.(check bool) "process start" true
@@ -797,19 +1133,26 @@ let test_process_and_tool_events_are_normalized () =
     (contains projection "private-status")
 
 let () =
-  (match Cwr_cabal.bootstrap_hardened () with
-  | Ok () -> ()
-  | Error error -> Alcotest.fail error);
   Alcotest.run "CWR Cabal rich bridge"
     [
       ( "bootstrap and routing",
         [
           Alcotest.test_case "second bootstrap conflict" `Quick
             test_bootstrap_conflict_is_clear;
+          Alcotest.test_case "hardened entry identity is pinned" `Quick
+            test_hardened_entry_identity_is_pinned;
+          Alcotest.test_case "custom token binds exact entry" `Quick
+            test_custom_token_binds_exact_entry_and_bootstrap;
+          Alcotest.test_case "concurrent create" `Quick
+            test_concurrent_create_uses_immutable_bootstrap;
           Alcotest.test_case "missing blank raw and quarantined" `Quick
             test_missing_blank_untrusted_and_quarantined_backends;
           Alcotest.test_case "unavailable and zero-attempt timeout" `Quick
             test_unavailable_and_zero_attempt_timeout;
+          Alcotest.test_case "registry and availability failures retain trace"
+            `Quick test_predispatch_registry_version_and_availability_errors;
+          Alcotest.test_case "version rejection retains trace" `Quick
+            test_predispatch_version_rejection;
         ] );
       ( "request mapping",
         [
@@ -832,5 +1175,10 @@ let () =
             test_cost_rounding_sessions_and_event_truncation;
           Alcotest.test_case "process and tool event normalization" `Quick
             test_process_and_tool_events_are_normalized;
+        ] );
+      ( "destructive lifecycle",
+        [
+          Alcotest.test_case "clear and rebootstrap cannot refresh trust" `Quick
+            test_clear_and_rebootstrap_do_not_refresh_trust;
         ] );
     ]
