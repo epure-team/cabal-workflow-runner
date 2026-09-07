@@ -1,9 +1,9 @@
 (** Additive host-neutral rich agent execution contract.
 
     These DTOs are independent of the deterministic workflow interpreter and of
-    Cabal. They are intended for a later host bridge. Construction is opaque and
-    validated so optional fields can be extended without breaking callers. No
-    constructor performs filesystem or backend I/O. *)
+    Cabal. They are consumed by separately linked host bridges. Construction is
+    opaque and validated so optional fields can be extended without breaking
+    callers. No constructor performs filesystem or backend I/O. *)
 
 type attachment
 (** Opaque validated workspace-relative attachment reference. It contains

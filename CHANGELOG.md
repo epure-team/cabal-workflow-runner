@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**Installable Cabal rich bridge.** Added
+`cabal_workflow_runner.cabal_bridge`, backed exclusively by Cabal's hardened runtime and
+`Backend_completer.make_rich`. It maps rich schema/media/web/timeout/turn/resume/model/
+read-only requests and exhaustive result, attempt, event, metric, session, cleanup, and
+typed error evidence into the Batch-1 host-neutral contract. Strict structured output
+accepts only complete JSON objects/arrays; prose, fences, bracket scanning, scalars, and
+session-id injection are removed.
+
+The CLI now adapts this rich runtime to the unchanged workflow-engine `Backend.t` seam.
+`CWR_BACKEND` is mandatory and has no first-available fallback, attachment limits are an
+explicit zero-attachment CLI policy, and read-only work no longer bypasses Cabal's central
+registry/preflight path. The core `lib/` remains Cabal-free. Fake-backend tests exercise
+request/status/retry/error/event/cost/session mapping without real CLIs. CI, release, and
+developer setup pin Cabal commit `eccda75cede474c8682db41ab5c99d639a655441`.
+
 **Additive rich agent execution contract.** Added opaque, validated host-neutral
 `Agent_execution` request/result/error DTOs; integer-micro-USD and saturating token
 `Execution_metrics`; bounded typed post-completion `Workflow_event` traces; and a
@@ -101,8 +116,9 @@ The pre-release `Native_schema_rejection` category is renamed to the causally ne
 `Native_backend_failure_with_schema`, matching Cabal's contract: the schema was in force,
 but is not asserted to have caused the backend failure. Error projections remain
 versioned/redacted/bounded and now account for an outer trace. The migration notes pin an
-exhaustive table for Cabal's current `Backend_completer.make_rich` outcomes and defer
-float-USD conversion until a checked deterministic micro-USD rounding policy is chosen.
+exhaustive table for Cabal's current `Backend_completer.make_rich` outcomes; the bridge
+uses checked ceiling conversion from finite non-negative float USD to integer micro-USD,
+saturating positive representational overflow.
 
 **Yojson 2.2 compatibility.** Canonical JSON validation now rejects Yojson's
 non-standard `Tuple`/`Variant` values explicitly and expression projection treats them

@@ -195,13 +195,12 @@ cannot be classified maps to `Unknown`; process ids and raw process streams are
 deliberately outside the safe host-neutral projection. These are explicit
 redactions, not rewritten telemetry.
 
-One conversion policy remains deliberately deferred: Cabal's optional
-`cost_usd : float` cannot be losslessly assigned to CWR's integer micro-USD field
-without a specified finite-range and rounding rule. A future bridge must reject
-non-finite/negative/out-of-range values and apply an approved deterministic
-rounding policy. Until then it must fail conversion rather than silently drop the
-cost, set it to unknown, truncate it, or overflow it. The same rule applies to
-cost carried by normalized usage events.
+The installable bridge applies one deterministic conversion policy to Cabal's
+optional `cost_usd : float`: finite non-negative values become
+`ceil (cost_usd * 1_000_000)` integer micro-USD, and positive representational
+overflow saturates at `Int64.max_int` consistently with CWR aggregate saturation.
+Negative and non-finite values fail conversion rather than being dropped or
+rewritten. The same rule applies to cost carried by normalized usage events.
 
 ### Pre-release incomplete-execution addition
 

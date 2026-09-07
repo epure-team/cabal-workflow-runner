@@ -1,8 +1,8 @@
 (** Opaque one-call runtime seam for rich agent execution.
 
     The runtime is additive and is not wired into {!Engine}. It lets a host
-    supply a Cabal-backed or other implementation later without introducing a
-    Cabal dependency in the library. *)
+    supply a separately linked Cabal-backed or other implementation without
+    introducing a Cabal dependency in the core library. *)
 
 type capabilities
 (** Opaque advisory runtime capability metadata. Callers must still handle a

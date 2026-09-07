@@ -69,13 +69,16 @@ verdicts rather than on an LLM's opinion of its own diff. See
 - **Library** `cabal_workflow_runner` (`lib/`): types, fail-closed validator,
   deterministic engine + replay, backend abstraction, JSON loader, and native
   Ed25519 attestation. It does *not* depend on cabal.
-- **Executable** `cabal-workflow-runner` (`bin/`): a small CLI; this is the only place
-  that links cabal.
+- **Cabal bridge** `cabal_workflow_runner.cabal_bridge` (`cabal_bridge/`): the
+  separately linked, installable rich-runtime implementation.
+- **Executable** `cabal-workflow-runner` (`bin/`): a small CLI that links the bridge.
 
 ## Rich agent execution contract (additive)
 
-The library exposes a host-neutral contract for future rich backend bridges without
-changing the workflow format or wiring it into `Engine.run`:
+The core library exposes a host-neutral rich contract without changing the workflow
+format or wiring it directly into `Engine.run`. The separately installable
+`cabal_workflow_runner.cabal_bridge` library implements that contract through Cabal's
+central `Backend_completer.make_rich` path:
 
 - `Agent_execution` validates opaque requests with separate system/user prompts,
   finite positive timeouts, optional JSON Schema/session/routing/model/read-only
@@ -148,6 +151,13 @@ See the [rich execution migration
 notes](docs/rich-agent-execution-migration.md) for adoption details and the exhaustive
 mapping from Cabal's current `Backend_completer.make_rich` outcomes.
 
+`Cwr_cabal.bootstrap_hardened ()` must run once while the Cabal registry is empty.
+`Cwr_cabal.create` then requires an explicit backend id, working directory, and
+caller-owned `Task_preflight.limits`; it never chooses a first-available backend or
+defines product attachment limits. Hardened bootstrap ignores project/user/global
+adapter configuration. Tests may add one explicitly authorized custom backend with
+`Cwr_cabal.register_custom_backend`.
+
 Versioned response/incomplete-execution/error/event-trace Yojson projections are
 redacted persistence surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`,
 workflow JSON/schema, and workflow ledgers remain unchanged; the new runtime is not yet
@@ -155,13 +165,16 @@ an engine dependency.
 
 ## Build & test
 
-Built and tested in the cabal opam switch. The library currently links `yojson`, `eio`,
-`unix`, `base64`, `digestif`, and `mirage-crypto-ec`; Cabal remains executable-only.
-The executable/test toolchain additionally uses `cabal`, `eio_main`, `cmdliner`, and
-`alcotest`:
+Built and tested in an opam switch. The Cabal-free core library links `yojson`, `eio`,
+`unix`, `base64`, `digestif`, and `mirage-crypto-ec`; the separate bridge and executable
+add `cabal` and `eio_posix`. The executable/test toolchain also uses `eio_main`,
+`cmdliner`, and `alcotest`. CI and release builds pin the audited Cabal rich-runtime
+contract commit:
 
 ```sh
-eval $(opam env --switch=/path/to/cabal --set-switch)
+opam pin add -n cabal \
+  https://github.com/epure-team/cabal.git#eccda75cede474c8682db41ab5c99d639a655441
+opam install . --deps-only --with-test
 dune build
 dune test
 ```
@@ -285,12 +298,12 @@ workflow containing Attest rather than silently dropping signing authority.
 
 An Attest selection of `outputs.<agent-id>` is valid only when every Agent producer with
 that ID is declared `read_only`. Lint and validation enforce this statically. Runtime
-read-only dispatch does not trust registry capability metadata or YAML adapters: only
-cabal's available handwritten `claude-code` and `codex` implementations are eligible.
-Claude receives `--disallowedTools Bash,Edit,Write,NotebookEdit`; Codex receives
-`-s read-only`. Unsafe or unknown explicit `agent_type` values fail closed without
-fallback or dispatch. `scripts/read-only-selftest.sh` exercises exact argv, YAML-ID
-spoof resistance, and zero target mutation with fake CLIs.
+read-only dispatch goes through the hardened central Cabal registry and capability/input
+preflight; it does not load project/user/global YAML adapters and has no direct command-
+builder bypass. The handwritten Claude and Codex adapters retain their respective
+read-only CLI policies. Unsafe or unknown explicit `agent_type` values fail closed
+without fallback or dispatch. `scripts/read-only-selftest.sh` exercises exact argv,
+YAML-ID spoof resistance, and zero target mutation with fake CLIs.
 
 A read-only Agent may declare `input` as a non-empty, unique list of dotted paths
 produced earlier on every path. CWR sends the restricted-canonical projection in a
@@ -309,19 +322,20 @@ cabal-workflow-runner schema > workflow.schema.json
 
 `validate` rejects (exit 1) any workflow with an **ungoverned** loop (empty `governors`,
 or a `Max_iters`/`Fixpoint` with an out-of-range bound) or a commit that is not
-guaranteed-gated by the floor gates on every path. `run` dispatches agent steps to the
-first available cabal backend (forcing structured output, failing closed if none or if
-the agent returns no parseable JSON) and prints the outcome plus the recorded trace.
-`schema` is a thin wrapper printing `Workflow_schema.to_string ()` (the committed copy
+guaranteed-gated by the floor gates on every path. `run` forces strict structured output
+and prints the outcome plus the recorded trace. It requires the operator to set a
+canonical non-blank `CWR_BACKEND`; backend absence,
+quarantine, capability mismatch, and preflight failure all fail closed. `schema` is a
+thin wrapper printing `Workflow_schema.to_string ()` (the committed copy
 lives at [`schema/workflow.schema.json`](schema/workflow.schema.json)).
 
 ### Live run against a backend
 
-A `run` dispatches each agent step through cabal. Two environment variables target a
-specific (typically small/cheap/fast) model:
+A `run` dispatches each agent step through Cabal's hardened rich runtime. The backend
+selector is mandatory; the model override is optional:
 
-- **`CWR_BACKEND`** — the cabal backend id to use (e.g. `claude-code`). Unset ⇒ the
-  first available backend in the registry.
+- **`CWR_BACKEND`** — required canonical Cabal backend id (e.g. `claude-code`). Missing
+  or blank values fail before workflow execution; there is no first-available fallback.
 - **`CWR_MODEL`** — the model to pin (e.g. `haiku`). Unset ⇒ the backend's default.
 - **`CWR_BUDGET`** — a genuine **consumable** total-run budget for the `Budget` governor
   (default 1,000,000). Each `Budget`-governor check consumes one unit; with `CWR_BUDGET=N`

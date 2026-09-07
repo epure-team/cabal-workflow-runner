@@ -187,7 +187,8 @@ The library defines these types and *calls* the injected function; only `bin/`
 **size-capped** (64 KiB) with the `truncated` flag. The library's stub backend supplies a
 deterministic `run_command` for tests. This mirrors how `run_agent` keeps cabal out of
 `lib/`. The library's actual dependencies are `yojson`, `eio`, `unix`, `base64`,
-`digestif`, and `mirage-crypto-ec`; Cabal remains executable-only.
+`digestif`, and `mirage-crypto-ec`; Cabal is linked only by the separate installable
+`cabal_workflow_runner.cabal_bridge` library and executable.
 
 `digest` is an **MD5 content digest** (OCaml stdlib `Digest`) used for
 **change-detection / observability** in the file diff — it is **NOT** a cryptographic

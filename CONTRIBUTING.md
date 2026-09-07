@@ -8,11 +8,11 @@ keep changes small and well-tested.
 Everything is built and tested in an opam switch that has the public
 [cabal](https://github.com/epure-team/cabal) library and the dependencies declared in
 `dune-project`. The library currently uses `yojson`, `eio`, `unix`, `base64`,
-`digestif`, and `mirage-crypto-ec`; the executable/test toolchain also uses `cabal`,
-`eio_main`, `cmdliner`, and `alcotest`. Pin cabal and install deps:
+`digestif`, and `mirage-crypto-ec`; the bridge/executable/test toolchain also uses
+`cabal`, `eio_posix`, `eio_main`, `cmdliner`, and `alcotest`. Pin cabal and install deps:
 
 ```sh
-opam pin add -n cabal https://github.com/epure-team/cabal.git
+opam pin add -n cabal https://github.com/epure-team/cabal.git#eccda75cede474c8682db41ab5c99d639a655441
 opam install . --deps-only --with-test
 
 dune build
@@ -51,8 +51,10 @@ schema/workflow.schema.json`) so the no-drift test stays green.
 
 The library `cabal_workflow_runner` (`lib/`) has the dependencies listed above but
 must never depend on Cabal or a host application's workflow/orchestration layers.
-Cabal is linked **only** in the executable (`bin/`). Keep backend bridges injected
-behind library-owned contracts such as `Backend.t` or the additive rich `Runtime.t`.
+Cabal is linked only by the separate installable
+`cabal_workflow_runner.cabal_bridge` library and the executable. Keep `lib/`
+backend bridges injected behind library-owned contracts such as `Backend.t` or
+the additive rich `Runtime.t`.
 
 The rich execution DTOs are not part of workflow input: do not wire them into
 `Engine.run`, workflow JSON/schema, or workflow ledgers without a separately reviewed
