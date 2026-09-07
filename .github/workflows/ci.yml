@@ -25,6 +25,9 @@ jobs:
       - name: Test
         run: opam exec -- dune runtest
 
+      - name: Read-only backend integration self-test
+        run: bash scripts/read-only-selftest.sh
+
       - name: Pinned Run integration self-test
         run: scripts/pinned-run-selftest.sh
 

@@ -325,6 +325,8 @@ type attempt_state = {
   mutable process_exited : bool;
   mutable post_finish_metadata_seen : bool;
   mutable post_finish_metadata_rank : int;
+  mutable post_finish_truncation_seen : bool;
+  mutable post_finish_fallback_seq : int64 option;
 }
 
 let fresh_attempt_state number =
@@ -344,6 +346,8 @@ let fresh_attempt_state number =
     process_exited = false;
     post_finish_metadata_seen = false;
     post_finish_metadata_rank = 0;
+    post_finish_truncation_seen = false;
+    post_finish_fallback_seq = None;
   }
 
 let retry_attempt_kind = function
@@ -407,6 +411,13 @@ let validate_lifecycle events =
     if state.process_exited then
       Error "attempt activity observed after process exit"
     else before_attempt_end state
+  in
+  let valid_final_fallback_truncation counts =
+    Int64.compare counts.text_events 1L = 0
+    && Int64.compare counts.text_bytes 0L > 0
+    && Int64.compare counts.session_events 0L = 0
+    && Int64.compare counts.tool_events 0L = 0
+    && Int64.compare counts.control_events 0L = 0
   in
   let validate_attempt_started state kind =
     if state.started_kind <> None then Error "attempt started more than once"
@@ -538,6 +549,7 @@ let validate_lifecycle events =
                 state.agent_text_seen <- true;
                 state.post_finish_metadata_seen <- true;
                 state.post_finish_metadata_rank <- 2;
+                state.post_finish_fallback_seq <- Some event.seq;
                 Ok ()
             | Some _, Some _ | None, Some _ ->
                 Error "final result metadata observed after retry transition"
@@ -574,8 +586,29 @@ let validate_lifecycle events =
                 state.activity_seen <- true;
                 state.observation_seen <- true)
               (before_process_exit state)
-        | Delivery_truncated _ | Opaque_backend_observation ->
-            before_attempt_end state
+        | Delivery_truncated counts ->
+            (match (state.finished, state.retry) with
+            | Some _, None when state.post_finish_truncation_seen ->
+                Error "final fallback truncation was already observed"
+            | Some _, None when state.post_finish_metadata_rank <> 2 ->
+                Error "final fallback truncation is out of order"
+            | Some _, None
+              when
+                (match state.post_finish_fallback_seq with
+                | Some fallback_seq ->
+                    Int64.compare event.seq (Int64.succ fallback_seq) <> 0
+                | None -> true) ->
+                Error "final fallback truncation is not source-adjacent"
+            | Some _, None when not (valid_final_fallback_truncation counts) ->
+                Error "final fallback truncation counts are inconsistent"
+            | Some _, None ->
+                state.post_finish_metadata_seen <- true;
+                state.post_finish_truncation_seen <- true;
+                Ok ()
+            | Some _, Some _ | None, Some _ ->
+                Error "final result metadata observed after retry transition"
+            | None, None -> before_attempt_end state)
+        | Opaque_backend_observation -> before_attempt_end state
         | Task_started | Backend_selected _ | Preflight_started
         | Preflight_completed | Version_probe_started | Version_probe_completed
         | Availability_check_started | Availability_check_completed | Terminal _

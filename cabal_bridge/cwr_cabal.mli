@@ -109,10 +109,12 @@ val create :
     normalized event evidence in CWR Batch-1 types. Raw protocol lines, stdout,
     stderr, process ids, tool arguments, chain-of-thought, and attachment paths
     are never projected. Cabal may deliver final [Session_id], a non-empty
-    bounded [Agent_text_delta] fallback when no prior agent text was emitted, and
-    [Token_usage] immediately after its transport [Attempt_finished]
-    notification. [Workflow_event] permits only those ordered same-attempt final
-    observations in that position. The bridge preserves their original sequence,
-    attempt, elapsed, and payload envelopes; it never rotates or reassociates
+    bounded [Agent_text_delta] fallback when no prior agent text was emitted, a
+    truncation marker immediately following it in the source sequence when that
+    fallback retains only a prefix, and [Token_usage] after its transport
+    [Attempt_finished] notification. [Workflow_event] permits only that ordered
+    same-attempt final sequence. The retained fallback is a prefix lower bound
+    for the full result text. The bridge preserves every source sequence,
+    attempt, elapsed, and payload envelope; it never rotates or reassociates
     them. Final public text/session/usage parser observations may also occur
     after process exit while [Attempt_finished] is still pending. *)

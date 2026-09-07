@@ -131,10 +131,12 @@ central guarded `Backend_completer.make_rich_with_entry` path:
   process exit codes, and decreasing known cumulative usage/cost snapshots. Exit codes
   otherwise use the host's non-negative `int` range rather than a Unix-specific ceiling.
   After `Attempt_finished`, only same-attempt final session metadata, one non-empty
-  bounded agent-text fallback when no earlier agent text was observed, and final
-  cumulative usage metadata may precede the terminal, in that order. Their sequence,
-  attempt, elapsed time, and payload remain attached to the original event rather than
-  being rotated to fit the lifecycle. A backend's final public text/session/usage parser
+  bounded agent-text fallback when no earlier agent text was observed, its optional
+  positive text-truncation marker immediately following it in the source sequence, and
+  final cumulative usage metadata may precede the terminal, in that order. A truncated
+  fallback is a prefix lower bound for the complete result text. Their sequence, attempt,
+  elapsed time, and payload remain attached to the original event rather than being
+  rotated to fit the lifecycle. A backend's final public text/session/usage parser
   observations may also follow process exit while the transport attempt is still open.
   This batch does **not** claim live event streaming.
 - `Runtime` wraps one completion function. `Runtime.of_legacy_backend` adapts the
@@ -334,8 +336,11 @@ read-only dispatch goes through the hardened central Cabal registry and capabili
 preflight; it does not load project/user/global YAML adapters and has no direct command-
 builder bypass. The handwritten Claude and Codex adapters retain their respective
 read-only CLI policies. Unsafe or unknown explicit `agent_type` values fail closed
-without fallback or dispatch. `scripts/read-only-selftest.sh` exercises exact argv,
-YAML-ID spoof resistance, and zero target mutation with fake CLIs.
+without fallback or dispatch. `scripts/read-only-selftest.sh` exercises exact argv and
+YAML-ID spoof resistance with offline fake CLIs. Cabal may create or update only its owned
+`.cabal/backend-config/*` and `.codex/config.toml` workspace configuration; the selftest
+excludes exactly those paths from its snapshot and requires every other workspace file and
+its contents to remain unchanged.
 
 A read-only Agent may declare `input` as a non-empty, unique list of dotted paths
 produced earlier on every path. CWR sends the restricted-canonical projection in a

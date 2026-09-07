@@ -17,17 +17,24 @@ registry/preflight path. The core `lib/` remains Cabal-free. Fake-backend tests 
 request/status/retry/error/event/cost/session mapping without real CLIs. CI, release, and
 developer setup pin Cabal commit `c500033f9f45412936fd247a88f125844a2300db`.
 
+The offline read-only fake-backend selftest now runs in CI and hashes every workspace
+file except Cabal-managed `.cabal/backend-config/*` and `.codex/config.toml`; those are
+the only backend configuration files permitted to change.
+
 Review hardening makes successful Cabal bootstrap process-one-shot and returns an opaque
 identity handle required by bridge construction/custom registration. Each runtime is
 fixed to one exact physical registry entry/backend and invokes Cabal through its guarded
 entry API; raw, equal-looking replacement, and post-clear rebuilt registrations fail
 closed, while mutation after Cabal capture cannot switch the active invocation. Routing is
 not advertised and only an absent or bound-ID request hint is accepted. Final same-attempt
-session, one legitimate agent-text fallback, and usage events may follow
+session, one legitimate agent-text fallback, its positive text-truncation marker
+immediately following it in the source sequence, and usage events may follow
 `Attempt_finished` without payload rotation, preserving source sequence/attempt/time
-envelopes. Conflicting valid structured-report and
-normalized-text JSON now fails closed. A typed `Telemetry_mapping_failure` retains an
-already-valid safe event trace when contradictory/invalid telemetry cannot satisfy a richer
+envelopes. The retained fallback is cross-checked as a prefix lower bound for the
+complete result text and cannot count as continuation evidence. Conflicting valid
+structured-report and normalized-text JSON now fails closed. A typed
+`Telemetry_mapping_failure` retains an already-valid safe event trace when
+contradictory/invalid telemetry cannot satisfy a richer
 constructor. Maximum-turn capability records acceptance/forwarding only. The shell adapter
 continues to normalize ordinary exceptions but re-raises Eio cancellation and fatal runtime
 exceptions.

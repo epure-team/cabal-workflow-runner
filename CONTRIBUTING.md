@@ -84,8 +84,10 @@ not by itself prove that every backend CLI enforces the value.
 
 Keep event envelopes faithful: never rotate or reassociate payloads to make a trace
 validate. Only ordered same-attempt final session metadata, one non-empty bounded text
-fallback when no earlier text exists, and final usage metadata may follow
-`Attempt_finished`. Final public text/session/usage parser observations may follow
+fallback when no earlier text exists, its optional positive text-truncation marker
+immediately following it in the source sequence, and final usage metadata may follow
+`Attempt_finished`. Treat the retained text as a prefix lower bound and never as
+continuation evidence. Final public text/session/usage parser observations may follow
 process exit before the attempt finishes. When invalid or contradictory source
 telemetry prevents a richer constructor but the normalized source trace is valid, return
 `Telemetry_mapping_failure` with that exact trace. Strict structured output accepts only

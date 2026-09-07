@@ -177,13 +177,18 @@ val make_trace : ?omitted_count:int64 -> t list -> (trace, string) result
     attempt start, and pre-dispatch events carrying nonzero attempt numbers.
     The only activity accepted after [Attempt_finished] is ordered same-attempt
     final [Session_id], one non-empty bounded [Agent_text_delta] fallback when no
-    earlier agent text was retained, and [Usage_observed] metadata immediately
-    before the terminal. A fallback after earlier agent text, after final usage,
-    or more than once is contradictory; observing any final metadata makes a
-    later retry contradictory. Public text/session/usage parser observations may
-    occur after process exit but before [Attempt_finished]. The retained trace
-    must also fit {!max_trace_projection_bytes}; its exact JSON encoding size,
-    including escaping, is accounted without serializing it. *)
+    earlier agent text was retained, an optional [Delivery_truncated] marker
+    immediately following that fallback in the source sequence, and
+    [Usage_observed] metadata immediately before the terminal. The fallback
+    marker must report exactly one
+    omitted text event and positive omitted text bytes, with no omitted session,
+    tool, or control event; it cannot appear alone or more than once. A fallback
+    after earlier agent text, after final usage, or more than once is
+    contradictory; observing any final metadata makes a later retry
+    contradictory. Public text/session/usage parser observations may occur after
+    process exit but before [Attempt_finished]. The retained trace must also fit
+    {!max_trace_projection_bytes}; its exact JSON encoding size, including
+    escaping, is accounted without serializing it. *)
 
 val events : trace -> t list
 (** Retained events in chronological order. *)

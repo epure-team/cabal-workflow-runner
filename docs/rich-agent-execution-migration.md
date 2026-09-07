@@ -74,11 +74,14 @@ Callers adopting the new API must observe these fail-closed boundaries:
   every non-negative host `int`, without a Unix-only 255 ceiling.
 - Preserve each event's sequence number, attempt, elapsed time, and payload.
   Cabal may deliver final session metadata, one non-empty bounded agent-text
-  fallback when no earlier agent text was emitted, and final usage immediately
-  after `Attempt_finished`; only those ordered same-attempt observations are
-  valid before the terminal. Never rotate or reassociate payloads to make a
-  trace fit. For a definitely pre-dispatch failure, normalize only `attempt` to
-  zero; preserve the source sequence, timestamp, and safely mapped payload.
+  fallback when no earlier agent text was emitted, a positive text-truncation
+  marker immediately following it in the source sequence when only a prefix was
+  retained, and final usage after `Attempt_finished`; only that ordered
+  same-attempt sequence is valid before the terminal. The retained prefix is a
+  lower bound for the complete result text; the marker cannot stand alone or
+  prove a continuation. Never rotate or reassociate payloads to make a trace
+  fit. For a definitely pre-dispatch failure, normalize only `attempt` to zero;
+  preserve the source sequence, timestamp, and safely mapped payload.
   Final public text/session/usage parser observations may occur after process
   exit while the attempt remains open; do not reject that Cabal ordering.
 - Emit `Usage_observed` as cumulative per-attempt snapshots, not deltas. Known
@@ -171,16 +174,17 @@ terminal must be attributed to N+1, never N. Explicit N+1 start, finish, process
 session, text, tool, usage, or other backend observation evidence selects
 `Invocation_started`; terminal alone is insufficient. With no such evidence,
 `Invocation_may_have_started` is valid only when the N+1 terminal is accompanied
-by a positive truncation marker or retained sequence gap capable of hiding
-transition/start/activity specifically at the N→N+1 boundary. If the retry
-transition is retained, scan only after it and any later retained N evidence. If
-it is omitted, scan after completed N's last retained lifecycle/observation
-event. A gap ending before that anchor, an earlier truncation, or a global
-`omitted_count` with no boundary-local gap is unrelated and must not upgrade a
-dense transition→terminal suffix to uncertainty. A dense no-omission terminal
-on N selects `continuation = None`. A retained N+1 finish must be failed, timed
-out, or cancelled exactly like the outer terminal. A successful N+1
-finish/terminal, N+2 evidence, skipped number, mismatched kind, unsupported
+by a positive N+1 truncation marker or retained sequence gap capable of hiding
+transition/start/activity specifically at the N→N+1 boundary. A final-text
+fallback truncation marker belonging to completed attempt N is unrelated. If
+the retry transition is retained, scan only after it and any later retained N
+evidence. If it is omitted, scan after completed N's last retained
+lifecycle/observation event. A gap ending before that anchor, an earlier
+truncation, or a global `omitted_count` with no boundary-local gap is unrelated
+and must not upgrade a dense transition→terminal suffix to uncertainty. A dense
+no-omission terminal on N selects `continuation = None`. A retained N+1 finish
+must be failed, timed out, or cancelled exactly like the outer terminal. A
+successful N+1 finish/terminal, N+2 evidence, skipped number, mismatched kind, unsupported
 certainty claim, or completed-attempt usage/cost/session mismatch fails
 conversion rather than fabricating telemetry. N+1 session observations remain
 in the trace and N+1 metric observations remain separate lower bounds; neither

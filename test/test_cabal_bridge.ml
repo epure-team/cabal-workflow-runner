@@ -622,6 +622,98 @@ let test_final_agent_text_fallback_is_preserved () =
   | None -> fail "final fallback was not immediately before the terminal");
   Alcotest.(check int) "fallback backend called once" 1 !(observation.calls)
 
+let test_oversized_final_agent_text_fallback_is_bounded () =
+  let id = "cwr-oversized-final-text-fallback" in
+  let omitted_sentinel = "OMITTED_FINAL_TEXT_SENTINEL" in
+  let final_text =
+    {|{"data":"|}
+    ^ String.make Task_event.max_agent_text_delta_bytes 'x'
+    ^ omitted_sentinel ^ {|"}|}
+  in
+  let expected_prefix =
+    String.sub final_text 0 Task_event.max_agent_text_delta_bytes
+  in
+  let backend, observation =
+    make_backend ~emit_result_text:false ~id
+      (fun ~env:_ ~context:_ ~call:_ _ -> result ~text:final_text ())
+  in
+  let custom_backend = register id backend in
+  Eio_posix.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let runtime =
+    create ~sw ~env ~custom_backend ~backend_id:id ~working_dir:"/tmp" ()
+  in
+  let response = Runtime.complete runtime (request ()) |> execution_ok in
+  Alcotest.(check string) "complete final text retained" final_text
+    (Agent_execution.final_text response);
+  let trace =
+    match Agent_execution.event_trace response with
+    | Some trace -> trace
+    | None -> fail "oversized final fallback trace was absent"
+  in
+  let rec adjacent = function
+    | finish :: text :: truncation :: terminal :: rest -> (
+        match
+          ( Workflow_event.payload finish,
+            Workflow_event.payload text,
+            Workflow_event.payload truncation,
+            Workflow_event.payload terminal )
+        with
+        | ( Workflow_event.Attempt_finished Workflow_event.Attempt_succeeded,
+            Workflow_event.Agent_text_delta retained,
+            Workflow_event.Delivery_truncated counts,
+            Workflow_event.Terminal Workflow_event.Succeeded ) ->
+            Some (finish, text, truncation, terminal, retained, counts)
+        | _ -> adjacent (text :: truncation :: terminal :: rest))
+    | _ -> None
+  in
+  (match adjacent (Workflow_event.events trace) with
+  | Some (finish, text, truncation, terminal, retained, counts) ->
+      Alcotest.(check string) "bounded source prefix" expected_prefix retained;
+      Alcotest.(check int) "Cabal text event bound"
+        Task_event.max_agent_text_delta_bytes (String.length retained);
+      Alcotest.(check int64) "one partially omitted text event" 1L
+        (Workflow_event.omitted_text_events counts);
+      Alcotest.(check int64) "exact omitted text bytes"
+        (Int64.of_int (String.length final_text - String.length retained))
+        (Workflow_event.omitted_text_bytes counts);
+      Alcotest.(check int64) "no usage omissions" 0L
+        (Workflow_event.omitted_usage_events counts);
+      Alcotest.(check int64) "no session omissions" 0L
+        (Workflow_event.omitted_session_events counts);
+      Alcotest.(check int64) "no tool omissions" 0L
+        (Workflow_event.omitted_tool_events counts);
+      Alcotest.(check int64) "no control omissions" 0L
+        (Workflow_event.omitted_control_events counts);
+      Alcotest.(check int64) "fallback source sequence preserved"
+        (Int64.succ (Workflow_event.seq finish)) (Workflow_event.seq text);
+      Alcotest.(check int64) "marker source sequence preserved"
+        (Int64.succ (Workflow_event.seq text))
+        (Workflow_event.seq truncation);
+      Alcotest.(check int64) "terminal source sequence preserved"
+        (Int64.succ (Workflow_event.seq truncation))
+        (Workflow_event.seq terminal);
+      List.iter
+        (fun event ->
+          Alcotest.(check int) "same source attempt"
+            (Workflow_event.attempt finish) (Workflow_event.attempt event))
+        [text; truncation; terminal];
+      Alcotest.(check bool) "fallback time preserved" true
+        (Workflow_event.elapsed_s text >= Workflow_event.elapsed_s finish);
+      Alcotest.(check bool) "marker time preserved" true
+        (Workflow_event.elapsed_s truncation >= Workflow_event.elapsed_s text);
+      Alcotest.(check bool) "terminal time preserved" true
+        (Workflow_event.elapsed_s terminal
+        >= Workflow_event.elapsed_s truncation)
+  | None -> fail "bounded fallback lifecycle was not retained exactly");
+  Alcotest.(check int64) "no unlocated omissions" 0L
+    (Workflow_event.omitted_count trace);
+  let projected = Yojson.Safe.to_string (Workflow_event.trace_to_yojson trace) in
+  Alcotest.(check bool) "omitted suffix remains absent from safe trace" false
+    (contains projected omitted_sentinel);
+  Alcotest.(check int) "oversized fallback backend called once" 1
+    !(observation.calls)
+
 let test_nonresume_prompt_and_default_model () =
   let id = "cwr-map-prompt" in
   let backend, observation =
@@ -1363,6 +1455,8 @@ let () =
             test_process_and_tool_events_are_normalized;
           Alcotest.test_case "final agent text fallback" `Quick
             test_final_agent_text_fallback_is_preserved;
+          Alcotest.test_case "oversized final agent text fallback" `Quick
+            test_oversized_final_agent_text_fallback_is_bounded;
         ] );
       ( "destructive lifecycle",
         [

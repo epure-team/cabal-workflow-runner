@@ -349,8 +349,13 @@ val make_response :
     unlocated omission count, later sequence gap, or later usage-truncation
     marker makes finality unknown. A dimension absent from the final observation
     remains lower-bound-only. Retained known snapshots must also be
-    non-decreasing. [event_trace] defaults to [None], preserving the distinction
-    between no collected trace and a trace with omissions. *)
+    non-decreasing. A retained post-finish text fallback must equal the matching
+    attempt text unless a positive text-truncation marker immediately follows it
+    in the source sequence and makes it a prefix lower bound; the completed
+    result still retains the full normalized text. Such an attempt-N fallback
+    marker is result-delivery evidence and cannot establish an omitted
+    continuation N+1. [event_trace] defaults to [None], preserving the
+    distinction between no collected trace and a trace with omissions. *)
 
 val attempts : response -> attempt list
 (** Ordered complete attempt list. *)
@@ -418,7 +423,9 @@ val make_incomplete_execution :
     retained N evidence). Otherwise it begins after the last retained lifecycle
     or observation event for completed N. A prefix gap or earlier N truncation
     that ends before a dense retained transition-to-terminal suffix does not
-    qualify; an unlocated trace omission count alone does not qualify either. A
+    qualify; an unlocated trace omission count alone does not qualify either.
+    Truncation can account for a continuation only when its marker belongs to
+    N+1; a bounded final-text fallback marker on completed attempt N cannot. A
     prior [schema_error] establishes retry context but does not by itself
     establish that a continuation began.
 

@@ -498,10 +498,13 @@ by `Ledger`. `Workflow_event.trace`, despite its broad historical module name, i
 separate optional agent-completion lifecycle trace nested in `Agent_execution.response`.
 It is not an engine trace, is not written to the workflow ledger, and is not consumed by
 `Engine.replay`. Cabal can emit final session metadata, one non-empty bounded agent-text
-fallback when no earlier agent text was emitted, and final usage immediately after
-`Attempt_finished`; only those ordered same-attempt observations are valid before the
-terminal. The bridge retains their original sequence number, attempt, timestamp, and
-payload. It never rotates event payloads between envelopes. Final public
+fallback when no earlier agent text was emitted, a positive text-truncation marker
+immediately following it in the source sequence when only a prefix was retained, and
+final usage after `Attempt_finished`; only that ordered same-attempt sequence is valid
+before the terminal. The fallback marker cannot stand alone or serve as continuation
+evidence, and its retained text is a prefix lower bound for the complete result text. The
+bridge retains every original sequence number, attempt, timestamp, and payload. It never
+rotates event payloads between envelopes. Final public
 text/session/usage parser observations may follow process exit while the attempt remains
 open. If already-valid safe source events cannot be fused with contradictory or invalid
 result telemetry, a distinct

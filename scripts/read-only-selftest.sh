@@ -54,9 +54,16 @@ workflow() {
   printf '{"name":"read-only-runtime","steps":[{"kind":"agent","id":"a","prompt":"p","read_only":true%s,"output_schema":{"ok":"bool"}}]}\n' "$field"
 }
 
-workspace_files() {
-  find . -type f ! -path './.cabal/backend-config/*' \
-    ! -path './.codex/config.toml' -printf '%P\n' | sort
+workspace_snapshot() {
+  local path digest
+  # These are the only Cabal-managed workspace files permitted to change.
+  while IFS= read -r path; do
+    digest=$(sha256sum -- "$path")
+    printf '%s %s\n' "${digest%% *}" "${path#./}"
+  done < <(
+    find . -type f ! -path './.cabal/backend-config/*' \
+      ! -path './.codex/config.toml' -print | sort
+  )
 }
 
 run_safe() {
@@ -66,7 +73,7 @@ run_safe() {
   workflow "$type" > "$tmp/work/workflow.json"
   rm -f "$tmp/argv" "$tmp/mutated"
   local before
-  before=$(cd "$tmp/work" && workspace_files)
+  before=$(cd "$tmp/work" && workspace_snapshot)
   if ! (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
       FAKE_ARGV="$tmp/argv" FAKE_MUTATION="$tmp/mutated" \
       CWR_BACKEND="$backend" "$cwr" run workflow.json > "$tmp/out" 2>&1); then
@@ -74,7 +81,7 @@ run_safe() {
     exit 1
   fi
   [[ ! -e $tmp/mutated ]]
-  [[ $(cd "$tmp/work" && workspace_files) == "$before" ]]
+  [[ $(cd "$tmp/work" && workspace_snapshot) == "$before" ]]
   grep -qx -- "$expected" "$tmp/argv"
 }
 
