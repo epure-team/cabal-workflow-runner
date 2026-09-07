@@ -238,7 +238,7 @@ grep -F 'audit ledger incomplete after workflow effects' "$tmp/append.err" >/dev
   fail "append-write failure lacked incomplete-audit warning"
 for injected in CWR_TEST_FAIL_LEDGER_PREFIX_FLUSH CWR_TEST_FAIL_LEDGER_APPEND_FLUSH CWR_TEST_FAIL_LEDGER_CLOSE; do
   rc=0
-  env "$injected"=1 $BIN run --floor ready --approve "$token" \
+  env "$injected"=1 "$BIN" run --floor ready --approve "$token" \
     --ledger "$tmp/$injected.ndjson" "$tmp/committed.json" > "$tmp/$injected.out" 2> "$tmp/$injected.err" || rc=$?
   assert_eq 1 "$rc" "$injected exit code"
   assert_not_contains 'outcome: Committed' "$tmp/$injected.out" \
@@ -269,6 +269,7 @@ assert_not_contains 'outcome: Committed' "$tmp/replaced.out" \
 # A busy ledger is rejected before truncation.
 printf 'busy-original\n' > "$tmp/busy.ndjson"
 mkfifo "$tmp/release-lock"
+# shellcheck disable=SC2016 # $1 and $2 are expanded by the inner shell.
 (flock -x "$tmp/busy.ndjson" sh -c 'printf ready > "$1"; read _ < "$2"' sh \
   "$tmp/lock-ready" "$tmp/release-lock") & lock_pid=$!
 until test -f "$tmp/lock-ready"; do :; done
