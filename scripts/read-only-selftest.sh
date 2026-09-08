@@ -1,8 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-cwr=${CWR_BIN:-$root/_build/default/bin/main.exe}
+invocation_dir=$(pwd -P)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+
+resolve_executable() {
+  local label=$1 candidate=$2 resolved dir base
+  if [[ -z $candidate ]]; then
+    echo "read-only backend selftest: $label is blank" >&2
+    return 1
+  fi
+  if [[ $candidate == */* ]]; then
+    resolved=$candidate
+  elif ! resolved=$(type -P -- "$candidate"); then
+    echo "read-only backend selftest: $label is not executable or on PATH" >&2
+    return 1
+  fi
+  [[ $resolved == /* ]] || resolved=$invocation_dir/$resolved
+  dir=$(dirname -- "$resolved")
+  base=$(basename -- "$resolved")
+  if ! dir=$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P); then
+    echo "read-only backend selftest: $label directory does not exist" >&2
+    return 1
+  fi
+  resolved=$dir/$base
+  if [[ ! -f $resolved || ! -x $resolved ]]; then
+    echo "read-only backend selftest: $label is not an executable file" >&2
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+cwr=$(resolve_executable CWR_BIN "${CWR_BIN:-$root/_build/default/bin/main.exe}")
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/work" "$tmp/home/.cabal/adapters"
@@ -10,15 +39,15 @@ mkdir -p "$tmp/bin" "$tmp/work" "$tmp/home/.cabal/adapters"
 # Cabal probes and dispatches through this helper. Resolve it explicitly before
 # restricting PATH so only the fixture's backend CLIs are discoverable.
 if [[ -n ${CABAL_PROCESS_GROUP_LAUNCHER:-} ]]; then
-  launcher=$CABAL_PROCESS_GROUP_LAUNCHER
+  launcher_candidate=$CABAL_PROCESS_GROUP_LAUNCHER
 else
-  opam_bin=$(opam var bin)
-  launcher=$opam_bin/cabal-process-group-launcher
+  if ! opam_bin=$(opam var bin 2>/dev/null); then
+    echo "read-only backend selftest: cannot locate the active opam bin directory" >&2
+    exit 1
+  fi
+  launcher_candidate=$opam_bin/cabal-process-group-launcher
 fi
-if [[ ! -x $launcher ]]; then
-  echo "read-only backend selftest: missing Cabal process-group launcher" >&2
-  exit 1
-fi
+launcher=$(resolve_executable CABAL_PROCESS_GROUP_LAUNCHER "$launcher_candidate")
 
 cat > "$tmp/bin/claude" <<'SH'
 #!/bin/bash
@@ -50,13 +79,16 @@ SH
 chmod +x "$tmp/bin/claude" "$tmp/bin/codex"
 cat > "$tmp/bin/unsafe-spoof" <<'SH'
 #!/bin/bash
+printf '%s %s\n' "${0##*/}" "$*" >> "$TRAP_CALLS"
 : > "$FAKE_MUTATION"
 printf '{"ok":true}\n'
 SH
-chmod +x "$tmp/bin/unsafe-spoof"
-cat > "$tmp/home/.cabal/adapters/claude-code.yaml" <<'YAML'
-name: claude-code
-display_name: spoofed unsafe claude
+cp "$tmp/bin/unsafe-spoof" "$tmp/bin/opencode"
+cp "$tmp/bin/unsafe-spoof" "$tmp/bin/not-registered"
+chmod +x "$tmp/bin/unsafe-spoof" "$tmp/bin/opencode" "$tmp/bin/not-registered"
+cat > "$tmp/home/.cabal/adapters/unknown-custom.yaml" <<'YAML'
+name: unknown-custom
+display_name: spoofed unsafe custom backend
 invocation_command: unsafe-spoof
 template_set: generic
 timeout_seconds: 10
@@ -86,17 +118,18 @@ run_safe() {
   local backend=claude-code
   [[ $type == codex ]] && backend=codex
   workflow "$type" > "$tmp/work/workflow.json"
-  rm -f "$tmp/argv" "$tmp/calls" "$tmp/mutated"
+  rm -f "$tmp/argv" "$tmp/calls" "$tmp/trap-calls" "$tmp/mutated"
   local before
   before=$(cd "$tmp/work" && workspace_snapshot)
   if ! (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin" \
       CABAL_PROCESS_GROUP_LAUNCHER="$launcher" \
-      FAKE_ARGV="$tmp/argv" FAKE_CALLS="$tmp/calls" FAKE_MUTATION="$tmp/mutated" \
+      FAKE_ARGV="$tmp/argv" FAKE_CALLS="$tmp/calls" \
+      TRAP_CALLS="$tmp/trap-calls" FAKE_MUTATION="$tmp/mutated" \
       CWR_BACKEND="$backend" "$cwr" run workflow.json > "$tmp/out" 2>&1); then
     cat "$tmp/out" >&2
     exit 1
   fi
-  [[ ! -e $tmp/mutated ]]
+  [[ ! -e $tmp/trap-calls && ! -e $tmp/mutated ]]
   [[ $(cd "$tmp/work" && workspace_snapshot) == "$before" ]]
   grep -Fqx -- '--version' "$tmp/calls"
   grep -qx -- "$expected" "$tmp/argv"
@@ -105,16 +138,19 @@ run_safe() {
 run_rejected() {
   local type=$1
   workflow "$type" > "$tmp/work/workflow.json"
-  rm -f "$tmp/argv" "$tmp/calls" "$tmp/mutated"
+  rm -f "$tmp/argv" "$tmp/calls" "$tmp/trap-calls" "$tmp/mutated"
   if (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin" \
       CABAL_PROCESS_GROUP_LAUNCHER="$launcher" FAKE_ARGV="$tmp/argv" \
-      FAKE_CALLS="$tmp/calls" FAKE_MUTATION="$tmp/mutated" \
+      FAKE_CALLS="$tmp/calls" TRAP_CALLS="$tmp/trap-calls" \
+      FAKE_MUTATION="$tmp/mutated" \
       CWR_BACKEND=claude-code "$cwr" run workflow.json \
       > "$tmp/out" 2>&1); then
     echo "backend $type unexpectedly dispatched" >&2
     exit 1
   fi
-  [[ ! -e $tmp/argv && ! -e $tmp/calls && ! -e $tmp/mutated ]]
+  grep -Fq -- '"error":"agent_type does not match the bound live backend"' "$tmp/out"
+  [[ ! -e $tmp/argv && ! -e $tmp/calls && ! -e $tmp/trap-calls ]]
+  [[ ! -e $tmp/mutated ]]
 }
 
 # Central hardened dispatch may write its owned backend configuration (including
@@ -130,6 +166,7 @@ grep -qx -- '-s' "$tmp/argv"
 # request routing fails closed without dispatch.
 run_safe default Bash,Edit,Write,NotebookEdit,WebSearch,WebFetch
 run_rejected opencode
+run_rejected not-registered
 run_rejected unknown-custom
 
 echo "read-only backend selftest: OK"
