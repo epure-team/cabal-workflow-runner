@@ -7,20 +7,43 @@
 ; Cwr_runner.Runner directly, instead of hand-duplicating this file (as cabal-chat had to before
 ; this -- see its lib/real_run_command.ml, now dropped in favor of this). Packaging-only: the
 ; module itself (runner.ml) is untouched.
+
 (library
  (name cwr_runner)
  (public_name cabal_workflow_runner.runner)
  (modules runner)
  (libraries cabal_workflow_runner cabal eio digestif unix))
 
+(library
+ (name backend_cabal)
+ (modules backend_cabal)
+ (libraries
+  cabal_workflow_runner
+  cabal_workflow_runner.cabal_bridge
+  cwr_runner
+  cabal
+  eio
+  unix))
+
 (executable
  (name main)
- (modules main compiler backend_cabal)
+ (modules main compiler)
  (public_name cabal-workflow-runner)
- (libraries cabal_workflow_runner cwr_runner cabal eio_main cmdliner yojson unix))
+ (libraries
+  cabal_workflow_runner
+  cabal_workflow_runner.cabal_bridge
+  backend_cabal
+  cwr_runner
+  cabal
+  eio_main
+  cmdliner
+  yojson
+  unix))
 
 ; --profile static: fully static binary via musl (Linux only).
 ; Not applied by default so macOS builds are unaffected.
+
 (env
  (static
-  (link_flags (-ccopt -static))))
+  (link_flags
+   (-ccopt -static))))

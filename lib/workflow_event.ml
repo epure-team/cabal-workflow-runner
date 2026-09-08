@@ -317,9 +317,16 @@ type attempt_state = {
   mutable retry : retry_kind option;
   mutable process_started : bool;
   mutable observation_seen : bool;
+  mutable session_seen : bool;
+  mutable agent_text_seen : bool;
+  mutable usage_seen : bool;
   mutable termination_requested : bool;
   mutable kill_escalated : bool;
   mutable process_exited : bool;
+  mutable post_finish_metadata_seen : bool;
+  mutable post_finish_metadata_rank : int;
+  mutable post_finish_truncation_seen : bool;
+  mutable post_finish_fallback_seq : int64 option;
 }
 
 let fresh_attempt_state number =
@@ -331,9 +338,16 @@ let fresh_attempt_state number =
     retry = None;
     process_started = false;
     observation_seen = false;
+    session_seen = false;
+    agent_text_seen = false;
+    usage_seen = false;
     termination_requested = false;
     kill_escalated = false;
     process_exited = false;
+    post_finish_metadata_seen = false;
+    post_finish_metadata_rank = 0;
+    post_finish_truncation_seen = false;
+    post_finish_fallback_seq = None;
   }
 
 let retry_attempt_kind = function
@@ -398,6 +412,13 @@ let validate_lifecycle events =
       Error "attempt activity observed after process exit"
     else before_attempt_end state
   in
+  let valid_final_fallback_truncation counts =
+    Int64.compare counts.text_events 1L = 0
+    && Int64.compare counts.text_bytes 0L > 0
+    && Int64.compare counts.session_events 0L = 0
+    && Int64.compare counts.tool_events 0L = 0
+    && Int64.compare counts.control_events 0L = 0
+  in
   let validate_attempt_started state kind =
     if state.started_kind <> None then Error "attempt started more than once"
     else if state.activity_seen then
@@ -430,6 +451,8 @@ let validate_lifecycle events =
               Ok ())
         | Retry_transition { kind; reason } ->
             if state.retry <> None then Error "attempt retried more than once"
+            else if state.post_finish_metadata_seen then
+              Error "attempt retried after final result metadata"
             else if state.number = max_int then
               Error "attempt number cannot advance"
             else if
@@ -490,14 +513,102 @@ let validate_lifecycle events =
                   state.activity_seen <- true;
                   state.process_exited <- true)
                 (before_attempt_end state)
-        | Session_id _ | Agent_text_delta _ | Tool_started _ | Tool_finished _
+        | Session_id _ ->
+            (match (state.finished, state.retry) with
+            | Some _, None when state.session_seen ->
+                Error "final session metadata was already observed"
+            | Some _, None when state.post_finish_metadata_rank > 0 ->
+                Error "final session metadata is out of order"
+            | Some _, None ->
+                state.activity_seen <- true;
+                state.observation_seen <- true;
+                state.session_seen <- true;
+                state.post_finish_metadata_seen <- true;
+                state.post_finish_metadata_rank <- 1;
+                Ok ()
+            | Some _, Some _ | None, Some _ ->
+                Error "final result metadata observed after retry transition"
+            | None, None ->
+                Result.map
+                  (fun () ->
+                    state.activity_seen <- true;
+                    state.observation_seen <- true;
+                    state.session_seen <- true)
+                  (before_attempt_end state))
+        | Agent_text_delta text ->
+            (match (state.finished, state.retry) with
+            | Some _, None when text = "" ->
+                Error "final fallback agent text must be non-empty"
+            | Some _, None when state.agent_text_seen ->
+                Error "final fallback agent text follows earlier agent text"
+            | Some _, None when state.post_finish_metadata_rank >= 3 ->
+                Error "final fallback agent text is out of order"
+            | Some _, None ->
+                state.activity_seen <- true;
+                state.observation_seen <- true;
+                state.agent_text_seen <- true;
+                state.post_finish_metadata_seen <- true;
+                state.post_finish_metadata_rank <- 2;
+                state.post_finish_fallback_seq <- Some event.seq;
+                Ok ()
+            | Some _, Some _ | None, Some _ ->
+                Error "final result metadata observed after retry transition"
+            | None, None ->
+                Result.map
+                  (fun () ->
+                    state.activity_seen <- true;
+                    state.observation_seen <- true;
+                    state.agent_text_seen <- true)
+                  (before_attempt_end state))
         | Usage_observed _ ->
+            (match (state.finished, state.retry) with
+            | Some _, None when state.usage_seen ->
+                Error "final usage metadata was already observed"
+            | Some _, None ->
+                state.activity_seen <- true;
+                state.observation_seen <- true;
+                state.usage_seen <- true;
+                state.post_finish_metadata_seen <- true;
+                state.post_finish_metadata_rank <- 3;
+                Ok ()
+            | Some _, Some _ | None, Some _ ->
+                Error "final result metadata observed after retry transition"
+            | None, None ->
+                Result.map
+                  (fun () ->
+                    state.activity_seen <- true;
+                    state.observation_seen <- true;
+                    state.usage_seen <- true)
+                  (before_attempt_end state))
+        | Tool_started _ | Tool_finished _ ->
             Result.map
               (fun () ->
                 state.activity_seen <- true;
                 state.observation_seen <- true)
               (before_process_exit state)
-        | Delivery_truncated _ | Opaque_backend_observation -> Ok ()
+        | Delivery_truncated counts ->
+            (match (state.finished, state.retry) with
+            | Some _, None when state.post_finish_truncation_seen ->
+                Error "final fallback truncation was already observed"
+            | Some _, None when state.post_finish_metadata_rank <> 2 ->
+                Error "final fallback truncation is out of order"
+            | Some _, None
+              when
+                (match state.post_finish_fallback_seq with
+                | Some fallback_seq ->
+                    Int64.compare event.seq (Int64.succ fallback_seq) <> 0
+                | None -> true) ->
+                Error "final fallback truncation is not source-adjacent"
+            | Some _, None when not (valid_final_fallback_truncation counts) ->
+                Error "final fallback truncation counts are inconsistent"
+            | Some _, None ->
+                state.post_finish_metadata_seen <- true;
+                state.post_finish_truncation_seen <- true;
+                Ok ()
+            | Some _, Some _ | None, Some _ ->
+                Error "final result metadata observed after retry transition"
+            | None, None -> before_attempt_end state)
+        | Opaque_backend_observation -> before_attempt_end state
         | Task_started | Backend_selected _ | Preflight_started
         | Preflight_completed | Version_probe_started | Version_probe_completed
         | Availability_check_started | Availability_check_completed | Terminal _
@@ -570,7 +681,12 @@ let validate_lifecycle events =
       | Tool_finished _ | Usage_observed _ ->
           Result.bind (advance_lifecycle 8 "attempt event") (fun () ->
               validate_attempt_event event)
-      | Delivery_truncated _ | Opaque_backend_observation -> Ok ()
+      | (Delivery_truncated _ | Opaque_backend_observation)
+        when event.attempt = 0 ->
+          Ok ()
+      | Delivery_truncated _ | Opaque_backend_observation ->
+          Result.bind (advance_lifecycle 8 "attempt event") (fun () ->
+              validate_attempt_event event)
     in
     seen_any := true;
     result

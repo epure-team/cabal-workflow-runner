@@ -6,6 +6,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 cwr=${CWR_BIN:-"$root/_build/default/bin/main.exe"}
+export CWR_BACKEND=${CWR_BACKEND:-claude-code}
 if [[ ! -x "$cwr" ]]; then
   opam exec --switch=/home/mathias/dev/cabal -- dune build --root "$root" bin/main.exe
 fi
@@ -161,12 +162,17 @@ if "$cwr" replay "$workflow" --ledger "$ledger" \
   exit 1
 fi
 
-if "$cwr" run "$workflow" --ctx '{"campaign":{"id":"C-1"}}' \
+missing_key_log="$tmp/missing-key.log"
+rc=0
+"$cwr" run "$workflow" --ctx '{"campaign":{"id":"C-1"}}' \
   --attestation-root "$tmp" --attestation-session session-002 \
-  --require-attestation export --expected-workflow-digest "$digest"; then
-  echo "missing-key attest unexpectedly succeeded" >&2
+  --require-attestation export --expected-workflow-digest "$digest" \
+  >"$missing_key_log" 2>&1 || rc=$?
+if [[ $rc -ne 2 ]]; then
+  echo "missing-key attest returned $rc instead of blocked exit 2" >&2
   exit 1
 fi
+grep -q 'outcome: Blocked' "$missing_key_log"
 
 expect_unsafe_run_failure() {
   local label=$1
@@ -175,15 +181,17 @@ expect_unsafe_run_failure() {
   local log="$tmp/unsafe-$label.log"
   mkdir "$unsafe_root"
   exec 3<"$seed"
-  if "$cwr" run "$workflow" --ctx "$selected" \
+  local rc=0
+  "$cwr" run "$workflow" --ctx "$selected" \
     --attestation-key-fd 3 --attestation-root "$unsafe_root" \
     --attestation-session "unsafe-$label" --require-attestation export \
-    --expected-workflow-digest "$digest" >"$log" 2>&1; then
-    echo "unsafe $label selection unexpectedly produced an attestation" >&2
+    --expected-workflow-digest "$digest" >"$log" 2>&1 || rc=$?
+  if [[ $rc -ne 1 ]]; then
+    echo "unsafe $label context returned $rc instead of input-error exit 1" >&2
     exit 1
   fi
   test ! -e "$unsafe_root/result.attestation.json"
-  grep -qi 'blocked' "$log"
+  grep -Fq -- '--ctx is non-canonical:' "$log"
   if grep -Eq 'Fatal error|Invalid_argument|Raised at' "$log"; then
     echo "unsafe $label selection escaped as an uncaught exception" >&2
     exit 1

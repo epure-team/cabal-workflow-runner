@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+**Installable Cabal rich bridge.** Added
+`cabal_workflow_runner.cabal_bridge`, backed exclusively by Cabal's hardened runtime and
+`Backend_completer.make_rich_with_entry`. It maps rich schema/media/web/timeout/turn/resume/model/
+read-only requests and exhaustive result, attempt, event, metric, session, cleanup, and
+typed error evidence into the Batch-1 host-neutral contract. Strict structured output
+accepts only complete JSON objects/arrays; prose, fences, bracket scanning, scalars, and
+session-id injection are removed.
+
+The CLI now adapts this rich runtime to the unchanged workflow-engine `Backend.t` seam.
+`CWR_BACKEND` is mandatory and has no first-available fallback, attachment limits are an
+explicit zero-attachment CLI policy, and read-only work no longer bypasses Cabal's central
+registry/preflight path. The core `lib/` remains Cabal-free. Fake-backend tests exercise
+request/status/retry/error/event/cost/session mapping without real CLIs. CI, release, and
+developer setup pin Cabal commit `95dff454331dc610ce2db9d44924f2be818a1c6b`.
+
+The offline read-only fake-backend selftest now runs in CI and hashes every workspace
+file except Cabal-managed `.cabal/backend-config/*` and `.codex/config.toml`; those are
+the only backend configuration files permitted to change.
+
+Review hardening makes successful Cabal bootstrap process-one-shot and returns an opaque
+identity handle required by bridge construction/custom registration. Each runtime is
+fixed to one exact physical registry entry/backend and invokes Cabal through its guarded
+entry API; raw, equal-looking replacement, and post-clear rebuilt registrations fail
+closed, while mutation after Cabal capture cannot switch the active invocation. Routing is
+not advertised and only an absent or bound-ID request hint is accepted. Final same-attempt
+session, one legitimate agent-text fallback, its positive text-truncation marker
+immediately following it in the source sequence, and usage events may follow
+`Attempt_finished` without payload rotation, preserving source sequence/attempt/time
+envelopes. The retained fallback is cross-checked as a prefix lower bound for the
+complete result text and cannot count as continuation evidence. Conflicting valid
+structured-report and normalized-text JSON now fails closed. A typed
+`Telemetry_mapping_failure` retains an already-valid safe event trace when
+contradictory/invalid telemetry cannot satisfy a richer
+constructor. Maximum-turn capability records acceptance/forwarding only. The shell adapter
+continues to normalize ordinary exceptions but re-raises Eio cancellation and fatal runtime
+exceptions.
+
 **Additive rich agent execution contract.** Added opaque, validated host-neutral
 `Agent_execution` request/result/error DTOs; integer-micro-USD and saturating token
 `Execution_metrics`; bounded typed post-completion `Workflow_event` traces; and a
@@ -101,8 +138,9 @@ The pre-release `Native_schema_rejection` category is renamed to the causally ne
 `Native_backend_failure_with_schema`, matching Cabal's contract: the schema was in force,
 but is not asserted to have caused the backend failure. Error projections remain
 versioned/redacted/bounded and now account for an outer trace. The migration notes pin an
-exhaustive table for Cabal's current `Backend_completer.make_rich` outcomes and defer
-float-USD conversion until a checked deterministic micro-USD rounding policy is chosen.
+exhaustive table for Cabal's current guarded rich-completion outcomes; the bridge
+uses checked ceiling conversion from finite non-negative float USD to integer micro-USD,
+saturating positive representational overflow.
 
 **Yojson 2.2 compatibility.** Canonical JSON validation now rejects Yojson's
 non-standard `Tuple`/`Variant` values explicitly and expression projection treats them

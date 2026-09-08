@@ -537,9 +537,44 @@ let retained_cost_matches observation retained =
   retained_dimension_matches observation.usd_micros
     (Option.bind retained Execution_metrics.usd_micros)
 
+type retained_final_text_observation = {
+  retained_prefix : string;
+  mutable truncated : bool;
+}
+
+let retain_final_text_observation observations attempt_number text =
+  Hashtbl.replace observations attempt_number
+    {retained_prefix = text; truncated = false}
+
+let mark_final_text_truncated observations attempt_number =
+  match Hashtbl.find_opt observations attempt_number with
+  | None -> Error "final text truncation has no retained fallback prefix"
+  | Some observation ->
+      observation.truncated <- true;
+      Ok ()
+
+let validate_final_text_observations ~attempts observations =
+  Hashtbl.fold
+    (fun attempt_number observation result ->
+      Result.bind result (fun () ->
+          match find_attempt attempts attempt_number with
+          | None -> Error "final text event has no matching response attempt"
+          | Some attempt ->
+              let prefix = normalize_line_endings observation.retained_prefix in
+              if observation.truncated then
+                (* Omitted raw bytes can normalize away at a CRLF boundary, so
+                   the normalized lower bound may equal the full text. *)
+                if String.starts_with ~prefix attempt.text then Ok ()
+                else Error "final text prefix disagrees with response telemetry"
+              else if prefix = attempt.text then Ok ()
+              else Error "final text event disagrees with response telemetry"))
+    observations (Ok ())
+
 let validate_trace ~attempts ~status ~total_elapsed_s trace =
   let starts = Hashtbl.create (List.length attempts) in
   let usage_observations = Hashtbl.create (List.length attempts) in
+  let finished_attempts = Hashtbl.create (List.length attempts) in
+  let final_text_observations = Hashtbl.create (List.length attempts) in
   let previous_event = ref None in
   let no_unlocated_omissions =
     Int64.compare (Workflow_event.omitted_count trace) 0L = 0
@@ -608,15 +643,21 @@ let validate_trace ~attempts ~status ~total_elapsed_s trace =
                           "event attempt outcome disagrees with response \
                            telemetry"
                       else
-                        match Hashtbl.find_opt starts attempt.number with
-                        | Some started
-                          when attempt.elapsed_s
-                               > Workflow_event.elapsed_s event
-                                 -. started +. attempt_timing_tolerance_s ->
-                            Error
-                              "event attempt timing disagrees with response \
-                               telemetry"
-                        | Some _ | None -> Ok ())
+                        let timing =
+                          match Hashtbl.find_opt starts attempt.number with
+                          | Some started
+                            when attempt.elapsed_s
+                                 > Workflow_event.elapsed_s event
+                                   -. started +. attempt_timing_tolerance_s ->
+                              Error
+                                "event attempt timing disagrees with response \
+                                 telemetry"
+                          | Some _ | None -> Ok ()
+                        in
+                        Result.map
+                          (fun () ->
+                            Hashtbl.replace finished_attempts attempt.number ())
+                          timing)
                   | Session_id session_id ->
                       if attempt.session_id <> Some session_id then
                         Error "event session disagrees with response telemetry"
@@ -672,35 +713,46 @@ let validate_trace ~attempts ~status ~total_elapsed_s trace =
                           0L
                         > 0
                       then mark_usage_unknown attempt.number;
-                      Ok ()
+                      if Hashtbl.mem finished_attempts attempt.number then
+                        mark_final_text_truncated final_text_observations
+                          attempt.number
+                      else Ok ()
                   | Process_started | Process_termination_requested
-                  | Process_kill_escalated | Process_exited _
-                  | Agent_text_delta _ | Tool_started _ | Tool_finished _
-                  | Opaque_backend_observation ->
+                  | Process_kill_escalated | Process_exited _ | Tool_started _
+                  | Tool_finished _ | Opaque_backend_observation ->
+                      Ok ()
+                  | Agent_text_delta text ->
+                      if Hashtbl.mem finished_attempts attempt.number then
+                        retain_final_text_observation final_text_observations
+                          attempt.number text;
                       Ok ()
                   | Terminal _ -> Error "terminal event validation failed"))
       in
       let rec loop = function
         | [] ->
-            Hashtbl.fold
-              (fun attempt_number observation result ->
-                Result.bind result (fun () ->
-                    match find_attempt attempts attempt_number with
-                    | None ->
-                        Error "usage event has no matching response attempt"
-                    | Some attempt ->
-                        if
-                          not
-                            (retained_usage_matches observation attempt.usage)
-                        then
-                          Error
-                            "event usage disagrees with response telemetry"
-                        else if
-                          not (retained_cost_matches observation attempt.cost)
-                        then
-                          Error "event cost disagrees with response telemetry"
-                        else Ok ()))
-              usage_observations (Ok ())
+            Result.bind
+              (Hashtbl.fold
+                 (fun attempt_number observation result ->
+                   Result.bind result (fun () ->
+                       match find_attempt attempts attempt_number with
+                       | None ->
+                           Error "usage event has no matching response attempt"
+                       | Some attempt ->
+                           if
+                             not
+                               (retained_usage_matches observation attempt.usage)
+                           then
+                             Error
+                               "event usage disagrees with response telemetry"
+                           else if
+                             not (retained_cost_matches observation attempt.cost)
+                           then
+                             Error "event cost disagrees with response telemetry"
+                           else Ok ()))
+                 usage_observations (Ok ()))
+              (fun () ->
+                validate_final_text_observations ~attempts
+                  final_text_observations)
         | event :: rest ->
             Result.bind (validate_event event) (fun () -> loop rest)
       in
@@ -954,6 +1006,8 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
     ~(continuation : incomplete_continuation option) trace =
   let starts = Hashtbl.create (List.length completed_attempts) in
   let usage_observations = Hashtbl.create (List.length completed_attempts) in
+  let finished_attempts = Hashtbl.create (List.length completed_attempts) in
+  let final_text_observations = Hashtbl.create (List.length completed_attempts) in
   let continuation_observation = empty_retained_usage_observation () in
   let continuation_usage_seen = ref false in
   let continuation_cost_seen = ref false in
@@ -1009,13 +1063,18 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
         if not (outcome_matches_status outcome attempt.status) then
           Error "event attempt outcome disagrees with completed telemetry"
         else (
-          match Hashtbl.find_opt starts attempt.number with
-          | Some started
-            when attempt.elapsed_s
-                 > Workflow_event.elapsed_s event -. started
-                   +. attempt_timing_tolerance_s ->
-              Error "event attempt timing disagrees with completed telemetry"
-          | Some _ | None -> Ok ())
+          let timing =
+            match Hashtbl.find_opt starts attempt.number with
+            | Some started
+              when attempt.elapsed_s
+                   > Workflow_event.elapsed_s event -. started
+                     +. attempt_timing_tolerance_s ->
+                Error "event attempt timing disagrees with completed telemetry"
+            | Some _ | None -> Ok ()
+          in
+          Result.map
+            (fun () -> Hashtbl.replace finished_attempts attempt.number ())
+            timing)
     | Session_id session_id ->
         if attempt.session_id <> Some session_id then
           Error "event session disagrees with completed telemetry"
@@ -1049,10 +1108,17 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
     | Delivery_truncated counts ->
         if Int64.compare (Workflow_event.omitted_usage_events counts) 0L > 0
         then mark_usage_unknown attempt.number;
-        Ok ()
+        if Hashtbl.mem finished_attempts attempt.number then
+          mark_final_text_truncated final_text_observations attempt.number
+        else Ok ()
     | Process_started | Process_termination_requested | Process_kill_escalated
-    | Process_exited _ | Agent_text_delta _ | Tool_started _ | Tool_finished _
+    | Process_exited _ | Tool_started _ | Tool_finished _
     | Opaque_backend_observation ->
+        Ok ()
+    | Agent_text_delta text ->
+        if Hashtbl.mem finished_attempts attempt.number then
+          retain_final_text_observation final_text_observations attempt.number
+            text;
         Ok ()
     | Terminal _ -> Error "terminal event validation failed"
   in
@@ -1127,6 +1193,7 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
                   in
                   let truncation_can_hide_continuation =
                     Int64.compare (Workflow_event.seq event) anchor_seq > 0
+                    && Workflow_event.attempt event = expected.number
                     &&
                     match Workflow_event.payload event with
                     | Workflow_event.Delivery_truncated counts ->
@@ -1186,22 +1253,30 @@ let validate_incomplete_trace ~completed_attempts ~outer_status ~total_elapsed_s
       in
       let rec loop = function
         | [] ->
-            Hashtbl.fold
-              (fun attempt_number observation result ->
-                Result.bind result (fun () ->
-                    match find_attempt completed_attempts attempt_number with
-                    | None -> Error "usage event has no matching completed attempt"
-                    | Some attempt ->
-                        if
-                          not
-                            (retained_usage_matches observation attempt.usage)
-                        then
-                          Error "event usage disagrees with completed telemetry"
-                        else if
-                          not (retained_cost_matches observation attempt.cost)
-                        then Error "event cost disagrees with completed telemetry"
-                        else Ok ()))
-              usage_observations (Ok ())
+            Result.bind
+              (Hashtbl.fold
+                 (fun attempt_number observation result ->
+                   Result.bind result (fun () ->
+                       match find_attempt completed_attempts attempt_number with
+                       | None ->
+                           Error
+                             "usage event has no matching completed attempt"
+                       | Some attempt ->
+                           if
+                             not
+                               (retained_usage_matches observation attempt.usage)
+                           then
+                             Error
+                               "event usage disagrees with completed telemetry"
+                           else if
+                             not (retained_cost_matches observation attempt.cost)
+                           then
+                             Error "event cost disagrees with completed telemetry"
+                           else Ok ()))
+                 usage_observations (Ok ()))
+              (fun () ->
+                validate_final_text_observations ~attempts:completed_attempts
+                  final_text_observations)
         | event :: rest ->
             Result.bind (validate_event event) (fun () -> loop rest)
       in
@@ -1436,6 +1511,10 @@ type error =
       message : string;
       response : response;
     }
+  | Telemetry_mapping_error of {
+      message : string;
+      event_trace : Workflow_event.trace;
+    }
 
 type error_view =
   | Dispatch_failure of {
@@ -1463,6 +1542,10 @@ type error_view =
       kind : execution_failure_kind;
       message : string;
       response : response;
+    }
+  | Telemetry_mapping_failure of {
+      message : string;
+      event_trace : Workflow_event.trace;
     }
 
 let validate_trace_terminal_status ~status trace =
@@ -1594,6 +1677,11 @@ let make_execution_error ~kind ~message ~response () =
       (fun message -> Execution_error { kind; message; response })
       (normalize_nonempty_diagnostic "execution diagnostic" message)
 
+let make_telemetry_mapping_error ~message ~event_trace () =
+  Result.map
+    (fun message -> Telemetry_mapping_error {message; event_trace})
+    (normalize_nonempty_diagnostic "telemetry mapping diagnostic" message)
+
 let error_view = function
   | Dispatch_error { kind; message; event_trace } ->
       Dispatch_failure { kind; message; event_trace }
@@ -1609,6 +1697,8 @@ let error_view = function
         { cause; message; response; outer_event_trace }
   | Execution_error { kind; message; response } ->
       Execution_failure { kind; message; response }
+  | Telemetry_mapping_error {message; event_trace} ->
+      Telemetry_mapping_failure {message; event_trace}
 
 let response_to_yojson = response_projection
 
@@ -1679,4 +1769,11 @@ let error_to_yojson = function
           ("error_kind", `String "execution_failure");
           ("failure_kind", `String (string_of_execution_failure_kind kind));
           ("response", response_to_yojson response);
+        ]
+  | Telemetry_mapping_error {message = _; event_trace} ->
+      `Assoc
+        [
+          ("schema_version", `String "cwr.agent-execution.error/v1");
+          ("error_kind", `String "telemetry_mapping_failure");
+          ("event_trace", Workflow_event.trace_to_yojson event_trace);
         ]

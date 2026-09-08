@@ -1,9 +1,9 @@
 (** Additive host-neutral rich agent execution contract.
 
     These DTOs are independent of the deterministic workflow interpreter and of
-    Cabal. They are intended for a later host bridge. Construction is opaque and
-    validated so optional fields can be extended without breaking callers. No
-    constructor performs filesystem or backend I/O. *)
+    Cabal. They are consumed by separately linked host bridges. Construction is
+    opaque and validated so optional fields can be extended without breaking
+    callers. No constructor performs filesystem or backend I/O. *)
 
 type attachment
 (** Opaque validated workspace-relative attachment reference. It contains
@@ -349,8 +349,13 @@ val make_response :
     unlocated omission count, later sequence gap, or later usage-truncation
     marker makes finality unknown. A dimension absent from the final observation
     remains lower-bound-only. Retained known snapshots must also be
-    non-decreasing. [event_trace] defaults to [None], preserving the distinction
-    between no collected trace and a trace with omissions. *)
+    non-decreasing. A retained post-finish text fallback must equal the matching
+    attempt text unless a positive text-truncation marker immediately follows it
+    in the source sequence and makes it a prefix lower bound; the completed
+    result still retains the full normalized text. Such an attempt-N fallback
+    marker is result-delivery evidence and cannot establish an omitted
+    continuation N+1. [event_trace] defaults to [None], preserving the
+    distinction between no collected trace and a trace with omissions. *)
 
 val attempts : response -> attempt list
 (** Ordered complete attempt list. *)
@@ -418,7 +423,9 @@ val make_incomplete_execution :
     retained N evidence). Otherwise it begins after the last retained lifecycle
     or observation event for completed N. A prefix gap or earlier N truncation
     that ends before a dense retained transition-to-terminal suffix does not
-    qualify; an unlocated trace omission count alone does not qualify either. A
+    qualify; an unlocated trace omission count alone does not qualify either.
+    Truncation can account for a continuation only when its marker belongs to
+    N+1; a bounded final-text fallback marker on completed attempt N cannot. A
     prior [schema_error] establishes retry context but does not by itself
     establish that a continuation began.
 
@@ -503,8 +510,10 @@ type error
 (** Exhaustive in-process view distinguishing a proven no-invocation dispatch
     failure, an outcome with no completed attempt and indeterminate invocation
     progress, an interrupted execution with completed progress, a dispatch-layer
-    failure strictly after a completed execution, and an execution failure.
-    Completed-progress forms retain normalized attempts. *)
+    failure strictly after a completed execution, an execution failure, and a
+    boundary telemetry-mapping failure. Completed-progress forms retain
+    normalized attempts; mapping failures retain the exact safe source trace
+    even when its terminal status cannot fit another error constructor. *)
 type error_view =
   | Dispatch_failure of {
       kind : dispatch_failure_kind;
@@ -531,6 +540,10 @@ type error_view =
       kind : execution_failure_kind;
       message : string;
       response : response;
+    }
+  | Telemetry_mapping_failure of {
+      message : string;
+      event_trace : Workflow_event.trace;
     }
 
 val make_dispatch_error :
@@ -612,6 +625,17 @@ val make_execution_error :
     condition. The non-empty UTF-8 message is omitted from safe JSON
     persistence. *)
 
+val make_telemetry_mapping_error :
+  message:string ->
+  event_trace:Workflow_event.trace ->
+  unit ->
+  (error, string) result
+(** Construct an adapter-boundary failure for source telemetry that cannot be
+    represented by a richer execution/error constructor. The already validated
+    trace is retained byte-for-byte regardless of its terminal status or attempt
+    evidence; no result, attempt, status, or event is fabricated. The non-empty
+    UTF-8 diagnostic remains in process and is omitted from safe persistence. *)
+
 val error_view : error -> error_view
 (** Inspect the error classification and retained in-process diagnostic. *)
 
@@ -629,4 +653,5 @@ val error_to_yojson : error -> Yojson.Safe.t
     separate incomplete-observation lower bounds, and the safe outer trace, but
     no synthetic continuation result. Post-execution dispatch failures retain
     their fixed cause, safe response, and separate safe outer trace; execution
-    failures likewise embed the safe response and retain attempts. *)
+    failures likewise embed the safe response and retain attempts. Telemetry
+    mapping failures persist only their exact safe event trace. *)

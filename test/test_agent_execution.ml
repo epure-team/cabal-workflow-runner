@@ -1156,6 +1156,225 @@ let test_event_lifecycle_invariants () =
   rejects [ (0, Process_started); (0, Terminal Failed) ];
   rejects [ (1, Preflight_started); (1, Terminal Failed) ]
 
+let test_event_post_finish_final_metadata () =
+  let usage = ok (Execution_metrics.make_usage ~input_tokens:3L ()) in
+  let cost = ok (Execution_metrics.make_cost ~usd_micros:7L ()) in
+  let fallback_omissions =
+    ok
+      (Workflow_event.make_omission_counts ~text_events:1L ~text_bytes:4L
+         ())
+  in
+  let trace =
+    ok
+      (trace_of_payloads
+         [
+           (0, Task_started);
+           (1, Attempt_started Initial_attempt);
+           (1, Attempt_finished Attempt_succeeded);
+           (1, Session_id "final-session");
+           (1, Agent_text_delta "final fallback");
+           (1, Delivery_truncated fallback_omissions);
+           (1, Usage_observed {usage = Some usage; cost = Some cost});
+           (1, Terminal Succeeded);
+         ])
+  in
+  let mapped_attempt =
+    attempt ~session_id:"final-session" ~usage ~cost
+      ~text:"final fallback...." ~elapsed_s:0.1 ()
+  in
+  (match
+     Agent_execution.make_response ~attempts:[mapped_attempt] ~status:Success
+       ~total_elapsed_s:0.7 ~cleanup_status:Cleanup_not_required
+       ~event_trace:trace ()
+   with
+  | Ok _ -> ()
+  | Error message -> Alcotest.fail message);
+  let mismatched_attempt =
+    attempt ~session_id:"final-session" ~usage ~cost
+      ~text:"other fallback...." ~elapsed_s:0.1 ()
+  in
+  expect_error
+    (Agent_execution.make_response ~attempts:[mismatched_attempt] ~status:Success
+       ~total_elapsed_s:0.7 ~cleanup_status:Cleanup_not_required
+       ~event_trace:trace ());
+  let mismatched_usage =
+    ok (Execution_metrics.make_usage ~input_tokens:4L ())
+  in
+  let usage_mismatch_attempt =
+    attempt ~session_id:"final-session" ~usage:mismatched_usage ~cost
+      ~text:"final fallback...." ~elapsed_s:0.1 ()
+  in
+  expect_error
+    (Agent_execution.make_response ~attempts:[usage_mismatch_attempt]
+       ~status:Success ~total_elapsed_s:0.7
+       ~cleanup_status:Cleanup_not_required ~event_trace:trace ());
+  let crlf_omissions =
+    ok
+      (Workflow_event.make_omission_counts ~text_events:1L ~text_bytes:1L
+         ())
+  in
+  let crlf_trace =
+    ok
+      (trace_of_payloads
+         [
+           (1, Attempt_started Initial_attempt);
+           (1, Attempt_finished Attempt_succeeded);
+           (1, Agent_text_delta "line\r");
+           (1, Delivery_truncated crlf_omissions);
+           (1, Terminal Succeeded);
+         ])
+  in
+  let crlf_attempt = attempt ~text:"line\r\n" ~elapsed_s:0.1 () in
+  ignore
+    (response ~attempts:[crlf_attempt] ~total_elapsed_s:0.5
+       ~event_trace:crlf_trace ())
+
+let test_event_final_parser_observations_after_process_exit () =
+  ignore
+    (ok
+       (trace_of_payloads
+          [
+            (1, Attempt_started Initial_attempt);
+            (1, Process_started);
+            (1, Process_exited (Exited 0));
+            (1, Agent_text_delta "final parsed text");
+            (1, Session_id "final-session");
+            (1, Attempt_finished Attempt_succeeded);
+            (1, Terminal Succeeded);
+          ]))
+
+let test_event_post_finish_rejects_nonfinal_metadata () =
+  let tool = ok (Workflow_event.make_tool ~name:"reader" ()) in
+  let omissions = ok (Workflow_event.make_omission_counts ~usage_events:1L ()) in
+  let fallback_omissions =
+    ok
+      (Workflow_event.make_omission_counts ~text_events:1L ~text_bytes:1L
+         ())
+  in
+  let invalid_fallback_omissions =
+    [
+      ok (Workflow_event.make_omission_counts ~text_events:1L ());
+      ok
+        (Workflow_event.make_omission_counts ~text_events:2L ~text_bytes:1L
+           ());
+      ok
+        (Workflow_event.make_omission_counts ~text_events:1L ~text_bytes:1L
+           ~session_events:1L ());
+    ]
+  in
+  let rejects payload =
+    expect_error
+      (trace_of_payloads
+         [
+           (1, Attempt_started Initial_attempt);
+           (1, Attempt_finished Attempt_succeeded);
+           (1, payload);
+           (1, Terminal Succeeded);
+         ])
+  in
+  List.iter rejects
+    [
+      Tool_started tool;
+      Process_started;
+      Retry_transition {kind = Fresh_retry; reason = Transport_retry};
+      Delivery_truncated omissions;
+      Opaque_backend_observation;
+    ];
+  List.iter
+    (fun payloads -> expect_error (trace_of_payloads payloads))
+    [
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Delivery_truncated fallback_omissions);
+        (1, Agent_text_delta "out-of-order");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Agent_text_delta "streamed");
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "not-a-fallback");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "fallback");
+        (1, Agent_text_delta "duplicate");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Usage_observed {usage = None; cost = None});
+        (1, Delivery_truncated fallback_omissions);
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "fallback");
+        (1, Session_id "out-of-order");
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "fallback");
+        (1, Delivery_truncated fallback_omissions);
+        (1, Delivery_truncated fallback_omissions);
+        (1, Terminal Succeeded);
+      ];
+      [
+        (1, Attempt_started Initial_attempt);
+        (1, Attempt_finished Attempt_succeeded);
+        (1, Agent_text_delta "fallback");
+        (1, Retry_transition {kind = Fresh_retry; reason = Transport_retry});
+        (2, Terminal Failed);
+      ];
+    ];
+  List.iter
+    (fun invalid_counts ->
+      expect_error
+        (trace_of_payloads
+           [
+             (1, Attempt_started Initial_attempt);
+             (1, Attempt_finished Attempt_succeeded);
+             (1, Agent_text_delta "fallback");
+             (1, Delivery_truncated invalid_counts);
+             (1, Terminal Succeeded);
+           ]))
+    invalid_fallback_omissions;
+  expect_error
+    (Workflow_event.make_trace
+       [
+         event ~seq:1L ~attempt:1 ~elapsed_s:0.1
+           (Attempt_started Initial_attempt);
+         event ~seq:2L ~attempt:1 ~elapsed_s:0.2
+           (Attempt_finished Attempt_succeeded);
+         event ~seq:3L ~attempt:1 ~elapsed_s:0.3
+           (Agent_text_delta "fallback");
+         event ~seq:5L ~attempt:1 ~elapsed_s:0.4
+           (Delivery_truncated fallback_omissions);
+         event ~seq:6L ~attempt:1 ~elapsed_s:0.5 (Terminal Succeeded);
+       ]);
+  expect_error
+    (trace_of_payloads
+       [
+         (1, Attempt_started Initial_attempt);
+         (1, Attempt_finished Attempt_succeeded);
+         (1, Session_id "final-session");
+         (1, Retry_transition {kind = Fresh_retry; reason = Schema_validation});
+         (2, Terminal Failed);
+       ])
+
 let test_event_omitted_subsequence_is_conservative () =
   ignore
     (ok
@@ -1596,6 +1815,31 @@ let test_error_classification () =
       Alcotest.(check bool)
         ("execution kind " ^ tag) true (contains serialized tag))
     execution_kinds
+
+let test_telemetry_mapping_failure_retains_trace () =
+  let trace = terminal_trace () in
+  let error =
+    ok
+      (Agent_execution.make_telemetry_mapping_error
+         ~message:"unsafe source telemetry" ~event_trace:trace ())
+  in
+  (match Agent_execution.error_view error with
+  | Agent_execution.Telemetry_mapping_failure {message; event_trace} ->
+      Alcotest.(check string) "diagnostic retained in process"
+        "unsafe source telemetry" message;
+      Alcotest.(check bool) "exact valid trace retained" true
+        (Workflow_event.trace_to_yojson event_trace
+        = Workflow_event.trace_to_yojson trace)
+  | _ -> Alcotest.fail "telemetry mapping failure was misclassified");
+  let json = Agent_execution.error_to_yojson error in
+  Alcotest.(check bool) "stable failure kind" true
+    (Yojson.Safe.Util.member "error_kind" json
+    = `String "telemetry_mapping_failure");
+  Alcotest.(check bool) "safe trace persisted" true
+    (Yojson.Safe.Util.member "event_trace" json
+    = Workflow_event.trace_to_yojson trace);
+  let serialized = Yojson.Safe.to_string json in
+  check_absent "mapping diagnostic omitted" serialized "unsafe source telemetry"
 
 let test_execution_error_coherence () =
   let success = response () in
@@ -2295,6 +2539,41 @@ let test_uncertain_continuation_accepts_post_transition_truncation () =
           ~cleanup_status:Cleanup_not_required ~continuation:uncertain
           ~outer_event_trace:truncated_start ()))
 
+let test_uncertain_continuation_rejects_final_fallback_truncation () =
+  let full_text = "bounded fallback plus omitted suffix" in
+  let first = attempt ~schema_error:"schema rejected" ~text:full_text () in
+  let omissions =
+    ok
+      (Workflow_event.make_omission_counts ~text_events:1L
+         ~text_bytes:
+           (Int64.of_int (String.length full_text - String.length "bounded fallback"))
+         ())
+  in
+  let completed_fallback_only =
+    ok
+      (Workflow_event.make_trace
+         [
+           event ~seq:1L ~attempt:1 ~elapsed_s:0.05
+             (Attempt_started Initial_attempt);
+           event ~seq:2L ~attempt:1 ~elapsed_s:0.3
+             (Attempt_finished Attempt_succeeded);
+           event ~seq:3L ~attempt:1 ~elapsed_s:0.31
+             (Agent_text_delta "bounded fallback");
+           event ~seq:4L ~attempt:1 ~elapsed_s:0.32
+             (Delivery_truncated omissions);
+           event ~seq:5L ~attempt:2 ~elapsed_s:0.5 (Terminal Timed_out);
+         ])
+  in
+  let uncertain =
+    incomplete_continuation ~number:2 ~kind:Fresh_attempt
+      ~invocation:Agent_execution.Invocation_may_have_started
+  in
+  expect_error
+    (Agent_execution.make_incomplete_execution ~completed_attempts:[first]
+       ~outer_status:Timed_out ~total_elapsed_s:0.5
+       ~cleanup_status:Cleanup_not_required ~continuation:uncertain
+       ~outer_event_trace:completed_fallback_only ())
+
 let test_incomplete_completed_telemetry_mismatches () =
   let completed_usage = ok (Execution_metrics.make_usage ~input_tokens:7L ()) in
   let mismatched_usage =
@@ -2751,6 +3030,9 @@ let test_legacy_runtime_failure_and_unsupported () =
       | Incomplete_execution _ ->
           Alcotest.fail
             "legacy bool=false returned a completed result, not partial execution"
+      | Telemetry_mapping_failure _ ->
+          Alcotest.fail
+            "legacy bool=false returned native telemetry, not adapter mapping"
       | Dispatch_failure _ ->
           Alcotest.fail "legacy bool=false is execution, not dispatch failure")
   | Ok _ -> Alcotest.fail "legacy bool=false must be an execution error");
@@ -3001,6 +3283,12 @@ let () =
             test_event_terminal_invariants;
           Alcotest.test_case "lifecycle state machine" `Quick
             test_event_lifecycle_invariants;
+          Alcotest.test_case "post-finish final session and usage metadata"
+            `Quick test_event_post_finish_final_metadata;
+          Alcotest.test_case "final parser observations after process exit"
+            `Quick test_event_final_parser_observations_after_process_exit;
+          Alcotest.test_case "post-finish rejects nonfinal metadata" `Quick
+            test_event_post_finish_rejects_nonfinal_metadata;
           Alcotest.test_case "omitted-event subsequences" `Quick
             test_event_omitted_subsequence_is_conservative;
           Alcotest.test_case "event, trace, omission, and text bounds" `Quick
@@ -3022,6 +3310,8 @@ let () =
             test_serialized_projection_bounds;
           Alcotest.test_case "dispatch vs execution errors" `Quick
             test_error_classification;
+          Alcotest.test_case "telemetry mapping failure retains trace" `Quick
+            test_telemetry_mapping_failure_retains_trace;
           Alcotest.test_case "execution error coherence" `Quick
             test_execution_error_coherence;
           Alcotest.test_case "post-execution dispatch status preservation"
@@ -3050,6 +3340,9 @@ let () =
             test_uncertain_continuation_accepts_boundary_spanning_gap;
           Alcotest.test_case "accept post-transition truncation" `Quick
             test_uncertain_continuation_accepts_post_transition_truncation;
+          Alcotest.test_case
+            "reject final fallback truncation as continuation evidence" `Quick
+            test_uncertain_continuation_rejects_final_fallback_truncation;
           Alcotest.test_case "incomplete completed telemetry mismatches" `Quick
             test_incomplete_completed_telemetry_mismatches;
           Alcotest.test_case "cancellation during resumed retry" `Quick

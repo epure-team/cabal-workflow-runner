@@ -8,15 +8,16 @@ keep changes small and well-tested.
 Everything is built and tested in an opam switch that has the public
 [cabal](https://github.com/epure-team/cabal) library and the dependencies declared in
 `dune-project`. The library currently uses `yojson`, `eio`, `unix`, `base64`,
-`digestif`, and `mirage-crypto-ec`; the executable/test toolchain also uses `cabal`,
-`eio_main`, `cmdliner`, and `alcotest`. Pin cabal and install deps:
+`digestif`, and `mirage-crypto-ec`; the bridge/executable/test toolchain also uses
+`cabal`, `eio_posix`, `eio_main`, `cmdliner`, and `alcotest`. Pin cabal and install deps:
 
 ```sh
-opam pin add -n cabal https://github.com/epure-team/cabal.git
+opam pin add -n cabal https://github.com/epure-team/cabal.git#95dff454331dc610ce2db9d44924f2be818a1c6b
 opam install . --deps-only --with-test
 
 dune build
 dune test          # the full suite must stay green
+dune build @fmt    # Dune/OCaml formatting must be clean
 ```
 
 The test binary also runs standalone from the repo root:
@@ -51,8 +52,10 @@ schema/workflow.schema.json`) so the no-drift test stays green.
 
 The library `cabal_workflow_runner` (`lib/`) has the dependencies listed above but
 must never depend on Cabal or a host application's workflow/orchestration layers.
-Cabal is linked **only** in the executable (`bin/`). Keep backend bridges injected
-behind library-owned contracts such as `Backend.t` or the additive rich `Runtime.t`.
+Cabal is linked only by the separate installable
+`cabal_workflow_runner.cabal_bridge` library and the executable. Keep `lib/`
+backend bridges injected behind library-owned contracts such as `Backend.t` or
+the additive rich `Runtime.t`.
 
 The rich execution DTOs are not part of workflow input: do not wire them into
 `Engine.run`, workflow JSON/schema, or workflow ledgers without a separately reviewed
@@ -60,6 +63,51 @@ compatibility change. Normalized event traces are post-completion values in this
 do not document the API as live streaming. Keep their opaque-constructor resource bounds,
 event/response cross-validation, and pre-dispatch legacy-adapter rejections covered when
 extending the contract.
+
+## Cabal bridge trust and mapping rules
+
+Production startup must call `Cwr_cabal.bootstrap_hardened ()` exactly once while the
+Cabal registry is empty, retain its opaque handle, and pass `~bootstrap` to every
+`Cwr_cabal.create` or `register_custom_backend` call. Do not add a first-available,
+direct `Agentic_backend`, YAML-adapter, or registry-rebootstrap bypass. Each runtime is
+authorized by one exact physical entry/backend captured at construction; it advertises
+no cross-backend routing and accepts a request routing value only when it equals the
+bound ID. Custom selection additionally requires its bootstrap-bound opaque token.
+`CWR_BACKEND` remains a required explicit canonical ID for the CLI.
+
+All bridge execution goes through guarded
+`Backend_completer.make_rich_with_entry`, including the sole call-time registry lookup,
+exact-entry identity guard, input/capability preflight, version/availability checks,
+schema enforcement, event collection, deadlines, and cleanup. Caller-owned attachment
+limits remain mandatory. A maximum-turn value is accepted and forwarded, but this does
+not by itself prove that every backend CLI enforces the value.
+
+Keep event envelopes faithful: never rotate or reassociate payloads to make a trace
+validate. Only ordered same-attempt final session metadata, one non-empty bounded text
+fallback when no earlier text exists, its optional positive text-truncation marker
+immediately following it in the source sequence, and final usage metadata may follow
+`Attempt_finished`. Treat the retained text as a prefix lower bound and never as
+continuation evidence. Final public text/session/usage parser observations may follow
+process exit before the attempt finishes. When invalid or contradictory source
+telemetry prevents a richer constructor but the normalized source trace is valid, return
+`Telemetry_mapping_failure` with that exact trace. Strict structured output accepts only
+standard JSON objects/arrays; valid but different structured-report and normalized-text
+values are a conflict and must fail closed.
+
+`Backend_cabal.protect_shell_command` may map ordinary exceptions to exit `127`, but it
+must re-raise Eio cancellation and `Out_of_memory`, `Stack_overflow`, and `Sys.Break`.
+Add mapping cases to `test/test_cabal_bridge_mapping.ml`, integration/identity cases to
+`test/test_cabal_bridge.ml`, event-model cases to `test/test_agent_execution.ml`, and
+shell classification cases to `test/test_backend_cabal.ml`.
+
+### Cabal release blocker
+
+- [ ] Do not merge or publish this bridge as normally installable until a Cabal release
+      contains commit `95dff454331dc610ce2db9d44924f2be818a1c6b`.
+- [ ] Keep CI, release, and developer setup pinned to that exact commit until the release
+      exists; do not invent a package-version constraint in advance.
+- [ ] After the Cabal release, verify a clean unpinned package installation before
+      replacing the commit pin and clearing this blocker.
 
 ## Safety floor must not regress
 

@@ -69,19 +69,22 @@ verdicts rather than on an LLM's opinion of its own diff. See
 - **Library** `cabal_workflow_runner` (`lib/`): types, fail-closed validator,
   deterministic engine + replay, backend abstraction, JSON loader, and native
   Ed25519 attestation. It does *not* depend on cabal.
-- **Executable** `cabal-workflow-runner` (`bin/`): a small CLI; this is the only place
-  that links cabal.
+- **Cabal bridge** `cabal_workflow_runner.cabal_bridge` (`cabal_bridge/`): the
+  separately linked, installable rich-runtime implementation.
+- **Executable** `cabal-workflow-runner` (`bin/`): a small CLI that links the bridge.
 
 ## Rich agent execution contract (additive)
 
-The library exposes a host-neutral contract for future rich backend bridges without
-changing the workflow format or wiring it into `Engine.run`:
+The core library exposes a host-neutral rich contract without changing the workflow
+format or wiring it directly into `Engine.run`. The separately installable
+`cabal_workflow_runner.cabal_bridge` library implements that contract through Cabal's
+central guarded `Backend_completer.make_rich_with_entry` path:
 
 - `Agent_execution` validates opaque requests with separate system/user prompts,
   finite positive timeouts, optional JSON Schema/session/routing/model/read-only
-  metadata, ordered workspace-relative attachment references, and disabled/search/
-  search+fetch web policies (optionally domain-restricted). Construction performs no
-  filesystem I/O.
+  metadata and maximum-turn bounds, ordered workspace-relative attachment references,
+  and disabled/search/search+fetch web policies (optionally domain-restricted).
+  Construction performs no filesystem I/O.
 - Rich results retain structured status, normalized public text/JSON, every initial/
   fresh/resumed attempt, path-free delivery intent, exact optional usage and integer
   micro-USD cost, aggregate telemetry, final session, cleanup status, and an optional
@@ -100,6 +103,9 @@ changing the workflow format or wiring it into `Engine.run`:
   invoked-but-uncommitted fresh/resumed continuation,
   post-execution dispatch failures retaining any coherent non-empty response plus a
   separate outer failed trace, and execution failures remain distinct typed shapes.
+  A separate telemetry-mapping failure retains an already-valid safe source trace when
+  invalid or contradictory source telemetry cannot fit a richer response/error
+  constructor; it never silently drops that trace or fabricates an attempt/status.
   Incomplete execution never fabricates a continuation result: its failed/timed-out/
   cancelled outer status and complete bounded outer trace remain separate from committed
   attempts. Aggregate metrics and final session use committed results only; bounded
@@ -124,6 +130,14 @@ changing the workflow format or wiring it into `Engine.run`:
   rejects visible phase, attempt, retry, and process-order contradictions, negative
   process exit codes, and decreasing known cumulative usage/cost snapshots. Exit codes
   otherwise use the host's non-negative `int` range rather than a Unix-specific ceiling.
+  After `Attempt_finished`, only same-attempt final session metadata, one non-empty
+  bounded agent-text fallback when no earlier agent text was observed, its optional
+  positive text-truncation marker immediately following it in the source sequence, and
+  final cumulative usage metadata may precede the terminal, in that order. A truncated
+  fallback is a prefix lower bound for the complete result text. Their sequence, attempt,
+  elapsed time, and payload remain attached to the original event rather than being
+  rotated to fit the lifecycle. A backend's final public text/session/usage parser
+  observations may also follow process exit while the transport attempt is still open.
   This batch does **not** claim live event streaming.
 - `Runtime` wraps one completion function. `Runtime.of_legacy_backend` adapts the
   unchanged `Backend.t` honestly as one synthetic attempt with unknown usage/cost, no
@@ -146,7 +160,31 @@ projections; incomplete and post-execution error bounds include a separately ret
 outer trace.
 See the [rich execution migration
 notes](docs/rich-agent-execution-migration.md) for adoption details and the exhaustive
-mapping from Cabal's current `Backend_completer.make_rich` outcomes.
+mapping from Cabal's current guarded rich-completion outcomes.
+
+`Cwr_cabal.bootstrap_hardened ()` must run once while the Cabal registry is empty and
+returns an opaque process-lifetime identity handle. Successful bootstrap is one-shot even
+if test-only code later clears and rebuilds Cabal's registry. `Cwr_cabal.create
+~bootstrap` then requires that handle, an explicit backend id, working directory, and
+caller-owned `Task_preflight.limits`; it never chooses a first-available backend or
+defines product attachment limits. Each returned runtime is permanently bound to the
+exact physical entry selected at construction and advertises `routing=false`. A request
+routing hint is accepted only when absent or equal to that bound backend; any other value
+fails before Cabal dispatch. Native-schema, session, media MIME, maximum-web, and
+read-only capabilities match the bound entry; maximum-turn forwarding, hard deadlines,
+and model selection are bridge guarantees, while restricted domains and routing remain
+false. Each call delegates the sole registry lookup, complete entry
+revalidation, physical-identity guard, and backend capture to
+`Backend_completer.make_rich_with_entry`, so raw registrations and equal-looking
+validated replacements fail closed while mutation after capture can execute only the
+captured original. Hardened bootstrap ignores project/user/global adapter configuration.
+Tests may add one explicitly authorized custom backend with
+`Cwr_cabal.register_custom_backend ~bootstrap`; its opaque token is bound to that handle,
+id, and exact entry. The handle is immutable and supports concurrent `create` calls.
+
+Maximum-turn requests are accepted by this bridge and forwarded unchanged into Cabal's
+completion contract. The runtime capability means acceptance/forwarding only; it is not
+new evidence that every backend CLI enforces the bound.
 
 Versioned response/incomplete-execution/error/event-trace Yojson projections are
 redacted persistence surfaces. The legacy `Backend.t`, `Backend.stub`, `Engine.run`,
@@ -155,13 +193,22 @@ an engine dependency.
 
 ## Build & test
 
-Built and tested in the cabal opam switch. The library currently links `yojson`, `eio`,
-`unix`, `base64`, `digestif`, and `mirage-crypto-ec`; Cabal remains executable-only.
-The executable/test toolchain additionally uses `cabal`, `eio_main`, `cmdliner`, and
-`alcotest`:
+Built and tested in an opam switch. The Cabal-free core library links `yojson`, `eio`,
+`unix`, `base64`, `digestif`, and `mirage-crypto-ec`; the separate bridge and executable
+add `cabal` and `eio_posix`. The executable/test toolchain also uses `eio_main`,
+`cmdliner`, and `alcotest`. CI and release builds pin the audited Cabal rich-runtime
+contract commit:
+
+> **Release blocker:** normal package installation is not supported until Cabal
+> releases the guarded API containing
+> `95dff454331dc610ce2db9d44924f2be818a1c6b`. Keep the exact commit pin below;
+> do not infer a future package-version constraint or treat this state as
+> release-ready.
 
 ```sh
-eval $(opam env --switch=/path/to/cabal --set-switch)
+opam pin add -n cabal \
+  https://github.com/epure-team/cabal.git#95dff454331dc610ce2db9d44924f2be818a1c6b
+opam install . --deps-only --with-test
 dune build
 dune test
 ```
@@ -285,12 +332,15 @@ workflow containing Attest rather than silently dropping signing authority.
 
 An Attest selection of `outputs.<agent-id>` is valid only when every Agent producer with
 that ID is declared `read_only`. Lint and validation enforce this statically. Runtime
-read-only dispatch does not trust registry capability metadata or YAML adapters: only
-cabal's available handwritten `claude-code` and `codex` implementations are eligible.
-Claude receives `--disallowedTools Bash,Edit,Write,NotebookEdit`; Codex receives
-`-s read-only`. Unsafe or unknown explicit `agent_type` values fail closed without
-fallback or dispatch. `scripts/read-only-selftest.sh` exercises exact argv, YAML-ID
-spoof resistance, and zero target mutation with fake CLIs.
+read-only dispatch goes through the hardened central Cabal registry and capability/input
+preflight; it does not load project/user/global YAML adapters and has no direct command-
+builder bypass. The handwritten Claude and Codex adapters retain their respective
+read-only CLI policies. Unsafe or unknown explicit `agent_type` values fail closed
+without fallback or dispatch. `scripts/read-only-selftest.sh` exercises exact argv and
+YAML-ID spoof resistance with offline fake CLIs. Cabal may create or update only its owned
+`.cabal/backend-config/*` and `.codex/config.toml` workspace configuration; the selftest
+excludes exactly those paths from its snapshot and requires every other workspace file and
+its contents to remain unchanged.
 
 A read-only Agent may declare `input` as a non-empty, unique list of dotted paths
 produced earlier on every path. CWR sends the restricted-canonical projection in a
@@ -309,19 +359,20 @@ cabal-workflow-runner schema > workflow.schema.json
 
 `validate` rejects (exit 1) any workflow with an **ungoverned** loop (empty `governors`,
 or a `Max_iters`/`Fixpoint` with an out-of-range bound) or a commit that is not
-guaranteed-gated by the floor gates on every path. `run` dispatches agent steps to the
-first available cabal backend (forcing structured output, failing closed if none or if
-the agent returns no parseable JSON) and prints the outcome plus the recorded trace.
-`schema` is a thin wrapper printing `Workflow_schema.to_string ()` (the committed copy
+guaranteed-gated by the floor gates on every path. `run` forces strict structured output
+and prints the outcome plus the recorded trace. It requires the operator to set a
+canonical non-blank `CWR_BACKEND`; backend absence,
+quarantine, capability mismatch, and preflight failure all fail closed. `schema` is a
+thin wrapper printing `Workflow_schema.to_string ()` (the committed copy
 lives at [`schema/workflow.schema.json`](schema/workflow.schema.json)).
 
 ### Live run against a backend
 
-A `run` dispatches each agent step through cabal. Two environment variables target a
-specific (typically small/cheap/fast) model:
+A `run` dispatches each agent step through Cabal's hardened rich runtime. The backend
+selector is mandatory; the model override is optional:
 
-- **`CWR_BACKEND`** — the cabal backend id to use (e.g. `claude-code`). Unset ⇒ the
-  first available backend in the registry.
+- **`CWR_BACKEND`** — required canonical Cabal backend id (e.g. `claude-code`). Missing
+  or blank values fail before workflow execution; there is no first-available fallback.
 - **`CWR_MODEL`** — the model to pin (e.g. `haiku`). Unset ⇒ the backend's default.
 - **`CWR_BUDGET`** — a genuine **consumable** total-run budget for the `Budget` governor
   (default 1,000,000). Each `Budget`-governor check consumes one unit; with `CWR_BUDGET=N`
@@ -445,9 +496,12 @@ ever executes**. A workflow file cannot grant itself the allowlist.
 > followed** — the command runs with cwd = the resolved target. This is **not a sandbox**;
 > the allowlist is the trust control.
 
-The run effect **never crashes the engine**: a spawn failure (exit `127`), an
-output-buffer overflow (exit `125`, `truncated=true`), or a timeout (exit `124`) is turned
-into a recorded `run_result`, so the run is always recorded and replayable.
+Ordinary run-effect failures are normalized: a spawn failure becomes exit `127`, an
+output-buffer overflow becomes exit `125` with `truncated=true`, and a timeout becomes
+exit `124`, producing a recorded replayable `run_result`. Eio cancellation and fatal
+runtime exceptions (`Out_of_memory`, `Stack_overflow`, and `Sys.Break`) are deliberately
+re-raised; the adapter never launders cancellation or process-fatal conditions into an
+ordinary command result.
 
 `working_dir` bounds the cwd and the snapshot scope but **does NOT sandbox** the command
 from touching absolute paths in its args; full isolation (container/chroot) is **out of

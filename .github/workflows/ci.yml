@@ -16,7 +16,7 @@ jobs:
 
       - name: Pin the public cabal library and install deps
         run: |
-          opam pin add -n cabal https://github.com/epure-team/cabal.git
+          opam pin add -n cabal https://github.com/epure-team/cabal.git#95dff454331dc610ce2db9d44924f2be818a1c6b
           opam install . --deps-only --with-test
 
       - name: Build
@@ -25,8 +25,11 @@ jobs:
       - name: Test
         run: opam exec -- dune runtest
 
+      - name: Read-only backend integration self-test
+        run: bash scripts/read-only-selftest.sh
+
       - name: Pinned Run integration self-test
-        run: scripts/pinned-run-selftest.sh
+        run: opam exec -- scripts/pinned-run-selftest.sh
 
   parity:
     runs-on: ubuntu-latest
@@ -43,7 +46,7 @@ jobs:
 
       - name: Pin the public cabal library and install deps
         run: |
-          opam pin add -n cabal https://github.com/epure-team/cabal.git
+          opam pin add -n cabal https://github.com/epure-team/cabal.git#95dff454331dc610ce2db9d44924f2be818a1c6b
           opam install . --deps-only --with-test
 
       - name: Install jsonschema
@@ -108,7 +111,7 @@ jobs:
 
       - name: Pin the public cabal library and install deps for BOTH repos (one shared switch)
         run: |
-          opam pin add -n cabal https://github.com/epure-team/cabal.git
+          opam pin add -n cabal https://github.com/epure-team/cabal.git#95dff454331dc610ce2db9d44924f2be818a1c6b
           # --with-test is REQUIRED, not optional hygiene: arch-index declares tezt as a
           # with-test dependency, its tezt/ dirs are part of @default, and scripts/pcc/pcc-index
           # runs a full `dune build` in the arch-index root at RUNTIME. Without tezt installed

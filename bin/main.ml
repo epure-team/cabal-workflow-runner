@@ -212,7 +212,11 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_f
       Eio_main.run (fun env ->
           Eio.Switch.run (fun sw ->
               let cwd = Sys.getcwd () in
-              let backend = Backend_cabal.make ~sw ~env ~working_dir:cwd in
+              match Backend_cabal.make ~sw ~env ~working_dir:cwd with
+              | Error message ->
+                  Printf.eprintf "backend configuration error: %s\n" message;
+                  1
+              | Ok backend ->
               let initial_ctx = match ctx_json with
                 | None -> []
                 | Some raw ->
@@ -666,7 +670,7 @@ let to_claude_workflow_cmd =
 
 let () =
   let doc = "Deterministic workflow engine on cabal." in
-  let info = Cmd.info "cabal-workflow-runner" ~version:"0.19.0" ~doc in
+  let info = Cmd.info "cabal-workflow-runner" ~version:"0.20.0" ~doc in
   let group =
     Cmd.group info
       [ lint_cmd; validate_cmd; run_cmd; replay_cmd; schema_cmd;
