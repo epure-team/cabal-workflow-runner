@@ -7,9 +7,23 @@ tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/work" "$tmp/home/.cabal/adapters"
 
+# Cabal probes and dispatches through this helper. Resolve it explicitly before
+# restricting PATH so only the fixture's backend CLIs are discoverable.
+if [[ -n ${CABAL_PROCESS_GROUP_LAUNCHER:-} ]]; then
+  launcher=$CABAL_PROCESS_GROUP_LAUNCHER
+else
+  opam_bin=$(opam var bin)
+  launcher=$opam_bin/cabal-process-group-launcher
+fi
+if [[ ! -x $launcher ]]; then
+  echo "read-only backend selftest: missing Cabal process-group launcher" >&2
+  exit 1
+fi
+
 cat > "$tmp/bin/claude" <<'SH'
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_CALLS"
 if [[ ${1-} == --version ]]; then echo 'fake claude'; exit 0; fi
 printf '%s\n' "$@" > "$FAKE_ARGV"
 args=" $* "
@@ -22,8 +36,9 @@ fi
 printf '{"type":"result","subtype":"success","is_error":false,"result":"{\\"ok\\":true}","structured_output":{"ok":true},"session_id":"70f62070-a552-4cc6-9ee2-b97cf02e3eda"}\n'
 SH
 cat > "$tmp/bin/codex" <<'SH'
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_CALLS"
 if [[ ${1-} == --version ]]; then echo 'fake codex'; exit 0; fi
 printf '%s\n' "$@" > "$FAKE_ARGV"
 args=" $* "
@@ -34,7 +49,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"ok\\
 SH
 chmod +x "$tmp/bin/claude" "$tmp/bin/codex"
 cat > "$tmp/bin/unsafe-spoof" <<'SH'
-#!/usr/bin/env bash
+#!/bin/bash
 : > "$FAKE_MUTATION"
 printf '{"ok":true}\n'
 SH
@@ -71,31 +86,35 @@ run_safe() {
   local backend=claude-code
   [[ $type == codex ]] && backend=codex
   workflow "$type" > "$tmp/work/workflow.json"
-  rm -f "$tmp/argv" "$tmp/mutated"
+  rm -f "$tmp/argv" "$tmp/calls" "$tmp/mutated"
   local before
   before=$(cd "$tmp/work" && workspace_snapshot)
-  if ! (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
-      FAKE_ARGV="$tmp/argv" FAKE_MUTATION="$tmp/mutated" \
+  if ! (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin" \
+      CABAL_PROCESS_GROUP_LAUNCHER="$launcher" \
+      FAKE_ARGV="$tmp/argv" FAKE_CALLS="$tmp/calls" FAKE_MUTATION="$tmp/mutated" \
       CWR_BACKEND="$backend" "$cwr" run workflow.json > "$tmp/out" 2>&1); then
     cat "$tmp/out" >&2
     exit 1
   fi
   [[ ! -e $tmp/mutated ]]
   [[ $(cd "$tmp/work" && workspace_snapshot) == "$before" ]]
+  grep -Fqx -- '--version' "$tmp/calls"
   grep -qx -- "$expected" "$tmp/argv"
 }
 
 run_rejected() {
   local type=$1
   workflow "$type" > "$tmp/work/workflow.json"
-  rm -f "$tmp/argv" "$tmp/mutated"
-  if (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin:$PATH" FAKE_ARGV="$tmp/argv" \
-      FAKE_MUTATION="$tmp/mutated" CWR_BACKEND=claude-code "$cwr" run workflow.json \
+  rm -f "$tmp/argv" "$tmp/calls" "$tmp/mutated"
+  if (cd "$tmp/work" && HOME="$tmp/home" PATH="$tmp/bin" \
+      CABAL_PROCESS_GROUP_LAUNCHER="$launcher" FAKE_ARGV="$tmp/argv" \
+      FAKE_CALLS="$tmp/calls" FAKE_MUTATION="$tmp/mutated" \
+      CWR_BACKEND=claude-code "$cwr" run workflow.json \
       > "$tmp/out" 2>&1); then
     echo "backend $type unexpectedly dispatched" >&2
     exit 1
   fi
-  [[ ! -e $tmp/argv && ! -e $tmp/mutated ]]
+  [[ ! -e $tmp/argv && ! -e $tmp/calls && ! -e $tmp/mutated ]]
 }
 
 # Central hardened dispatch may write its owned backend configuration (including
