@@ -15,7 +15,7 @@ The CLI now adapts this rich runtime to the unchanged workflow-engine `Backend.t
 explicit zero-attachment CLI policy, and read-only work no longer bypasses Cabal's central
 registry/preflight path. The core `lib/` remains Cabal-free. Fake-backend tests exercise
 request/status/retry/error/event/cost/session mapping without real CLIs. CI, release, and
-developer setup pin Cabal commit `c500033f9f45412936fd247a88f125844a2300db`.
+developer setup pin Cabal commit `95dff454331dc610ce2db9d44924f2be818a1c6b`.
 
 The offline read-only fake-backend selftest now runs in CI and hashes every workspace
 file except Cabal-managed `.cabal/backend-config/*` and `.codex/config.toml`; those are

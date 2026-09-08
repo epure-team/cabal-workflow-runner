@@ -242,7 +242,7 @@ redactions, not rewritten telemetry.
 ## Cabal release migration blocker
 
 - [ ] A Cabal release must contain commit
-  `c500033f9f45412936fd247a88f125844a2300db` before this bridge is merged or
+  `95dff454331dc610ce2db9d44924f2be818a1c6b` before this bridge is merged or
   published as normally installable.
 - [ ] Until then, keep CI, release, and developer setup pinned to that exact
   commit. Do not guess a future package version or claim release readiness.

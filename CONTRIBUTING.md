@@ -12,7 +12,7 @@ Everything is built and tested in an opam switch that has the public
 `cabal`, `eio_posix`, `eio_main`, `cmdliner`, and `alcotest`. Pin cabal and install deps:
 
 ```sh
-opam pin add -n cabal https://github.com/epure-team/cabal.git#c500033f9f45412936fd247a88f125844a2300db
+opam pin add -n cabal https://github.com/epure-team/cabal.git#95dff454331dc610ce2db9d44924f2be818a1c6b
 opam install . --deps-only --with-test
 
 dune build
@@ -103,7 +103,7 @@ shell classification cases to `test/test_backend_cabal.ml`.
 ### Cabal release blocker
 
 - [ ] Do not merge or publish this bridge as normally installable until a Cabal release
-      contains commit `c500033f9f45412936fd247a88f125844a2300db`.
+      contains commit `95dff454331dc610ce2db9d44924f2be818a1c6b`.
 - [ ] Keep CI, release, and developer setup pinned to that exact commit until the release
       exists; do not invent a package-version constraint in advance.
 - [ ] After the Cabal release, verify a clean unpinned package installation before

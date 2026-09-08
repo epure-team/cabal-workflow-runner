@@ -201,13 +201,13 @@ contract commit:
 
 > **Release blocker:** normal package installation is not supported until Cabal
 > releases the guarded API containing
-> `c500033f9f45412936fd247a88f125844a2300db`. Keep the exact commit pin below;
+> `95dff454331dc610ce2db9d44924f2be818a1c6b`. Keep the exact commit pin below;
 > do not infer a future package-version constraint or treat this state as
 > release-ready.
 
 ```sh
 opam pin add -n cabal \
-  https://github.com/epure-team/cabal.git#c500033f9f45412936fd247a88f125844a2300db
+  https://github.com/epure-team/cabal.git#95dff454331dc610ce2db9d44924f2be818a1c6b
 opam install . --deps-only --with-test
 dune build
 dune test
