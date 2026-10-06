@@ -26,6 +26,8 @@ let open_sink ~path ~run_id =
         match Secure_fs.read_regular path with
         | Error _ -> Error "cannot read telemetry sink"
         | Ok raw when String.length raw > 16 * 1024 * 1024 -> Error "telemetry sink exceeds 16 MiB"
+        | Ok raw when raw <> "" && raw.[String.length raw - 1] <> '\n' ->
+            Error "telemetry sink has an unterminated event"
         | Ok raw ->
             try
               let seq = String.split_on_char '\n' raw |> List.filter ((<>) "")

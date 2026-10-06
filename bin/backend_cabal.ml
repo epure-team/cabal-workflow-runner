@@ -240,10 +240,13 @@ let make ~sw ~env ~working_dir ?telemetry () : Cabal_workflow_runner.Backend.t =
                 let outcome = match r.status with
                   | Backend_types.Success -> "ok" | Failed _ -> "failed"
                   | Timeout -> "timeout" | Cancelled -> "cancelled" in
+                (* Codex's inherited parser sums unvalidated usage events and
+                   loses observed zero. Do not certify those as observations. *)
+                let validated_cost = if !selected_backend = Some "codex" then None else r.cost in
                 let usage = Option.map (fun (c : Backend_types.cost) ->
                   {Cabal_workflow_runner.Observation.input_tokens=c.tokens_input;
                    output_tokens=c.tokens_output;cache_read_tokens=c.cache_read_input_tokens;
-                   cache_write_tokens=c.cache_creation_input_tokens}) r.cost in
+                   cache_write_tokens=c.cache_creation_input_tokens}) validated_cost in
                 outcome, Some r.exit_code, r.session_id,
                 Some (Backend_types.duration_to_seconds r.elapsed *. 1000.), usage in
           Cabal_workflow_runner.Observation.finish sink ?backend:!selected_backend call ~outcome ~exit_code

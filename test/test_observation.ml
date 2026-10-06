@@ -72,8 +72,16 @@ let test_append_safety () = with_path @@ fun path ->
   Alcotest.(check int) "no duplicate event" 2 (List.length (events path));
   ignore (Observation.close sink)
 
+let test_missing_final_lf () = with_path @@ fun path ->
+  let original = {|{"run_id":"resume-run","call_seq":1,"type":"call.started"}|} in
+  let oc = open_out path in output_string oc original; close_out oc;
+  Alcotest.(check bool) "unterminated JSONL refused" true
+    (Result.is_error (Observation.open_sink ~path ~run_id:"resume-run"));
+  Alcotest.(check string) "prior bytes preserved" original (get (Secure_fs.read_regular path))
+
 let () = Alcotest.run "provider observations" ["sink", [
   Alcotest.test_case "metadata and resume" `Quick test_metadata_and_resume;
   Alcotest.test_case "allowlist" `Quick test_sanitization;
   Alcotest.test_case "exclusive lock and write failure" `Quick test_lock_and_failure;
-  Alcotest.test_case "append path and duplicate safety" `Quick test_append_safety]]
+  Alcotest.test_case "append path and duplicate safety" `Quick test_append_safety;
+  Alcotest.test_case "restart requires final LF" `Quick test_missing_final_lf]]

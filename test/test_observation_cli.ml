@@ -63,7 +63,30 @@ let test_provider_metadata code =
   Alcotest.(check bool) "elapsed present" true (member "timing" row |> member "duration_ms" <> `Null);
   List.iter Sys.remove [wf; out; cli]; Unix.rmdir dir
 
+let test_codex_usage_unknown () =
+  let dir = Filename.temp_file "cwr-codex-" "" in
+  Sys.remove dir; Unix.mkdir dir 0o700;
+  let wf = Filename.concat dir "workflow.json" in
+  let out = Filename.concat dir "events.jsonl" in
+  let cli = Filename.concat dir "codex" in
+  let write path content = let oc = open_out path in output_string oc content; close_out oc in
+  write wf {|{"name":"fixture","steps":[{"kind":"agent","id":"probe","agent_type":"codex","read_only":true,"prompt":"PRIVATE_PROMPT_MARKER"}]}|};
+  write cli "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex 0.122.0'; exit 0; fi\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"ok\\\":true}\"}}' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":7}}'\n";
+  Unix.chmod cli 0o700;
+  let command = Printf.sprintf "PATH=%s %s run %s --telemetry-file %s --telemetry-run-id codex-fixture >/dev/null 2>&1"
+      (Filename.quote (dir ^ ":" ^ Sys.getenv "PATH")) (Filename.quote Sys.argv.(1)) (Filename.quote wf) (Filename.quote out) in
+  Alcotest.(check int) "provider outcome unchanged" 0 (Sys.command command);
+  let raw = match Secure_fs.read_regular out with Ok raw -> raw | Error e -> Alcotest.fail e in
+  let rows = String.split_on_char '\n' raw |> List.filter ((<>) "") |> List.map Yojson.Safe.from_string in
+  let open Yojson.Safe.Util in
+  let usage = List.nth rows 1 |> member "usage" in
+  Alcotest.(check bool) "uncertified input withheld" true (member "input_tokens" usage = `Null);
+  Alcotest.(check bool) "uncertified output withheld" true (member "output_tokens" usage = `Null);
+  Alcotest.(check string) "basis unknown" "unknown" (member "usage_basis" usage |> to_string);
+  List.iter Sys.remove [wf; out; cli]; Unix.rmdir dir
+
 let () = Alcotest.run ~argv:[|Sys.argv.(0)|] "observation CLI" ["metadata", [
   Alcotest.test_case "unknown backend" `Quick test_flags_and_unknown_failure;
   Alcotest.test_case "provider success" `Quick (fun () -> test_provider_metadata 0);
-  Alcotest.test_case "provider failure" `Quick (fun () -> test_provider_metadata 9)]]
+  Alcotest.test_case "provider failure" `Quick (fun () -> test_provider_metadata 9);
+  Alcotest.test_case "Codex usage unknown" `Quick test_codex_usage_unknown]]

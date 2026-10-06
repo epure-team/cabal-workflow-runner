@@ -102,7 +102,10 @@ success, including errors caught by parallel execution. Replay emits no calls.
 Records contain bounded identifiers, selected backend, requested model, status,
 exit code, session, nullable input/output/cache tokens and Cabal elapsed time.
 No prompt, output, error prose, environment or transcript is serialized.
-Observed zero remains zero; absent counts remain null. Failure usage is partial.
+Observed Claude zero remains zero; absent counts remain null. Failure usage is partial.
+Codex usage is withheld as unknown until its upstream event/zero semantics are
+validated. A nonempty sink missing its final newline is refused before dispatch,
+without modifying its retained bytes.
 Provider identity, observed model, monetary cost and input-category semantics
 remain unknown; this is not an invoice or a sub-agent/request accounting ledger.
 Elapsed time is Cabal's measured wall-clock duration, not a monotonic claim.
