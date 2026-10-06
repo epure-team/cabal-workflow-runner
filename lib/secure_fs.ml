@@ -38,6 +38,7 @@ let lock_identity_matches ~root ~relative identity =
 
 type ledger_handle = { fd : int; path : string; device : string; inode : string }
 external ledger_open_raw : string -> int * string * string = "cwr_secure_ledger_open"
+external ledger_open_append_raw : string -> int * string * string = "cwr_secure_ledger_open_append"
 external ledger_write_raw : int -> string -> string -> unit = "cwr_secure_ledger_write"
 external ledger_flush_raw : int -> string -> unit = "cwr_secure_ledger_flush"
 external ledger_identity_matches_raw : string -> string -> string -> bool = "cwr_secure_ledger_identity_matches"
@@ -45,6 +46,8 @@ external ledger_close_raw : int -> unit = "cwr_secure_ledger_close"
 
 let ledger_open path = Result.map (fun (fd, device, inode) -> { fd; path; device; inode })
   (protect (fun () -> ledger_open_raw path))
+let ledger_open_append path = Result.map (fun (fd, device, inode) -> { fd; path; device; inode })
+  (protect (fun () -> ledger_open_append_raw path))
 let ledger_write handle ~phase content = protect (fun () -> ledger_write_raw handle.fd content phase)
 let ledger_flush handle ~phase = protect (fun () -> ledger_flush_raw handle.fd phase)
 let ledger_identity_matches handle = protect (fun () ->

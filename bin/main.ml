@@ -196,8 +196,8 @@ let finish_ledger handle trace =
   | Ok (), Ok () -> Ok ()
   | Error message, _ | Ok (), Error message -> Error message
 
-let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_fd
-    attestation_root attestation_session required_attestations expected_digest deadline =
+let run_with_telemetry file floor_gates approve allow_run ledger ctx_json attestation_key_fd
+    attestation_root attestation_session required_attestations expected_digest deadline telemetry read_only_policy =
   match load_and_validate ~required_attestations ~floor_gates file with
   | Error e ->
       Printf.eprintf "%s\n" e;
@@ -212,7 +212,7 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_f
       Eio_main.run (fun env ->
           Eio.Switch.run (fun sw ->
               let cwd = Sys.getcwd () in
-              let backend = Backend_cabal.make ~sw ~env ~working_dir:cwd in
+              let backend = Backend_cabal.make ~sw ~env ~working_dir:cwd ?telemetry ?read_only_policy () in
               let initial_ctx = match ctx_json with
                 | None -> []
                 | Some raw ->
@@ -284,6 +284,27 @@ let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_f
       ))
 
 (* ---- replay subcommand ---- *)
+
+let cmd_run file floor_gates approve allow_run ledger ctx_json attestation_key_fd
+    attestation_root attestation_session required_attestations expected_digest deadline telemetry_file telemetry_run_id tools budget_usd max_turns =
+  match Read_only_policy.of_options tools budget_usd max_turns with
+  | Error message -> Printf.eprintf "agent policy: %s\n" message; 1
+  | Ok read_only_policy ->
+  let sink = match telemetry_file, telemetry_run_id with
+    | None, None -> Ok None
+    | Some path, Some run_id -> Result.map Option.some (Observation.open_sink ~path ~run_id)
+    | _ -> Error "--telemetry-file and --telemetry-run-id must be supplied together" in
+  match sink with
+  | Error message -> Printf.eprintf "telemetry: %s\n" message; 1
+  | Ok telemetry ->
+      try Fun.protect
+        ~finally:(fun () -> Option.iter (fun sink -> match Observation.close sink with
+          | Ok () -> () | Error _ -> raise Observation.Sink_error) telemetry)
+        (fun () -> run_with_telemetry file floor_gates approve allow_run ledger ctx_json
+          attestation_key_fd attestation_root attestation_session required_attestations
+          expected_digest deadline telemetry read_only_policy)
+      with Observation.Sink_error | Fun.Finally_raised Observation.Sink_error ->
+        Printf.eprintf "telemetry: durable observation failed; refusing success\n"; 1
 
 let load_public_identity path =
   Result.bind (Secure_fs.read_regular path) (fun raw ->
@@ -599,6 +620,21 @@ let deadline_arg = Arg.(value & opt (some float) None &
           for the workflow's Deadline governor. Runtime-only: never read from the workflow file. \
           Absent => a workflow declaring Deadline never stops via that governor.")
 
+let telemetry_file_arg = Arg.(value & opt (some string) None &
+  info ["telemetry-file"] ~docv:"PATH"
+    ~doc:"Append private host-owned model-call observations to PATH; requires --telemetry-run-id. Separate from replay ledger. Write failure stops dispatch/refuses success.")
+let telemetry_run_id_arg = Arg.(value & opt (some string) None &
+  info ["telemetry-run-id"] ~docv:"ID" ~doc:"Host-assigned correlation identity for --telemetry-file.")
+let read_only_tools_arg = Arg.(value & opt (some string) None &
+  info ["read-only-tools"] ~docv:"TOOLS"
+    ~doc:"Trusted-host Claude-only toolset: comma-separated unique subset of Read,Glob,Grep. Requires both agent limit flags; refuses mutable/other backend dispatch. Enables native safe/restricted mode and strict empty MCP.")
+let agent_max_budget_arg = Arg.(value & opt (some float) None &
+  info ["agent-max-budget-usd"] ~docv:"USD"
+    ~doc:"Finite positive Claude native maximum spend per invocation; requires --read-only-tools and --agent-max-turns. Not a campaign billing meter.")
+let agent_max_turns_arg = Arg.(value & opt (some int) None &
+  info ["agent-max-turns"] ~docv:"N"
+    ~doc:"Positive Claude native turn ceiling per invocation; requires --read-only-tools and --agent-max-budget-usd.")
+
 let run_cmd =
   let doc = "Run a workflow deterministically, dispatching agents via cabal." in
   Cmd.v (Cmd.info "run" ~doc)
@@ -606,7 +642,8 @@ let run_cmd =
       const cmd_run $ file_arg $ floor_arg $ approve_arg $ allow_run_arg
       $ ledger_arg $ ctx_arg $ attestation_key_fd_arg $ attestation_root_arg
       $ attestation_session_arg $ require_attestation_arg
-      $ expected_workflow_digest_arg $ deadline_arg)
+      $ expected_workflow_digest_arg $ deadline_arg $ telemetry_file_arg $ telemetry_run_id_arg
+      $ read_only_tools_arg $ agent_max_budget_arg $ agent_max_turns_arg)
 
 let replay_ledger_arg =
   Arg.(

@@ -15,7 +15,7 @@
 
 (executable
  (name main)
- (modules main compiler backend_cabal)
+ (modules main compiler backend_cabal read_only_policy)
  (public_name cabal-workflow-runner)
  (libraries cabal_workflow_runner cwr_runner cabal eio_main cmdliner yojson unix))
 

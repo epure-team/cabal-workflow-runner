@@ -1,0 +1,13 @@
+{
+  "task": "claude-read-only-policy",
+  "status": "GO",
+  "round": 1,
+  "cycle": 1,
+  "qa_no_go_round": 0,
+  "config": {
+    "max_rounds": 5
+  },
+  "cause": null,
+  "warnings": [],
+  "violations": []
+}

@@ -82,6 +82,72 @@ dune build
 dune test
 ```
 
+## Private provider observation sidecar
+
+`run` optionally persists host-owned call metadata separately from its replay
+ledger. Supply both flags; omission preserves existing behavior:
+
+```sh
+cabal-workflow-runner run workflow.json --telemetry-file private/calls.jsonl \
+  --telemetry-run-id unique-run-id
+```
+
+The existing parent directory must be trusted and contain no symlink ancestors.
+The regular sink is owner-only, exclusively locked, appended rather than
+truncated, and fsynced before dispatch (`call.started`) and before returning
+(`call.finished`). Reusing the same run ID/path resumes occurrence numbers.
+Interrupted starts remain open; no usage is invented. A sink error refuses
+success, including errors caught by parallel execution. Replay emits no calls.
+
+Records contain bounded identifiers, selected backend, requested model, status,
+exit code, session, nullable input/output/cache tokens and Cabal elapsed time.
+No prompt, output, error prose, environment or transcript is serialized.
+Observed Claude zero remains zero; absent counts remain null. Failure usage is partial.
+Codex usage is withheld as unknown until its upstream event/zero semantics are
+validated. A nonempty sink missing its final newline is refused before dispatch,
+without modifying its retained bytes.
+Provider identity, observed model, monetary cost and input-category semantics
+remain unknown; this is not an invoice or a sub-agent/request accounting ledger.
+Elapsed time is Cabal's measured wall-clock duration, not a monotonic claim.
+Consumers own campaign correlation, ingestion deduplication and pricing.
+
+Requires Cabal's additive Claude cost/session parser API; the core library still
+has no Cabal dependency. See `Observation`'s public interface and the deterministic
+provider/sink tests for the v1 sidecar contract.
+
+## Bounded Claude read-only host policy
+
+Trusted launchers can narrow agent capabilities independently of workflow
+prompts. All three opt-in flags are required together:
+
+```sh
+cabal-workflow-runner run workflow.json --read-only-tools Read,Glob,Grep \
+  --agent-max-budget-usd 1 --agent-max-turns 8
+```
+
+Tools must be a nonempty unique subset of `Read,Glob,Grep`; budget must be finite
+and positive and turns positive. The policy refuses mutable agents and any
+backend other than the handwritten Claude Code adapter, without fallback.
+Legacy behavior is unchanged when all flags are absent. Limits apply to each
+provider invocation, not the entire workflow or campaign; native spend is a
+CLI ceiling, not proof of billing or a refund guarantee.
+
+The command uses Claude's native exact `--tools` set, `--safe-mode`,
+`--restricted`, `--permission-mode dontAsk`, `--strict-mcp-config` with an empty
+MCP configuration, `--max-budget-usd` and `--max-turns`. It removes legacy
+permission bypass and allow/deny flags. Thus Read/Glob/Grep are available but
+Bash, writes, network-fetch/search and sub-agent tools are not selected. Native
+safe mode disables user customizations/hooks while preserving OAuth auth;
+admin-managed policy still applies. `--bare` is not used because it disables
+OAuth discovery. Unsupported native options fail the invocation; there is no
+permissive retry. Installed Claude 2.1.291 help was inspected for these native
+safety controls. Older CLI versions need compatible options or will fail closed.
+
+This policy controls agent tool dispatch, not engine `Run` authority or OS
+isolation. Do not enable `--allow-run` in a read-only audit; use a read-only OS
+sandbox and sanitized environment for filesystem/configuration defense in depth.
+It is not a claim that the provider transport itself is offline.
+
 ## Read-only monitor
 
 The optional TypeScript monitor exposes only `GET` routes. It reads CWR ledgers from
