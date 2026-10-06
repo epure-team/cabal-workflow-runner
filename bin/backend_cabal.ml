@@ -143,16 +143,19 @@ let run_read_only_backend ~sw ~env backend spec =
         Claude_code.build_command ~project_config_path:None ~mcp_config_path spec
       in
       Backend_process.run_task_with ~sw ~env ~spec ~build_command
+        ~parse_cost:Claude_code.parse_cost_from_stdout
         ~parse_stdout:Claude_code.parse_stdout_text
         ~parse_session_id:Claude_code.parse_session_id_from_stdout ()
   | Codex_cli ->
       Backend_process.run_task_with ~sw ~env ~spec
         ~build_command:Codex_cli.build_command
-        ~parse_stdout:Codex_cli.parse_stdout_text ()
+        ~parse_cost:(fun stdout -> snd (Codex_cli.parse_jsonl_output stdout))
+        ~parse_stdout:Codex_cli.parse_stdout_text
+        ~parse_session_id:Codex_cli.parse_session_id_from_stdout ()
 
 (* Build a backend record bound to a live eio environment + switch. Dispatches
    agent work to the first available cabal backend; fails closed if none. *)
-let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
+let make ~sw ~env ~working_dir ?telemetry () : Cabal_workflow_runner.Backend.t =
   (* Populate the registry with the built-in adapters (claude-code, codex,
      gemini, ...). Without this the registry is empty and every dispatch fails
      closed. CWR_BACKEND selects a backend by id (default: first available);
@@ -225,10 +228,35 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
           [ Backend_types.Files_changed; Backend_types.Structured_report ]
         ()
     in
+    let observation = Option.map (fun sink ->
+      Cabal_workflow_runner.Observation.start sink ~step:id ~backend:requested ~model) telemetry in
+    let selected_backend = ref requested in
+    let finish ?(exception_outcome="failed") result =
+      match telemetry, observation with
+      | Some sink, Some call ->
+          let outcome, exit_code, session_id, duration_ms, usage = match result with
+            | None -> exception_outcome, None, None, None, None
+            | Some (r : Backend_types.task_result) ->
+                let outcome = match r.status with
+                  | Backend_types.Success -> "ok" | Failed _ -> "failed"
+                  | Timeout -> "timeout" | Cancelled -> "cancelled" in
+                let usage = Option.map (fun (c : Backend_types.cost) ->
+                  {Cabal_workflow_runner.Observation.input_tokens=c.tokens_input;
+                   output_tokens=c.tokens_output;cache_read_tokens=c.cache_read_input_tokens;
+                   cache_write_tokens=c.cache_creation_input_tokens}) r.cost in
+                outcome, Some r.exit_code, r.session_id,
+                Some (Backend_types.duration_to_seconds r.elapsed *. 1000.), usage in
+          Cabal_workflow_runner.Observation.finish sink ?backend:!selected_backend call ~outcome ~exit_code
+            ~session_id ~duration_ms ~usage
+      | _ -> ()
+    in
     let response_opt =
+      try
       if read_only then
         Option.map
-          (fun backend -> run_read_only_backend ~sw ~env backend spec)
+          (fun backend ->
+            selected_backend := Some (read_only_backend_name backend);
+            run_read_only_backend ~sw ~env backend spec)
           (select_read_only requested)
       else
         let backend_opt =
@@ -238,11 +266,18 @@ let make ~sw ~env ~working_dir : Cabal_workflow_runner.Backend.t =
         in
         Option.map
           (fun backend ->
+            selected_backend := Some (Agentic_backend.name backend);
             let request = { Backend_types.spec; ctxt = id } in
             Agentic_backend.run_task_with_ctxt ~sw ~env backend request
             |> fun response -> response.Backend_types.result)
           backend_opt
+      with e ->
+        (* The persisted start remains evidence of attempted dispatch. Never
+           copy exception prose or a provider transcript into the sidecar. *)
+        let exception_outcome = match e with Eio.Cancel.Cancelled _ -> "cancelled" | _ -> "failed" in
+        finish ~exception_outcome None; raise e
     in
+    finish response_opt;
     match response_opt with
     | None ->
         ( false,

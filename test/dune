@@ -46,3 +46,12 @@
  (alias runtest)
  (deps test_approval_ledger.sh)
  (action (run bash %{dep:test_approval_ledger.sh} %{exe:../bin/main.exe})))
+(test
+ (name test_observation_cli)
+ (modules test_observation_cli)
+ (libraries cabal_workflow_runner alcotest yojson unix)
+ (action (run %{test} %{exe:../bin/main.exe})))
+(test
+ (name test_observation)
+ (modules test_observation)
+ (libraries cabal_workflow_runner alcotest yojson unix))

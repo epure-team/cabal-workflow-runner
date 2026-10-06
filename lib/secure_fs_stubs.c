@@ -238,7 +238,7 @@ CAMLprim value cwr_secure_lock_identity_matches(value vroot, value vrel,
   CAMLreturn(Val_bool(matches));
 }
 
-CAMLprim value cwr_secure_ledger_open(value vpath) {
+static value secure_ledger_open(value vpath, int append) {
   CAMLparam1(vpath); CAMLlocal3(out, vdev, vino);
   const char *path = String_val(vpath); char *copy = strdup(path), *slash, *name;
   int parent = -1, fd = -1, saved; struct stat st; char devbuf[32], inobuf[32];
@@ -247,7 +247,7 @@ CAMLprim value cwr_secure_ledger_open(value vpath) {
   if (slash) { *slash = 0; name = slash + 1; parent = open_dir_chain(*copy ? copy : "/"); }
   else { name = copy; parent = open_dir_chain("."); }
   if (unsafe_component(name)) { close(parent); free(copy); errno = EINVAL; fail_errno("unsafe ledger filename"); }
-  fd = openat(parent, name, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+  fd = openat(parent, name, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC | (append ? O_APPEND : 0), 0600);
   if (fd < 0) { saved = errno; close(parent); free(copy); errno = saved; fail_errno("openat ledger"); }
   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
     saved = errno ? errno : EINVAL; close(fd); close(parent); free(copy); errno = saved;
@@ -261,7 +261,7 @@ CAMLprim value cwr_secure_ledger_open(value vpath) {
     saved = errno ? errno : EINVAL; flock(fd, LOCK_UN); close(fd); close(parent); free(copy); errno = saved;
     fail_errno("private unaliased regular ledger required after lock");
   }
-  if (fchmod(fd, 0600) || ftruncate(fd, 0)) {
+  if (fchmod(fd, 0600) || (!append && ftruncate(fd, 0)) || (append && fsync(parent))) {
     saved = errno ? errno : EINVAL; flock(fd, LOCK_UN); close(fd); close(parent); free(copy); errno = saved;
     fail_errno("initialize private ledger");
   }
@@ -272,6 +272,14 @@ CAMLprim value cwr_secure_ledger_open(value vpath) {
   out = caml_alloc_tuple(3);
   Store_field(out, 0, Val_int(fd)); Store_field(out, 1, vdev); Store_field(out, 2, vino);
   CAMLreturn(out);
+}
+
+CAMLprim value cwr_secure_ledger_open(value vpath) {
+  return secure_ledger_open(vpath, 0);
+}
+
+CAMLprim value cwr_secure_ledger_open_append(value vpath) {
+  return secure_ledger_open(vpath, 1);
 }
 
 CAMLprim value cwr_secure_ledger_write(value vfd, value vcontent, value vphase) {

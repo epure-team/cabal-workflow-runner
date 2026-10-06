@@ -18,6 +18,12 @@ val lock_identity_matches : root:string -> relative:string -> lock_identity ->
 
 type ledger_handle
 val ledger_open : string -> (ledger_handle, string) result
+
+(** Open a private, unaliased, regular file with exclusive nonblocking lock and
+    append semantics. Existing bytes are retained; a new directory entry is
+    fsynced. Ancestor and target symlinks are rejected, as for [ledger_open]. *)
+val ledger_open_append : string -> (ledger_handle, string) result
+
 val ledger_write : ledger_handle -> phase:string -> string -> (unit, string) result
 val ledger_flush : ledger_handle -> phase:string -> (unit, string) result
 val ledger_identity_matches : ledger_handle -> (bool, string) result

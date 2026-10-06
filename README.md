@@ -82,6 +82,36 @@ dune build
 dune test
 ```
 
+## Private provider observation sidecar
+
+`run` optionally persists host-owned call metadata separately from its replay
+ledger. Supply both flags; omission preserves existing behavior:
+
+```sh
+cabal-workflow-runner run workflow.json --telemetry-file private/calls.jsonl \
+  --telemetry-run-id unique-run-id
+```
+
+The existing parent directory must be trusted and contain no symlink ancestors.
+The regular sink is owner-only, exclusively locked, appended rather than
+truncated, and fsynced before dispatch (`call.started`) and before returning
+(`call.finished`). Reusing the same run ID/path resumes occurrence numbers.
+Interrupted starts remain open; no usage is invented. A sink error refuses
+success, including errors caught by parallel execution. Replay emits no calls.
+
+Records contain bounded identifiers, selected backend, requested model, status,
+exit code, session, nullable input/output/cache tokens and Cabal elapsed time.
+No prompt, output, error prose, environment or transcript is serialized.
+Observed zero remains zero; absent counts remain null. Failure usage is partial.
+Provider identity, observed model, monetary cost and input-category semantics
+remain unknown; this is not an invoice or a sub-agent/request accounting ledger.
+Elapsed time is Cabal's measured wall-clock duration, not a monotonic claim.
+Consumers own campaign correlation, ingestion deduplication and pricing.
+
+Requires Cabal's additive Claude cost/session parser API; the core library still
+has no Cabal dependency. See `Observation`'s public interface and the deterministic
+provider/sink tests for the v1 sidecar contract.
+
 ## Read-only monitor
 
 The optional TypeScript monitor exposes only `GET` routes. It reads CWR ledgers from
