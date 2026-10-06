@@ -9,3 +9,6 @@ Branch: `feat/provider-observation-sidecar`. Contribution repository: `epure-tea
 The user authorized upstream draft PR creation. The requested stopping point is an open draft; merge and branch deletion are out of scope. Cabal's trusted same-repository PR must follow its automatic Épure mirror and may not merge independently. CWR adoption requires the Cabal helper/correction contribution.
 
 Only owned source, tests and generic review/QA/ship artifacts are staged. Incidental Cabal package regeneration, private staged install and locally installed review tooling are excluded.
+# Draft handoff result
+
+Shipped with the sidecar in draft PR https://github.com/epure-team/cabal-workflow-runner/pull/23, verified OPEN/draft against main. Source policy commit 7dcc26aaefadbdf3b4cecb7358e23ce03894f0b2; review artifacts initially 9c29a78. Its actual static review-convergence and QA-convergence checks exited zero before push. CI queued/in progress, not claimed passing; no merge. No OS-isolation or production child/request accounting claims. Metabolism skipped: no harness.json; advisory cost snapshot skipped for non-ISO ledger time bounds.
