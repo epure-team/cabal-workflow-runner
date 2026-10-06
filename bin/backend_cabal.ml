@@ -136,17 +136,20 @@ let default_read_only_backend ~sw ~env =
    Claude blocks Bash/Edit/Write and Codex selects its read-only sandbox. Calling
    [Backend_process.run_task_with] directly also avoids backend project-config
    setup writes in the audited target directory. *)
-let run_read_only_backend ~sw ~env backend spec =
+let run_read_only_backend ~sw ~env ?policy backend spec =
   match backend with
   | Claude_code ->
       let build_command ~mcp_config_path spec =
-        Claude_code.build_command ~project_config_path:None ~mcp_config_path spec
+        let command = Claude_code.build_command ~project_config_path:None
+          ~mcp_config_path:(if Option.is_some policy then None else mcp_config_path) spec in
+        match policy with Some policy -> Read_only_policy.apply policy command | None -> command
       in
       Backend_process.run_task_with ~sw ~env ~spec ~build_command
         ~parse_cost:Claude_code.parse_cost_from_stdout
         ~parse_stdout:Claude_code.parse_stdout_text
         ~parse_session_id:Claude_code.parse_session_id_from_stdout ()
   | Codex_cli ->
+      if Option.is_some policy then failwith "host read-only policy requires Claude Code";
       Backend_process.run_task_with ~sw ~env ~spec
         ~build_command:Codex_cli.build_command
         ~parse_cost:(fun stdout -> snd (Codex_cli.parse_jsonl_output stdout))
@@ -155,7 +158,7 @@ let run_read_only_backend ~sw ~env backend spec =
 
 (* Build a backend record bound to a live eio environment + switch. Dispatches
    agent work to the first available cabal backend; fails closed if none. *)
-let make ~sw ~env ~working_dir ?telemetry () : Cabal_workflow_runner.Backend.t =
+let make ~sw ~env ~working_dir ?telemetry ?read_only_policy () : Cabal_workflow_runner.Backend.t =
   (* Populate the registry with the built-in adapters (claude-code, codex,
      gemini, ...). Without this the registry is empty and every dispatch fails
      closed. CWR_BACKEND selects a backend by id (default: first available);
@@ -255,11 +258,13 @@ let make ~sw ~env ~working_dir ?telemetry () : Cabal_workflow_runner.Backend.t =
     in
     let response_opt =
       try
+      if Option.is_some read_only_policy && not read_only then
+        failwith "host read-only policy refuses mutable agent steps";
       if read_only then
         Option.map
           (fun backend ->
             selected_backend := Some (read_only_backend_name backend);
-            run_read_only_backend ~sw ~env backend spec)
+            run_read_only_backend ~sw ~env ?policy:read_only_policy backend spec)
           (select_read_only requested)
       else
         let backend_opt =

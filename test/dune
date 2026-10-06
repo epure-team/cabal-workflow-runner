@@ -55,3 +55,8 @@
  (name test_observation)
  (modules test_observation)
  (libraries cabal_workflow_runner alcotest yojson unix))
+(test
+ (name test_host_policy_cli)
+ (modules test_host_policy_cli)
+ (libraries alcotest unix)
+ (action (run %{test} %{exe:../bin/main.exe})))
